@@ -113,8 +113,8 @@ npm run test:e2e:ci
 ```
 
 El workflow `CI` ejecuta esta secuencia en cada PR y push a `develop` o `master`
-con MySQL 8.4 efímero. El job requerido se llama `verify`; cualquier paso fallido
-detiene el job y, por contrato, ningún pipeline de despliegue puede omitirlo.
+con MySQL 8.4 efímero. El job se llama `verify`; cualquier paso fallido detiene el
+job y, por contrato, el pipeline de despliegue debe ejecutar este gate antes de publicar.
 
 ## Ramas
 
