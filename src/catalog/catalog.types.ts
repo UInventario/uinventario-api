@@ -16,6 +16,14 @@ export interface ProductResponse {
   meta: { apiVersion: '1' };
 }
 
+export interface ProductRetirementResponse {
+  data: {
+    outcome: 'DELETED' | 'DEACTIVATED';
+    product: ProductData | null;
+  };
+  meta: { apiVersion: '1' };
+}
+
 export interface CatalogOptionsResponse {
   data: {
     categories: Array<{ id: string; name: string }>;
