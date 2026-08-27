@@ -2417,6 +2417,66 @@ describe('UInventario API (e2e)', () => {
     });
   });
 
+  describe('Core role authorization matrix', () => {
+    beforeEach(resetIdentityData);
+
+    it('rejects anonymous access and a role without Core permissions', async () => {
+      for (const path of [
+        '/api/v1/onboarding/company',
+        '/api/v1/products',
+        '/api/v1/inventory/stock',
+        '/api/v1/pos/sales',
+      ]) {
+        await request(app.getHttpServer()).get(path).expect(401);
+      }
+
+      await registerAccount('role-authorization-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      const [principal] = await dataSource.query<
+        Array<{ id: string; tenant_id: string }>
+      >('SELECT id, tenant_id FROM users WHERE normalized_email = ? LIMIT 1', [
+        registrationPayload.email,
+      ]);
+      const staffRoleId = randomUUID();
+      await dataSource.query(
+        `INSERT INTO roles (id, tenant_id, code, name) VALUES (?, ?, 'STAFF', 'Personal')`,
+        [staffRoleId, principal.tenant_id],
+      );
+      await dataSource.query('DELETE FROM user_roles WHERE user_id = ?', [
+        principal.id,
+      ]);
+      await dataSource.query(
+        'INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)',
+        [principal.id, staffRoleId],
+      );
+
+      for (const [path, code] of [
+        ['/api/v1/onboarding/company', 'ONBOARDING_ACCESS_DENIED'],
+        ['/api/v1/products', 'PRODUCT_ACCESS_DENIED'],
+        ['/api/v1/inventory/stock', 'INVENTORY_ACCESS_DENIED'],
+        ['/api/v1/pos/sales', 'POS_ACCESS_DENIED'],
+        ['/api/v1/audit-events', 'AUDIT_ACCESS_DENIED'],
+      ]) {
+        await request(app.getHttpServer())
+          .get(path)
+          .set('Cookie', cookie)
+          .expect(403)
+          .expect(({ body }: { body: { code?: string } }) => {
+            expect(body.code).toBe(code);
+          });
+      }
+
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({ legalName: 'Cambio no autorizado', countryCode: 'MX' })
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('ONBOARDING_ACCESS_DENIED');
+        });
+    });
+  });
+
   describe('Core audit trail', () => {
     beforeEach(async () => {
       await resetIdentityData();
