@@ -16,7 +16,7 @@ describe('UInventario API (e2e)', () => {
   let app: INestApplication<App>;
   let dataSource: DataSource;
 
-  beforeAll(async () => {
+  async function bootApplication(): Promise<void> {
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
     }).compile();
@@ -25,7 +25,9 @@ describe('UInventario API (e2e)', () => {
     configureApp(app);
     await app.init();
     dataSource = app.get(DataSource);
-  });
+  }
+
+  beforeAll(bootApplication);
 
   async function resetIdentityData(): Promise<void> {
     await dataSource.query('SET FOREIGN_KEY_CHECKS = 0');
@@ -2604,6 +2606,132 @@ describe('UInventario API (e2e)', () => {
         .expect(403)
         .expect(({ body }: { body: { code?: string } }) => {
           expect(body.code).toBe('AUDIT_ACCESS_DENIED');
+        });
+    });
+  });
+
+  describe('Core release persistence', () => {
+    beforeEach(async () => {
+      await resetIdentityData();
+      app.get<ThrottlerStorageService>(ThrottlerStorage).storage.clear();
+    });
+
+    it('keeps the completed Core journey available after an application restart', async () => {
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'release-registration')
+        .send(registrationPayload)
+        .expect(201);
+      const login = await request(app.getHttpServer())
+        .post('/api/v1/auth/sessions')
+        .send({
+          email: registrationPayload.email,
+          password: registrationPayload.password,
+        })
+        .expect(200);
+      const cookie = (
+        login.headers['set-cookie'] as unknown as string[]
+      )[0].split(';')[0];
+
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Tienda Persistente, S.A. de C.V.',
+          tradeName: 'Tienda Persistente',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      const location = await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Sucursal Persistente',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Persistente',
+          locationName: 'General Persistente',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Persistente' })
+        .expect(200);
+
+      const product = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto Persistente',
+          sku: 'RELEASE-CORE-1',
+          cost: '5.00',
+          price: '10.00',
+        })
+        .expect(201);
+      const productId = (product.body as { data: { id: string } }).data.id;
+      const locationId = (
+        location.body as { data: { location: { id: string } } }
+      ).data.location.id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'release-stock')
+        .send({
+          productId,
+          locationId,
+          type: 'INITIAL',
+          quantity: '10',
+          reason: 'Stock de release',
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'release-sale')
+        .send({ lines: [{ productId, quantity: '2' }], cashReceived: '20.00' })
+        .expect(201);
+
+      await app.close();
+      await bootApplication();
+
+      await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              tenant: { name: 'Tienda Persistente' },
+              context: {
+                branch: { name: 'Sucursal Persistente' },
+                warehouse: { name: 'Bodega Persistente' },
+                cashRegister: { name: 'Caja Persistente' },
+              },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/balance`)
+        .query({ locationId })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              product: { id: productId, sku: 'RELEASE-CORE-1' },
+              quantity: '8.000',
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [{ status: 'COMPLETED', total: '20.00' }],
+            meta: { pagination: { total: 1 } },
+          });
         });
     });
   });
