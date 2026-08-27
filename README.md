@@ -1,21 +1,24 @@
 # UInventario API
 
-Backend NestJS de UInventario. Expone los contratos y reglas de negocio del producto; la persistencia se incorporará mediante migraciones en el incremento que la necesite.
+Backend NestJS de UInventario. Expone contratos, persistencia y reglas de negocio con aislamiento por tenant.
 
 ## Desarrollo local
 
 ```bash
 npm install
 copy .env.example .env
+npm run db:up
+npm run migration:run
 npm run start:dev
 ```
 
 El servicio escucha en `http://localhost:3000` por defecto.
 
 - `GET /health/live`: proceso disponible.
-- `GET /health/ready`: servicio preparado para aceptar tráfico. Las dependencias externas se añadirán a esta comprobación cuando existan.
+- `GET /health/ready`: servicio y base de datos preparados.
+- `POST /api/v1/auth/registrations`: crea atómicamente tenant, usuario y rol administrador; requiere `Idempotency-Key`.
 
-Toda configuración se recibe mediante variables de entorno. `.env.example` contiene únicamente valores locales no sensibles.
+MySQL 8.4 local corre en Docker con volumen persistente. Dev y Prod reciben una `DATABASE_URL` independiente mediante secretos; el repositorio no contiene credenciales productivas.
 
 ## Gates
 
