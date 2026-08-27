@@ -9303,7 +9303,22 @@ describe('UInventario API (e2e)', () => {
         .send({ commands: [firstCommand] })
         .expect(201);
       expect(first.body).toMatchObject({
-        data: { results: [{ status: 'CONFIRMED', replay: false }] },
+        data: {
+          results: [
+            {
+              status: 'CONFIRMED',
+              replay: false,
+              result: {
+                meta: {
+                  offlineResolution: {
+                    domain: 'STOCK',
+                    strategy: 'AUTO_MERGE',
+                  },
+                },
+              },
+            },
+          ],
+        },
       });
       expect(replay.body).toMatchObject({
         data: { results: [{ status: 'CONFIRMED', replay: true }] },
@@ -9575,6 +9590,7 @@ describe('UInventario API (e2e)', () => {
                   error: {
                     status: 409,
                     details: { code: 'OFFLINE_SALE_SNAPSHOT_CONFLICT' },
+                    conflict: { domain: 'SALE', strategy: 'REJECT' },
                   },
                 },
               ],
@@ -9629,7 +9645,14 @@ describe('UInventario API (e2e)', () => {
               data: {
                 results: Array<{
                   status: string;
-                  error?: { details?: { code?: string } };
+                  error?: {
+                    details?: { code?: string };
+                    conflict?: {
+                      domain?: string;
+                      strategy?: string;
+                      currentState?: { quantity?: string };
+                    };
+                  };
                 }>;
               };
             }
@@ -9644,6 +9667,11 @@ describe('UInventario API (e2e)', () => {
       expect(countErrors).toHaveLength(1);
       expect(countErrors[0].error?.details?.code).toBe(
         'INVENTORY_COUNT_CONFLICT',
+      );
+      expect(countErrors[0].error?.conflict?.domain).toBe('STOCK');
+      expect(countErrors[0].error?.conflict?.strategy).toBe('REVIEW');
+      expect(countErrors[0].error?.conflict?.currentState?.quantity).toMatch(
+        /^[34]\.000$/,
       );
 
       const rejectedAdjustment = {
@@ -9688,6 +9716,14 @@ describe('UInventario API (e2e)', () => {
       expect(rejectedReplay.body).toMatchObject({
         data: { results: [{ status: 'ERROR', replay: true }] },
       });
+      const [rejectionAudit] = await dataSource.query<
+        Array<{ total: number | string }>
+      >(
+        `SELECT COUNT(*) AS total FROM audit_events
+         WHERE action = 'OFFLINE_COMMAND_REJECTED' AND entity_id = ?`,
+        [rejectedAdjustment.commandId],
+      );
+      expect(Number(rejectionAudit.total)).toBe(1);
 
       const staleDeviceId = randomUUID();
       const staleCommand = {

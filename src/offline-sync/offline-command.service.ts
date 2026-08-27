@@ -115,7 +115,14 @@ export class OfflineCommandService {
             deviceId: command.scope.deviceId,
           },
         });
-        return { status: 'CONFIRMED', result: response };
+        return {
+          status: 'CONFIRMED',
+          result: this.withResolution(response, {
+            domain: 'STOCK',
+            strategy: 'AUTO_MERGE',
+            userAction: 'Ninguna; el delta se aplicó en orden transaccional.',
+          }),
+        };
       }
       if (command.kind === 'INVENTORY_COUNT') {
         this.requirePermission(principal, 'INVENTORY_COUNT');
@@ -148,7 +155,14 @@ export class OfflineCommandService {
             capturedAt: payload.capturedAt,
           },
         });
-        return { status: 'CONFIRMED', result: response };
+        return {
+          status: 'CONFIRMED',
+          result: this.withResolution(response, {
+            domain: 'STOCK',
+            strategy: 'REVIEW',
+            userAction: 'Ninguna; el conteo se validó contra su saldo base.',
+          }),
+        };
       }
       if (command.kind === 'CASH_SALE') {
         this.requirePermission(principal, 'SALES_MANAGE');
@@ -182,7 +196,15 @@ export class OfflineCommandService {
             deviceId: command.scope.deviceId,
           },
         });
-        return { status: 'CONFIRMED', result: response };
+        return {
+          status: 'CONFIRMED',
+          result: this.withResolution(response, {
+            domain: 'SALE',
+            strategy: 'COMPENSATE',
+            userAction:
+              'Si requiere corrección, usa la anulación auditada de venta.',
+          }),
+        };
       }
       throw new UnprocessableEntityException({
         code: 'OFFLINE_COMMAND_NOT_SUPPORTED',
@@ -190,9 +212,29 @@ export class OfflineCommandService {
       });
     } catch (error) {
       if (error instanceof HttpException && error.getStatus() < 500) {
+        const conflict = this.classifyConflict(command, error);
+        await this.audit.recordRequired({
+          tenantId: principal.tenant.id,
+          actorUserId: principal.user.id,
+          action: 'OFFLINE_COMMAND_REJECTED',
+          entityType: 'OFFLINE_COMMAND',
+          entityId: command.commandId,
+          correlationId,
+          deduplicate: true,
+          after: {
+            kind: command.kind,
+            deviceId: command.scope.deviceId,
+            status: error.getStatus(),
+            conflict,
+          },
+        });
         return {
           status: 'ERROR',
-          error: { status: error.getStatus(), details: error.getResponse() },
+          error: {
+            status: error.getStatus(),
+            details: error.getResponse(),
+            conflict,
+          },
         };
       }
       throw error;
@@ -252,6 +294,62 @@ export class OfflineCommandService {
           'La operación excedió su vigencia offline y debe capturarse de nuevo.',
       });
     }
+  }
+
+  private classifyConflict(command: OfflineCommandDto, error: HttpException) {
+    const details = error.getResponse() as {
+      code?: string;
+      currentQuantity?: string;
+    };
+    const code = details.code ?? `HTTP_${error.getStatus()}`;
+    if (code === 'INVENTORY_COUNT_CONFLICT') {
+      return {
+        domain: 'STOCK' as const,
+        strategy: 'REVIEW' as const,
+        code,
+        currentState: { quantity: details.currentQuantity ?? null },
+        userAction: 'Sincroniza existencias y captura un conteo nuevo.',
+      };
+    }
+    if (command.kind === 'CASH_SALE') {
+      return {
+        domain: 'SALE' as const,
+        strategy: 'REJECT' as const,
+        code,
+        userAction:
+          'Actualiza precios, caja y stock; después captura una venta nueva.',
+      };
+    }
+    if (code.includes('PERMISSION') || error.getStatus() === 403) {
+      return {
+        domain: 'PERMISSION' as const,
+        strategy: 'REJECT' as const,
+        code,
+        userAction:
+          'Actualiza la sesión o solicita el permiso antes de capturar otra operación.',
+      };
+    }
+    return {
+      domain: 'STOCK' as const,
+      strategy: 'REJECT' as const,
+      code,
+      userAction:
+        'Sincroniza y revisa el stock antes de capturar otra operación.',
+    };
+  }
+
+  private withResolution<T extends { meta: Record<string, unknown> }>(
+    response: T,
+    resolution: {
+      domain: 'STOCK' | 'SALE';
+      strategy: string;
+      userAction: string;
+    },
+  ): T {
+    return {
+      ...response,
+      meta: { ...response.meta, offlineResolution: resolution },
+    };
   }
 
   private async payload<T extends object>(
