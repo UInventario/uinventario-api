@@ -9,8 +9,11 @@ import {
   Post,
   Query,
   Req,
+  UploadedFile,
   UseGuards,
+  UseInterceptors,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { SessionGuard } from '../auth/session/session.guard';
 import type { AuthenticatedRequest } from '../auth/session/session.types';
 import { PermissionGuard } from '../auth/authorization/permission.guard';
@@ -22,6 +25,9 @@ import { ListInventoryStockDto } from './dto/list-inventory-stock.dto';
 import { ListInventoryMovementsDto } from './dto/list-inventory-movements.dto';
 import { InventoryService } from './inventory.service';
 import { AuditService } from '../audit/audit.service';
+import { PreviewInventoryImportDto } from './dto/preview-inventory-import.dto';
+import { InventoryImportService } from './inventory-import.service';
+import type { InventoryImportFile } from './inventory-import.types';
 
 @Controller('inventory')
 @UseGuards(SessionGuard, PermissionGuard)
@@ -29,7 +35,60 @@ export class InventoryController {
   constructor(
     private readonly inventory: InventoryService,
     private readonly audit: AuditService,
+    private readonly inventoryImports: InventoryImportService,
   ) {}
+
+  @Post('imports/preview')
+  @RequirePermissions('INVENTORY_ADJUST')
+  @UseInterceptors(
+    FileInterceptor('file', {
+      limits: { fileSize: 2 * 1024 * 1024, files: 1 },
+    }),
+  )
+  previewImport(
+    @Req() request: AuthenticatedRequest,
+    @Body() dto: PreviewInventoryImportDto,
+    @UploadedFile() file: InventoryImportFile | undefined,
+  ) {
+    return this.inventoryImports.preview({
+      tenantId: request.principal.tenant.id,
+      warehouseId: request.principal.context.warehouse!.id,
+      userId: request.principal.user.id,
+      correlationId: request.requestId!,
+      mode: dto.mode,
+      file,
+    });
+  }
+
+  @Get('imports/:importId')
+  @RequirePermissions('INVENTORY_ADJUST')
+  getImport(
+    @Req() request: AuthenticatedRequest,
+    @Param('importId', new ParseUUIDPipe()) importId: string,
+  ) {
+    return this.inventoryImports.get(
+      request.principal.tenant.id,
+      request.principal.context.warehouse!.id,
+      importId,
+    );
+  }
+
+  @Post('imports/:importId/confirm')
+  @RequirePermissions('INVENTORY_ADJUST')
+  confirmImport(
+    @Req() request: AuthenticatedRequest,
+    @Param('importId', new ParseUUIDPipe()) importId: string,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+  ) {
+    return this.inventoryImports.confirm({
+      tenantId: request.principal.tenant.id,
+      warehouseId: request.principal.context.warehouse!.id,
+      userId: request.principal.user.id,
+      importId,
+      idempotencyKey,
+      correlationId: request.requestId!,
+    });
+  }
 
   @Get('stock')
   @RequirePermissions('INVENTORY_VIEW')

@@ -145,6 +145,7 @@ export class InventoryRepository {
           sale_id: string | null;
           transfer_id: string | null;
           receipt_id: string | null;
+          inventory_import_id: string | null;
           reason: string;
           reference: string | null;
           created_at: Date | string;
@@ -165,6 +166,7 @@ export class InventoryRepository {
       >(
         `SELECT im.id, im.type, im.quantity_change, im.resulting_quantity,
                 im.idempotency_key, im.sale_id, im.transfer_id, im.receipt_id,
+                im.inventory_import_id,
                 im.from_state, im.to_state, im.state_quantity,
                 im.reason, im.reference, im.created_at,
                 p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
@@ -211,19 +213,26 @@ export class InventoryRepository {
           warehouse: { id: row.warehouse_id, name: row.warehouse_name },
         },
         responsible: { id: row.user_id, email: row.user_email },
-        correlationId: row.sale_id ?? row.transfer_id ?? row.id,
+        correlationId:
+          row.sale_id ?? row.transfer_id ?? row.inventory_import_id ?? row.id,
         idempotencyKey: row.idempotency_key,
-        document: row.receipt_id
-          ? { type: 'RECEIPT', id: row.receipt_id, reference: row.reference }
-          : row.transfer_id
-            ? {
-                type: 'TRANSFER',
-                id: row.transfer_id,
-                reference: row.reference,
-              }
-            : row.sale_id
-              ? { type: 'SALE', id: row.sale_id, reference: row.reference }
-              : { type: 'MOVEMENT', id: row.id, reference: row.reference },
+        document: row.inventory_import_id
+          ? {
+              type: 'IMPORT',
+              id: row.inventory_import_id,
+              reference: row.reference,
+            }
+          : row.receipt_id
+            ? { type: 'RECEIPT', id: row.receipt_id, reference: row.reference }
+            : row.transfer_id
+              ? {
+                  type: 'TRANSFER',
+                  id: row.transfer_id,
+                  reference: row.reference,
+                }
+              : row.sale_id
+                ? { type: 'SALE', id: row.sale_id, reference: row.reference }
+                : { type: 'MOVEMENT', id: row.id, reference: row.reference },
         stateTransition:
           row.from_state && row.to_state && row.state_quantity
             ? {

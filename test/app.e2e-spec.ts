@@ -12,6 +12,7 @@ import { verify } from 'argon2';
 import { configureApp } from '../src/security/configure-app';
 import { RegistrationService } from '../src/auth/registration/registration.service';
 import { ThrottlerStorage, ThrottlerStorageService } from '@nestjs/throttler';
+import * as ExcelJS from 'exceljs';
 
 describe('UInventario API (e2e)', () => {
   let app: INestApplication<App>;
@@ -41,6 +42,8 @@ describe('UInventario API (e2e)', () => {
       'cash_register_movements',
       'cash_register_shifts',
       'inventory_movements',
+      'inventory_import_rows',
+      'inventory_imports',
       'inventory_transfer_receipt_lines',
       'inventory_transfer_receipts',
       'inventory_transfer_lines',
@@ -3039,6 +3042,268 @@ describe('UInventario API (e2e)', () => {
         .expect(({ body }: { body: { data: unknown[] } }) => {
           expect(body.data).toEqual([]);
         });
+    });
+
+    it('previews CSV/XLSX and confirms an atomic, tenant-scoped, retryable stock import', async () => {
+      await registerAccount('inventory-import-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeInventoryOnboarding(registrationPayload.email, cookie);
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Café importado',
+          sku: 'IMPORT-CAFE',
+          cost: '10.00',
+          price: '15.00',
+        })
+        .expect(201);
+      const [scope] = await dataSource.query<
+        Array<{
+          product_id: string;
+          location_id: string;
+          location_code: string;
+        }>
+      >(
+        `SELECT p.id AS product_id, l.id AS location_id, l.code AS location_code
+         FROM products p
+         INNER JOIN locations l ON l.tenant_id = p.tenant_id
+         INNER JOIN users u ON u.tenant_id = p.tenant_id
+         WHERE u.normalized_email = ? AND p.normalized_sku = 'IMPORT-CAFE' LIMIT 1`,
+        [registrationPayload.email],
+      );
+      const csv = [
+        'sku,location,quantity,state,reason',
+        `IMPORT-CAFE,${scope.location_code},10,AVAILABLE,Conteo inicial`,
+        `IMPORT-CAFE,${scope.location_code},2,DAMAGED,Producto dañado`,
+      ].join('\n');
+      const preview = await request(app.getHttpServer())
+        .post('/api/v1/inventory/imports/preview')
+        .set('Cookie', cookie)
+        .field('mode', 'INITIAL')
+        .attach('file', Buffer.from(csv), {
+          filename: 'stock-inicial.csv',
+          contentType: 'text/csv',
+        })
+        .expect(201);
+      expect(preview.body).toMatchObject({
+        data: {
+          mode: 'INITIAL',
+          status: 'PREVIEWED',
+          policy: 'ATOMIC',
+          canConfirm: true,
+          summary: { rows: 2, validRows: 2, errorRows: 0, movements: null },
+          rows: [
+            {
+              state: 'AVAILABLE',
+              targetQuantity: '10.000',
+              currentQuantity: '0.000',
+              difference: '10.000',
+              errors: [],
+            },
+            {
+              state: 'DAMAGED',
+              targetQuantity: '2.000',
+              currentQuantity: '0.000',
+              difference: '2.000',
+              errors: [],
+            },
+          ],
+        },
+      });
+      const importId = (preview.body as { data: { id: string } }).data.id;
+
+      const confirmed = await request(app.getHttpServer())
+        .post(`/api/v1/inventory/imports/${importId}/confirm`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'inventory-import-confirm-001')
+        .expect(201);
+      expect(confirmed.body).toMatchObject({
+        data: {
+          id: importId,
+          status: 'CONFIRMED',
+          canConfirm: false,
+          summary: { rows: 2, movements: 2 },
+        },
+        meta: { idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/imports/${importId}/confirm`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'inventory-import-confirm-retry')
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              id: importId,
+              status: 'CONFIRMED',
+              summary: { movements: 2 },
+            },
+            meta: { idempotentReplay: true },
+          });
+        });
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${scope.product_id}/balance`)
+        .query({ locationId: scope.location_id })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              quantity: '12.000',
+              states: [
+                { code: 'AVAILABLE', quantity: '10.000' },
+                { code: 'RESERVED', quantity: '0.000' },
+                { code: 'DAMAGED', quantity: '2.000' },
+                { code: 'IN_TRANSIT', quantity: '0.000' },
+              ],
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: Array<{
+                type: string;
+                correlationId: string;
+                document: { type: string; id: string };
+              }>;
+            };
+          }) => {
+            expect(
+              body.data.some(
+                (movement) =>
+                  movement.type === 'IMPORT' &&
+                  movement.correlationId === importId &&
+                  movement.document.type === 'IMPORT' &&
+                  movement.document.id === importId,
+              ),
+            ).toBe(true);
+          },
+        );
+
+      const invalidCsv = [
+        'sku;ubicacion;cantidad;estado;motivo',
+        `IMPORT-CAFE;${scope.location_code};20;AVAILABLE;Conteo válido`,
+        `NO-EXISTE;${scope.location_code};5;AVAILABLE;Fila inválida`,
+      ].join('\n');
+      const invalidPreview = await request(app.getHttpServer())
+        .post('/api/v1/inventory/imports/preview')
+        .set('Cookie', cookie)
+        .field('mode', 'COUNT')
+        .attach('file', Buffer.from(invalidCsv), 'conteo.csv')
+        .expect(201);
+      expect(invalidPreview.body).toMatchObject({
+        data: {
+          policy: 'ATOMIC',
+          canConfirm: false,
+          summary: { rows: 2, validRows: 1, errorRows: 1 },
+        },
+      });
+      const invalidImportId = (invalidPreview.body as { data: { id: string } })
+        .data.id;
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/imports/${invalidImportId}/confirm`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'inventory-import-invalid')
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVENTORY_IMPORT_HAS_ERRORS');
+        });
+
+      const staleCsv = [
+        'sku,location,quantity,state,reason',
+        `IMPORT-CAFE,${scope.location_code},15,AVAILABLE,Conteo físico`,
+      ].join('\n');
+      const stalePreview = await request(app.getHttpServer())
+        .post('/api/v1/inventory/imports/preview')
+        .set('Cookie', cookie)
+        .field('mode', 'COUNT')
+        .attach('file', Buffer.from(staleCsv), 'conteo-stale.csv')
+        .expect(201);
+      const staleImportId = (stalePreview.body as { data: { id: string } }).data
+        .id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'inventory-import-concurrent-entry')
+        .send({
+          productId: scope.product_id,
+          locationId: scope.location_id,
+          type: 'ENTRY',
+          quantity: '1',
+          reason: 'Entrada concurrente',
+          reference: 'RECEPCION-CONCURRENTE',
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/imports/${staleImportId}/confirm`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'inventory-import-stale')
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVENTORY_IMPORT_STALE');
+        });
+
+      const workbook = new ExcelJS.Workbook();
+      const sheet = workbook.addWorksheet('Conteo');
+      sheet.addRow(['sku', 'location', 'quantity', 'state', 'reason']);
+      sheet.addRow([
+        'IMPORT-CAFE',
+        scope.location_code,
+        '11',
+        'AVAILABLE',
+        'Vista previa Excel',
+      ]);
+      const xlsx = await workbook.xlsx.writeBuffer();
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/imports/preview')
+        .set('Cookie', cookie)
+        .field('mode', 'COUNT')
+        .attach('file', Buffer.from(xlsx), 'conteo.xlsx')
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              canConfirm: true,
+              summary: { rows: 1, errorRows: 0 },
+              rows: [{ currentQuantity: '11.000', difference: '0.000' }],
+            },
+          });
+        });
+
+      const otherEmail = 'otro-importador@example.com';
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'inventory-import-other-registration')
+        .send({
+          organizationName: 'Otra tienda',
+          email: otherEmail,
+          password: registrationPayload.password,
+        })
+        .expect(201);
+      const otherCookie = await createPersistedSession(otherEmail);
+      await completeInventoryOnboarding(otherEmail, otherCookie);
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/imports/${importId}`)
+        .set('Cookie', otherCookie)
+        .expect(404);
+
+      const [{ total: importMovements }] = await dataSource.query<
+        Array<{ total: number | string }>
+      >(
+        `SELECT COUNT(*) AS total FROM inventory_movements
+         WHERE tenant_id = (SELECT tenant_id FROM users WHERE normalized_email = ?)
+           AND inventory_import_id = ?`,
+        [registrationPayload.email, importId],
+      );
+      expect(Number(importMovements)).toBe(2);
     });
   });
 
