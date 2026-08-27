@@ -41,6 +41,8 @@ el usuario, sus roles y el tenant de esa sesión.
 - `POST /api/v1/inventory/movements`: registra stock inicial, entrada o ajuste con `Idempotency-Key`.
 - `POST /api/v1/pos/cart/quote`: valida productos, stock y cantidades, y recalcula precios/impuesto/totales del carrito.
 - `POST /api/v1/pos/sales/cash`: persiste venta, pago y descuento trazable de inventario en una sola transacción idempotente.
+- `GET /api/v1/pos/sales`: lista ventas de la sucursal activa con filtros y paginación.
+- `GET /api/v1/pos/sales/:id`: consulta líneas, pago, operador y movimientos de una venta autorizada.
 
 Cada login crea una sesión independiente por dispositivo. Las pestañas de un mismo
 navegador comparten la cookie; una rotación invalida el token anterior y logout no
