@@ -884,6 +884,7 @@ describe('UInventario API (e2e)', () => {
                   'INVENTORY_VIEW',
                   'PRODUCTS_MANAGE',
                   'SALES_MANAGE',
+                  'SALES_VOID',
                   'TENANT_MANAGE',
                 ],
               },
