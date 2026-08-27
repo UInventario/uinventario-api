@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { INestApplication, Logger } from '@nestjs/common';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
@@ -8,6 +8,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { SalesRepository } from '../src/pos/sales.repository';
 import { PosCartQuoteResponse } from '../src/pos/pos.types';
 import { verify } from 'argon2';
+import { configureApp } from '../src/security/configure-app';
+import { RegistrationService } from '../src/auth/registration/registration.service';
 
 describe('UInventario API (e2e)', () => {
   let app: INestApplication<App>;
@@ -19,14 +21,7 @@ describe('UInventario API (e2e)', () => {
     }).compile();
 
     app = moduleFixture.createNestApplication();
-    app.setGlobalPrefix('api/v1');
-    app.useGlobalPipes(
-      new ValidationPipe({
-        whitelist: true,
-        forbidNonWhitelisted: true,
-        transform: true,
-      }),
-    );
+    configureApp(app);
     await app.init();
     dataSource = app.get(DataSource);
   });
@@ -97,16 +92,16 @@ describe('UInventario API (e2e)', () => {
   }
 
   describe('health', () => {
-    it('/api/v1/health/live (GET)', () => {
+    it('/health/live (GET)', () => {
       return request(app.getHttpServer())
-        .get('/api/v1/health/live')
+        .get('/health/live')
         .expect(200)
         .expect({ status: 'ok', info: {}, error: {}, details: {} });
     });
 
-    it('/api/v1/health/ready (GET)', () => {
+    it('/health/ready (GET)', () => {
       return request(app.getHttpServer())
-        .get('/api/v1/health/ready')
+        .get('/health/ready')
         .expect(200)
         .expect({
           status: 'ok',
@@ -114,6 +109,91 @@ describe('UInventario API (e2e)', () => {
           error: {},
           details: { database: { status: 'up' } },
         });
+    });
+  });
+
+  describe('HTTP security', () => {
+    beforeEach(resetIdentityData);
+
+    it('adds defensive headers and a validated correlation id', async () => {
+      const requestId = 'security-correlation-2026';
+      await request(app.getHttpServer())
+        .get('/health/live')
+        .set('X-Request-Id', requestId)
+        .expect(200)
+        .expect('X-Request-Id', requestId)
+        .expect('X-Content-Type-Options', 'nosniff')
+        .expect('X-Frame-Options', 'SAMEORIGIN')
+        .expect('Cross-Origin-Resource-Policy', 'same-origin');
+
+      await request(app.getHttpServer())
+        .get('/health/live')
+        .set('X-Request-Id', 'invalid id with spaces')
+        .expect(200)
+        .expect(({ headers }: { headers: Record<string, string> }) => {
+          expect(headers['x-request-id']).toMatch(
+            /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+          );
+        });
+    });
+
+    it('rejects cross-origin mutations before credentials or data are processed', async () => {
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Origin', 'https://attacker.example')
+        .set('Idempotency-Key', 'security-origin-blocked')
+        .send(registrationPayload)
+        .expect(403)
+        .expect({
+          code: 'ORIGIN_NOT_ALLOWED',
+          message: 'El origen de la solicitud no está autorizado.',
+        });
+
+      const [{ total }] = await dataSource.query<
+        Array<{ total: number | string }>
+      >('SELECT COUNT(*) AS total FROM tenants');
+      expect(Number(total)).toBe(0);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Origin', 'http://localhost:4200')
+        .set('Idempotency-Key', 'security-origin-allowed')
+        .send(registrationPayload)
+        .expect(201)
+        .expect('Access-Control-Allow-Origin', 'http://localhost:4200');
+    });
+
+    it('returns and logs only sanitized metadata for unexpected errors', async () => {
+      const registration = app.get(RegistrationService);
+      const sensitiveValue = 'mysql://admin:secret@example/database';
+      const service = jest
+        .spyOn(registration, 'register')
+        .mockRejectedValueOnce(new Error(sensitiveValue));
+      const logger = jest
+        .spyOn(Logger.prototype, 'error')
+        .mockImplementation(() => undefined);
+
+      try {
+        const response = await request(app.getHttpServer())
+          .post('/api/v1/auth/registrations')
+          .set('Origin', 'http://localhost:4200')
+          .set('Idempotency-Key', 'security-sanitized-error')
+          .send(registrationPayload)
+          .expect(500)
+          .expect({
+            statusCode: 500,
+            message: 'Internal server error',
+          });
+
+        expect(JSON.stringify(response.body)).not.toContain(sensitiveValue);
+        expect(JSON.stringify(logger.mock.calls)).not.toContain(sensitiveValue);
+        expect(logger).toHaveBeenCalledWith(
+          expect.stringContaining('unhandled_request_error'),
+        );
+      } finally {
+        service.mockRestore();
+        logger.mockRestore();
+      }
     });
   });
 

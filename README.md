@@ -70,6 +70,20 @@ jobs ni cachés con datos de negocio; la configuración es global y no almacena 
 de tenants. Cualquier job, caché o logging estructurado futuro que transporte datos de
 negocio deberá incluir y validar explícitamente `tenantId`.
 
+## Seguridad HTTP
+
+La API aplica cabeceras defensivas, CORS con allowlist y cookies de sesión
+`HttpOnly`, `SameSite=Lax` y `Secure` en producción. Las mutaciones enviadas por
+un navegador con `Origin` ajeno a `CORS_ORIGINS` se rechazan antes de procesar
+credenciales o datos. `X-Request-Id` permite correlacionar fallos; los errores
+inesperados sólo registran metadatos sanitizados y nunca el mensaje o stack.
+En producción se confía únicamente en el proxy frontal para recuperar la IP real
+que alimenta los límites de solicitudes.
+
+El workflow `Security` audita dependencias y escanea el historial Git en cada PR
+y push a `develop` o `master`. No se deben agregar excepciones al escaneo para
+credenciales reales; los secretos pertenecen al gestor seguro del ambiente.
+
 ## Gates
 
 ```bash
