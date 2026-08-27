@@ -6,9 +6,10 @@ import { ConfigureInitialCashRegisterDto } from './dto/configure-initial-cash-re
 import { ConfigureInitialLocationDto } from './dto/configure-initial-location.dto';
 import { OnboardingService } from './onboarding.service';
 import { AuditService } from '../audit/audit.service';
+import { OnboardingAccessGuard } from './onboarding-access.guard';
 
 @Controller('onboarding')
-@UseGuards(SessionGuard)
+@UseGuards(SessionGuard, OnboardingAccessGuard)
 export class OnboardingController {
   constructor(
     private readonly onboarding: OnboardingService,
