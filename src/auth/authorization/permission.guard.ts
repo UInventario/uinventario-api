@@ -19,10 +19,14 @@ export class PermissionGuard implements CanActivate {
       REQUIRED_PERMISSIONS,
       [context.getHandler(), context.getClass()],
     );
+    const auditOnly =
+      required?.length &&
+      required.every((permission) => permission.startsWith('AUDIT_'));
     if (
       request.principal.nextStep !== 'APPLICATION' ||
-      !request.principal.context.branch ||
-      !request.principal.context.warehouse ||
+      (!auditOnly &&
+        (!request.principal.context.branch ||
+          !request.principal.context.warehouse)) ||
       !required?.every((permission) =>
         request.principal.user.permissions.includes(permission),
       )
@@ -30,8 +34,15 @@ export class PermissionGuard implements CanActivate {
       const inventory = required?.some((permission) =>
         permission.startsWith('INVENTORY_'),
       );
+      const audit = required?.some((permission) =>
+        permission.startsWith('AUDIT_'),
+      );
       throw new ForbiddenException({
-        code: inventory ? 'INVENTORY_ACCESS_DENIED' : 'PERMISSION_DENIED',
+        code: audit
+          ? 'AUDIT_ACCESS_DENIED'
+          : inventory
+            ? 'INVENTORY_ACCESS_DENIED'
+            : 'PERMISSION_DENIED',
         message: 'No tienes permisos para realizar esta operación.',
       });
     }

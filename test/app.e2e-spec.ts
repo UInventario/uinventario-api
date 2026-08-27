@@ -13,6 +13,7 @@ import { configureApp } from '../src/security/configure-app';
 import { RegistrationService } from '../src/auth/registration/registration.service';
 import { ThrottlerStorage, ThrottlerStorageService } from '@nestjs/throttler';
 import * as ExcelJS from 'exceljs';
+import { AuditService } from '../src/audit/audit.service';
 
 describe('UInventario API (e2e)', () => {
   let app: INestApplication<App>;
@@ -35,6 +36,7 @@ describe('UInventario API (e2e)', () => {
     await dataSource.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const table of [
       'audit_events',
+      'audit_chain_heads',
       'password_reset_tokens',
       'sale_payments',
       'sale_lines',
@@ -881,6 +883,8 @@ describe('UInventario API (e2e)', () => {
                 roles: ['ADMIN'],
                 permissions: [
                   'ACCESS_MANAGE',
+                  'AUDIT_EXPORT',
+                  'AUDIT_VIEW',
                   'CASH_REGISTER_CLOSE',
                   'CASH_REGISTER_MOVE',
                   'CASH_REGISTER_OPEN',
@@ -5980,6 +5984,201 @@ describe('UInventario API (e2e)', () => {
         .expect(403)
         .expect(({ body }: { body: { code?: string } }) => {
           expect(body.code).toBe('AUDIT_ACCESS_DENIED');
+        });
+    });
+
+    it('redacts, chains, filters and exports audit events with delegated permissions', async () => {
+      await registerAccount('audit-integrity-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Tienda Íntegra, S.A. de C.V.',
+          tradeName: 'Tienda Íntegra',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Sucursal Íntegra',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Íntegra',
+          locationName: 'General Íntegra',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Íntegra' })
+        .expect(200);
+      const [principal] = await dataSource.query<
+        Array<{ id: string; tenant_id: string }>
+      >('SELECT id, tenant_id FROM users WHERE normalized_email = ? LIMIT 1', [
+        registrationPayload.email,
+      ]);
+      const audit = app.get(AuditService);
+      await Promise.all(
+        Array.from({ length: 25 }, (_, index) =>
+          audit.recordRequired({
+            tenantId: principal.tenant_id,
+            actorUserId: principal.id,
+            action: 'VOLUME_EVENT',
+            entityType: 'AUDIT_TEST',
+            entityId: randomUUID(),
+            correlationId: `audit-volume-${index}`,
+            origin: 'SYSTEM',
+            after: {
+              index,
+              password: `password-${index}`,
+              nested: {
+                apiKey: `key-${index}`,
+                note: `Bearer token-${index}`,
+              },
+            },
+          }),
+        ),
+      );
+
+      const response = await request(app.getHttpServer())
+        .get('/api/v1/audit-events')
+        .query({
+          action: 'VOLUME_EVENT',
+          q: 'audit-volume',
+          page: 2,
+          pageSize: 10,
+        })
+        .set('Cookie', cookie)
+        .expect(200);
+      const body = response.body as {
+        data: Array<{
+          id: string;
+          tenantId: string;
+          sequence: number;
+          origin: string;
+          retentionUntil: string;
+          impersonator: null;
+          after: Record<string, unknown>;
+          integrity: { valid: boolean; hash: string; previousHash: string };
+        }>;
+        meta: {
+          retention: { minimumDays: number; policy: string };
+          integrity: { valid: boolean };
+          pagination: { total: number; page: number; totalPages: number };
+        };
+      };
+      expect(body.meta).toMatchObject({
+        retention: { minimumDays: 365, policy: 'APPEND_ONLY' },
+        integrity: { valid: true },
+        pagination: { total: 25, page: 2, totalPages: 3 },
+      });
+      expect(body.data).toHaveLength(10);
+      expect(
+        body.data.every(
+          (event) =>
+            event.tenantId === principal.tenant_id &&
+            event.origin === 'SYSTEM' &&
+            event.impersonator === null &&
+            event.integrity.valid &&
+            event.integrity.hash.length === 64 &&
+            event.integrity.previousHash.length === 64 &&
+            Date.parse(event.retentionUntil) > Date.now(),
+        ),
+      ).toBe(true);
+      expect(JSON.stringify(body.data)).not.toContain('password-');
+      expect(JSON.stringify(body.data)).not.toContain('key-');
+      expect(JSON.stringify(body.data)).not.toContain('token-');
+      expect(JSON.stringify(body.data)).toContain('[REDACTED]');
+
+      const exported = await request(app.getHttpServer())
+        .get('/api/v1/audit-events/export')
+        .query({ action: 'VOLUME_EVENT' })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect('Content-Type', /text\/csv/)
+        .expect('Content-Disposition', /audit-\d{4}-\d{2}-\d{2}\.csv/);
+      expect(exported.text.split('\r\n').filter(Boolean)).toHaveLength(26);
+      expect(exported.text).not.toContain('password-');
+      expect(exported.text).toContain('[REDACTED]');
+
+      await request(app.getHttpServer())
+        .get('/api/v1/audit-events')
+        .query({ action: 'AUDIT_EXPORT_CREATED' })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: Array<{
+                origin: string;
+                after: { filters: { action?: string }; results: number };
+                integrity: { valid: boolean };
+              }>;
+            };
+          }) => {
+            expect(body.data[0]).toMatchObject({
+              origin: 'ADMIN_CONSOLE',
+              after: { results: 25 },
+              integrity: { valid: true },
+            });
+            expect(body.data[0].after.filters.action).toBe('VOLUME_EVENT');
+          },
+        );
+
+      const viewerRoleId = randomUUID();
+      await dataSource.query(
+        `INSERT INTO roles (id, tenant_id, code, name)
+         VALUES (?, ?, 'AUDITOR', 'Auditor de solo lectura')`,
+        [viewerRoleId, principal.tenant_id],
+      );
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'AUDIT_VIEW')`,
+        [viewerRoleId, principal.tenant_id],
+      );
+      await dataSource.query('DELETE FROM user_roles WHERE user_id = ?', [
+        principal.id,
+      ]);
+      await dataSource.query(
+        'INSERT INTO user_roles (user_id, role_id, tenant_id) VALUES (?, ?, ?)',
+        [principal.id, viewerRoleId, principal.tenant_id],
+      );
+      const viewerCookie = await createPersistedSession(
+        registrationPayload.email,
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/audit-events')
+        .query({ action: 'VOLUME_EVENT', pageSize: 1 })
+        .set('Cookie', viewerCookie)
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/audit-events/export')
+        .set('Cookie', viewerCookie)
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('AUDIT_ACCESS_DENIED');
+        });
+
+      const eventId = body.data[0].id;
+      await dataSource.query(
+        `UPDATE audit_events SET after_data = JSON_OBJECT('tampered', TRUE)
+         WHERE id = ?`,
+        [eventId],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/audit-events')
+        .query({ action: 'VOLUME_EVENT', q: eventId })
+        .set('Cookie', viewerCookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [{ id: eventId, integrity: { valid: false } }],
+            meta: { integrity: { valid: false } },
+          });
         });
     });
   });
