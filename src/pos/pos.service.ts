@@ -88,6 +88,12 @@ export class PosService {
           message: 'La clave de idempotencia ya fue usada con otros datos.',
         });
       }
+      if (error instanceof PosInsufficientStockError) {
+        throw new ConflictException({
+          code: 'INSUFFICIENT_STOCK',
+          productId: error.productId,
+        });
+      }
       throw error;
     }
   }

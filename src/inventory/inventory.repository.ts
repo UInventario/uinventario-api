@@ -18,7 +18,7 @@ import {
 
 interface MovementRow {
   id: string;
-  type: 'INITIAL' | 'ENTRY' | 'ADJUSTMENT';
+  type: 'INITIAL' | 'ENTRY' | 'ADJUSTMENT' | 'SALE';
   quantity_change: string;
   resulting_quantity: string;
   reason: string;
