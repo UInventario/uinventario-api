@@ -249,7 +249,7 @@ describe('UInventario API (e2e)', () => {
         .set('Idempotency-Key', 'registration-retry-1')
         .send(payload)
         .expect(201)
-        .expect(expectedBody);
+        .expect(expectedBody as object);
 
       const [{ total }] = await dataSource.query<
         Array<{ total: string | number }>
