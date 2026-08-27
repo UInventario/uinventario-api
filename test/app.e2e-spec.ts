@@ -39,6 +39,8 @@ describe('UInventario API (e2e)', () => {
       'sale_lines',
       'sales',
       'inventory_movements',
+      'inventory_transfer_receipt_lines',
+      'inventory_transfer_receipts',
       'inventory_transfer_lines',
       'inventory_transfers',
       'inventory_balances',
@@ -2298,7 +2300,11 @@ describe('UInventario API (e2e)', () => {
         .set('Idempotency-Key', 'transfer-create-main')
         .send(transferInput('6', 'TR-001'))
         .expect(201);
-      const transferId = (created.body as { data: { id: string } }).data.id;
+      const mainTransfer = created.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+      const transferId = mainTransfer.data.id;
+      const transferLineId = mainTransfer.data.lines[0].id;
       await request(app.getHttpServer())
         .post('/api/v1/inventory/transfers')
         .set('Cookie', cookie)
@@ -2423,6 +2429,190 @@ describe('UInventario API (e2e)', () => {
           });
         });
 
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${transferId}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'transfer-receive-wrong-context')
+        .send({
+          lines: [
+            {
+              transferLineId,
+              receivedQuantity: '1',
+              discrepancyQuantity: '0',
+            },
+          ],
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVALID_TRANSFER_TARGET');
+        });
+
+      await request(app.getHttpServer())
+        .patch('/api/v1/auth/sessions/current/context')
+        .set('Cookie', cookie)
+        .send({
+          branchId: destination.id,
+          warehouseId: destinationWarehouse.id,
+        })
+        .expect(200);
+      const partialReceipt = {
+        lines: [
+          {
+            transferLineId,
+            receivedQuantity: '2',
+            discrepancyQuantity: '0',
+          },
+        ],
+      };
+      const concurrentReceiptReplay = await Promise.all(
+        ['first', 'second'].map(() =>
+          request(app.getHttpServer())
+            .post(`/api/v1/inventory/transfers/${transferId}/receipts`)
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', 'transfer-receive-partial')
+            .send(partialReceipt),
+        ),
+      );
+      expect(concurrentReceiptReplay.map(({ status }) => status)).toEqual([
+        200, 200,
+      ]);
+      expect(
+        concurrentReceiptReplay.map(
+          ({ body }) =>
+            (body as { meta: { idempotentReplay: boolean } }).meta
+              .idempotentReplay,
+        ),
+      ).toContain(true);
+      expect(concurrentReceiptReplay[0].body).toMatchObject({
+        data: {
+          status: 'PARTIALLY_RECEIVED',
+          lines: [
+            {
+              id: transferLineId,
+              receivedQuantity: '2.000',
+              discrepancyQuantity: '0.000',
+              pendingQuantity: '4.000',
+            },
+          ],
+        },
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${transferId}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'transfer-receive-excess')
+        .send({
+          lines: [
+            {
+              transferLineId,
+              receivedQuantity: '5',
+              discrepancyQuantity: '0',
+            },
+          ],
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('TRANSFER_RECEIPT_EXCEEDS_PENDING');
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${transferId}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'transfer-receive-missing-reason')
+        .send({
+          lines: [
+            {
+              transferLineId,
+              receivedQuantity: '3',
+              discrepancyQuantity: '1',
+            },
+          ],
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('TRANSFER_DISCREPANCY_REASON_REQUIRED');
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${transferId}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'transfer-receive-final')
+        .send({
+          discrepancyReason: 'Faltante confirmado al abrir el embarque',
+          lines: [
+            {
+              transferLineId,
+              receivedQuantity: '3',
+              discrepancyQuantity: '1',
+            },
+          ],
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              status: 'RECEIVED',
+              lines: [
+                {
+                  id: transferLineId,
+                  receivedQuantity: '5.000',
+                  discrepancyQuantity: '1.000',
+                  pendingQuantity: '0.000',
+                },
+              ],
+              receipts: [
+                {
+                  receivedBy: { email: registrationPayload.email },
+                  lines: [
+                    {
+                      transferLineId,
+                      receivedQuantity: '2.000',
+                      discrepancyQuantity: '0.000',
+                    },
+                  ],
+                },
+                {
+                  discrepancyReason: 'Faltante confirmado al abrir el embarque',
+                  receivedBy: { email: registrationPayload.email },
+                  lines: [
+                    {
+                      transferLineId,
+                      receivedQuantity: '3.000',
+                      discrepancyQuantity: '1.000',
+                    },
+                  ],
+                },
+              ],
+            },
+          });
+        });
+
+      const successfulCompetingId =
+        competingTransfers[
+          competingDispatches.findIndex(({ status }) => status === 200)
+        ];
+      const successfulCompeting = await request(app.getHttpServer())
+        .get(`/api/v1/inventory/transfers/${successfulCompetingId}`)
+        .set('Cookie', cookie)
+        .expect(200);
+      const successfulCompetingLineId = (
+        successfulCompeting.body as { data: { lines: Array<{ id: string }> } }
+      ).data.lines[0].id;
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${successfulCompetingId}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'transfer-receive-complete')
+        .send({
+          lines: [
+            {
+              transferLineId: successfulCompetingLineId,
+              receivedQuantity: '3',
+              discrepancyQuantity: '0',
+            },
+          ],
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { status: 'RECEIVED' } });
+        });
+
       const balances = await dataSource.query<
         Array<{
           location_id: string;
@@ -2448,11 +2638,11 @@ describe('UInventario API (e2e)', () => {
         in_transit_quantity: '0.000',
       });
       expect(target).toMatchObject({
-        quantity: '9.000',
-        available_quantity: '0.000',
-        in_transit_quantity: '9.000',
+        quantity: '8.000',
+        available_quantity: '8.000',
+        in_transit_quantity: '0.000',
       });
-      expect(Number(source.quantity) + Number(target.quantity)).toBe(10);
+      expect(Number(source.quantity) + Number(target.quantity)).toBe(9);
 
       await request(app.getHttpServer())
         .get(`/api/v1/inventory/transfers/${transferId}`)
@@ -2462,7 +2652,7 @@ describe('UInventario API (e2e)', () => {
           expect(body).toMatchObject({
             data: {
               id: transferId,
-              status: 'DISPATCHED',
+              status: 'RECEIVED',
               reference: 'TR-001',
               reason: 'Reabasto entre sucursales',
               originWarehouse: { id: originWarehouse.id },
@@ -2486,8 +2676,8 @@ describe('UInventario API (e2e)', () => {
          WHERE transfer_id IS NOT NULL AND product_id = ?`,
         [productId],
       );
-      expect(Number(movementSummary.transfers)).toBe(4);
-      expect(Number(movementSummary.movement_total)).toBe(0);
+      expect(Number(movementSummary.transfers)).toBe(8);
+      expect(Number(movementSummary.movement_total)).toBe(-1);
     });
 
     it('rejects products and locations outside the active tenant', async () => {
@@ -2589,9 +2779,11 @@ describe('UInventario API (e2e)', () => {
           ],
         })
         .expect(201);
-      const foreignTransferId = (
-        foreignTransferResponse.body as { data: { id: string } }
-      ).data.id;
+      const foreignTransferData = foreignTransferResponse.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+      const foreignTransferId = foreignTransferData.data.id;
+      const foreignTransferLineId = foreignTransferData.data.lines[0].id;
 
       const foreignContext = await request(app.getHttpServer())
         .patch('/api/v1/auth/sessions/current/context')
@@ -2617,6 +2809,36 @@ describe('UInventario API (e2e)', () => {
         .set('Cookie', primaryCookie)
         .expect(404);
       expect(foreignTransfer.body).toEqual(missingTransfer.body);
+
+      const foreignReceipt = await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${foreignTransferId}/receipts`)
+        .set('Cookie', primaryCookie)
+        .set('Idempotency-Key', 'inventory-foreign-receipt')
+        .send({
+          lines: [
+            {
+              transferLineId: foreignTransferLineId,
+              receivedQuantity: '1',
+              discrepancyQuantity: '0',
+            },
+          ],
+        })
+        .expect(404);
+      const missingReceipt = await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${randomUUID()}/receipts`)
+        .set('Cookie', primaryCookie)
+        .set('Idempotency-Key', 'inventory-missing-receipt')
+        .send({
+          lines: [
+            {
+              transferLineId: randomUUID(),
+              receivedQuantity: '1',
+              discrepancyQuantity: '0',
+            },
+          ],
+        })
+        .expect(404);
+      expect(foreignReceipt.body).toEqual(missingReceipt.body);
 
       const invalidTransferInput = (destinationWarehouseId: string) => ({
         destinationWarehouseId,
@@ -3755,7 +3977,10 @@ describe('UInventario API (e2e)', () => {
   describe('Core audit trail', () => {
     beforeEach(async () => {
       await resetIdentityData();
-      app.get<ThrottlerStorageService>(ThrottlerStorage).storage.clear();
+      const throttlerStorage =
+        app.get<ThrottlerStorageService>(ThrottlerStorage);
+      throttlerStorage.onApplicationShutdown();
+      throttlerStorage.storage.clear();
     });
 
     it('records critical actions without secrets and exposes an admin-only append-only view', async () => {
@@ -3948,7 +4173,10 @@ describe('UInventario API (e2e)', () => {
   describe('Core release persistence', () => {
     beforeEach(async () => {
       await resetIdentityData();
-      app.get<ThrottlerStorageService>(ThrottlerStorage).storage.clear();
+      const throttlerStorage =
+        app.get<ThrottlerStorageService>(ThrottlerStorage);
+      throttlerStorage.onApplicationShutdown();
+      throttlerStorage.storage.clear();
     });
 
     it('keeps the completed Core journey available after an application restart', async () => {

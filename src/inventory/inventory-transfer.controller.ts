@@ -14,6 +14,7 @@ import { AuditService } from '../audit/audit.service';
 import { SessionGuard } from '../auth/session/session.guard';
 import type { AuthenticatedRequest } from '../auth/session/session.types';
 import { CreateInventoryTransferDto } from './dto/create-inventory-transfer.dto';
+import { ReceiveInventoryTransferDto } from './dto/receive-inventory-transfer.dto';
 import { InventoryAccessGuard } from './inventory-access.guard';
 import { InventoryTransferService } from './inventory-transfer.service';
 
@@ -76,6 +77,31 @@ export class InventoryTransferController {
     await this.record(
       request,
       'INVENTORY_TRANSFER_DISPATCHED',
+      result.data.id,
+      true,
+    );
+    return result;
+  }
+
+  @Post(':transferId/receipts')
+  @HttpCode(200)
+  async receive(
+    @Req() request: AuthenticatedRequest,
+    @Param('transferId', new ParseUUIDPipe()) transferId: string,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: ReceiveInventoryTransferDto,
+  ) {
+    const result = await this.transfers.receive({
+      tenantId: request.principal.tenant.id,
+      transferId,
+      destinationWarehouseId: request.principal.context.warehouse!.id,
+      userId: request.principal.user.id,
+      idempotencyKey,
+      dto,
+    });
+    await this.record(
+      request,
+      'INVENTORY_TRANSFER_RECEIVED',
       result.data.id,
       true,
     );

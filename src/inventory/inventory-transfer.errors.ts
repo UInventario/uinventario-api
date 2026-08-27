@@ -33,3 +33,21 @@ export class InventoryTransferInsufficientStockError extends Error {
     super('INVENTORY_TRANSFER_INSUFFICIENT_STOCK');
   }
 }
+
+export class InvalidInventoryTransferReceiptError extends Error {
+  constructor() {
+    super('INVALID_INVENTORY_TRANSFER_RECEIPT');
+  }
+}
+
+export class InventoryTransferDiscrepancyReasonRequiredError extends Error {
+  constructor() {
+    super('INVENTORY_TRANSFER_DISCREPANCY_REASON_REQUIRED');
+  }
+}
+
+export class InventoryTransferReceiptExceedsPendingError extends Error {
+  constructor() {
+    super('INVENTORY_TRANSFER_RECEIPT_EXCEEDS_PENDING');
+  }
+}

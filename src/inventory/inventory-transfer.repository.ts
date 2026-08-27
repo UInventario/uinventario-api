@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { CreateInventoryTransferDto } from './dto/create-inventory-transfer.dto';
+import { ReceiveInventoryTransferDto } from './dto/receive-inventory-transfer.dto';
 import {
   DuplicateInventoryTransferLineError,
   InvalidInventoryTransferTargetError,
@@ -9,10 +10,14 @@ import {
   InventoryTransferInsufficientStockError,
   InventoryTransferNotFoundError,
   InventoryTransferStatusConflictError,
+  InvalidInventoryTransferReceiptError,
+  InventoryTransferDiscrepancyReasonRequiredError,
+  InventoryTransferReceiptExceedsPendingError,
 } from './inventory-transfer.errors';
 import {
   InventoryTransferData,
   InventoryTransferLineData,
+  InventoryTransferReceiptData,
   InventoryTransferStatus,
 } from './inventory-transfer.types';
 
@@ -61,6 +66,27 @@ interface TransferLineRow {
   destination_location_active: number | boolean;
   destination_warehouse_id: string;
   quantity: string;
+  received_quantity: string;
+  discrepancy_quantity: string;
+}
+
+interface ReceiptHeaderRow {
+  id: string;
+  discrepancy_reason: string | null;
+  created_at: Date;
+  received_user_id: string;
+  received_user_email: string;
+}
+
+interface ReceiptLineRow {
+  id: string;
+  line_number: number;
+  transfer_line_id: string;
+  product_id: string;
+  product_name: string;
+  product_sku: string;
+  received_quantity: string;
+  discrepancy_quantity: string;
 }
 
 interface BalanceState {
@@ -402,6 +428,297 @@ export class InventoryTransferRepository {
     }
   }
 
+  async receive(input: {
+    tenantId: string;
+    transferId: string;
+    destinationWarehouseId: string;
+    userId: string;
+    idempotencyKey: string;
+    dto: ReceiveInventoryTransferDto;
+  }): Promise<{ transfer: InventoryTransferData; replay: boolean }> {
+    const lineIds = input.dto.lines.map(({ transferLineId }) => transferLineId);
+    if (new Set(lineIds).size !== lineIds.length)
+      throw new InvalidInventoryTransferReceiptError();
+    const normalizedLines = input.dto.lines.map((line) => ({
+      transferLineId: line.transferLineId,
+      receivedQuantity: this.fromUnits(this.toUnits(line.receivedQuantity)),
+      discrepancyQuantity: this.fromUnits(
+        this.toUnits(line.discrepancyQuantity),
+      ),
+    }));
+    if (
+      normalizedLines.every(
+        (line) =>
+          this.toUnits(line.receivedQuantity) === 0n &&
+          this.toUnits(line.discrepancyQuantity) === 0n,
+      )
+    ) {
+      throw new InvalidInventoryTransferReceiptError();
+    }
+    const hasDiscrepancy = normalizedLines.some(
+      (line) => this.toUnits(line.discrepancyQuantity) > 0n,
+    );
+    if (hasDiscrepancy && !input.dto.discrepancyReason) {
+      throw new InventoryTransferDiscrepancyReasonRequiredError();
+    }
+    const fingerprint = createHash('sha256')
+      .update(
+        JSON.stringify({
+          transferId: input.transferId,
+          lines: [...normalizedLines].sort((left, right) =>
+            left.transferLineId.localeCompare(right.transferLineId),
+          ),
+          discrepancyReason: input.dto.discrepancyReason ?? null,
+        }),
+      )
+      .digest('hex');
+
+    try {
+      return await this.dataSource.transaction(
+        'READ COMMITTED',
+        async (manager) => {
+          const existing = await this.findReceiptByKey(
+            manager,
+            input.tenantId,
+            input.idempotencyKey,
+          );
+          if (existing) {
+            if (
+              existing.transferId !== input.transferId ||
+              existing.fingerprint !== fingerprint
+            ) {
+              throw new InventoryTransferIdempotencyConflictError();
+            }
+            const transfer = await this.findDocument(
+              manager,
+              input.tenantId,
+              input.transferId,
+            );
+            if (!transfer) throw new InventoryTransferNotFoundError();
+            return { transfer, replay: true };
+          }
+          const [header] = await manager.query<
+            Array<{
+              status: InventoryTransferStatus;
+              destination_warehouse_id: string;
+              reference: string;
+            }>
+          >(
+            `SELECT status, destination_warehouse_id, reference
+             FROM inventory_transfers
+             WHERE id = ? AND tenant_id = ? FOR UPDATE`,
+            [input.transferId, input.tenantId],
+          );
+          if (!header) throw new InventoryTransferNotFoundError();
+          if (header.destination_warehouse_id !== input.destinationWarehouseId)
+            throw new InvalidInventoryTransferTargetError();
+          if (!['DISPATCHED', 'PARTIALLY_RECEIVED'].includes(header.status))
+            throw new InventoryTransferStatusConflictError();
+
+          const transferLines = await this.findLineRows(
+            manager,
+            input.tenantId,
+            input.transferId,
+          );
+          const transferLineMap = new Map(
+            transferLines.map((line) => [line.id, line]),
+          );
+          const requested = normalizedLines.map((line) => {
+            const transferLine = transferLineMap.get(line.transferLineId);
+            if (!transferLine) throw new InvalidInventoryTransferReceiptError();
+            const received = this.toUnits(line.receivedQuantity);
+            const discrepancy = this.toUnits(line.discrepancyQuantity);
+            const processed = received + discrepancy;
+            if (processed <= 0n)
+              throw new InvalidInventoryTransferReceiptError();
+            const pending =
+              this.toUnits(transferLine.quantity) -
+              this.toUnits(transferLine.received_quantity) -
+              this.toUnits(transferLine.discrepancy_quantity);
+            if (processed > pending)
+              throw new InventoryTransferReceiptExceedsPendingError();
+            return { transferLine, received, discrepancy };
+          });
+
+          const balanceKeys = [
+            ...new Set(
+              requested.map(
+                ({ transferLine }) =>
+                  `${transferLine.product_id}:${transferLine.destination_location_id}`,
+              ),
+            ),
+          ].sort();
+          const balances = new Map<string, BalanceState>();
+          for (const key of balanceKeys) {
+            const separator = key.indexOf(':');
+            const productId = key.slice(0, separator);
+            const locationId = key.slice(separator + 1);
+            const [balance] = await manager.query<
+              Array<{
+                quantity: string;
+                available_quantity: string;
+                reserved_quantity: string;
+                damaged_quantity: string;
+                in_transit_quantity: string;
+              }>
+            >(
+              `SELECT quantity, available_quantity, reserved_quantity,
+                      damaged_quantity, in_transit_quantity
+               FROM inventory_balances
+               WHERE tenant_id = ? AND product_id = ? AND location_id = ? FOR UPDATE`,
+              [input.tenantId, productId, locationId],
+            );
+            if (!balance) throw new InvalidInventoryTransferReceiptError();
+            balances.set(key, {
+              quantity: this.toUnits(balance.quantity),
+              available: this.toUnits(balance.available_quantity),
+              reserved: this.toUnits(balance.reserved_quantity),
+              damaged: this.toUnits(balance.damaged_quantity),
+              inTransit: this.toUnits(balance.in_transit_quantity),
+            });
+          }
+
+          const receiptId = randomUUID();
+          await manager.query(
+            `INSERT INTO inventory_transfer_receipts
+              (id, tenant_id, transfer_id, discrepancy_reason, idempotency_key,
+               request_fingerprint, received_by_user_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+              receiptId,
+              input.tenantId,
+              input.transferId,
+              input.dto.discrepancyReason ?? null,
+              input.idempotencyKey,
+              fingerprint,
+              input.userId,
+            ],
+          );
+          for (const [index, item] of requested.entries()) {
+            const line = item.transferLine;
+            const processed = item.received + item.discrepancy;
+            const balanceKey = `${line.product_id}:${line.destination_location_id}`;
+            const balance = balances.get(balanceKey)!;
+            if (balance.inTransit < processed)
+              throw new InvalidInventoryTransferReceiptError();
+            balance.inTransit -= processed;
+            balance.available += item.received;
+            balance.quantity -= item.discrepancy;
+            await this.updateBalance(
+              manager,
+              input.tenantId,
+              line.product_id,
+              line.destination_location_id,
+              balance,
+            );
+            await manager.query(
+              `UPDATE inventory_transfer_lines
+               SET received_quantity = received_quantity + ?,
+                   discrepancy_quantity = discrepancy_quantity + ?
+               WHERE id = ? AND tenant_id = ?`,
+              [
+                this.fromUnits(item.received),
+                this.fromUnits(item.discrepancy),
+                line.id,
+                input.tenantId,
+              ],
+            );
+            const receiptLineId = randomUUID();
+            await manager.query(
+              `INSERT INTO inventory_transfer_receipt_lines
+                (id, tenant_id, receipt_id, transfer_line_id, line_number,
+                 received_quantity, discrepancy_quantity)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              [
+                receiptLineId,
+                input.tenantId,
+                receiptId,
+                line.id,
+                index + 1,
+                this.fromUnits(item.received),
+                this.fromUnits(item.discrepancy),
+              ],
+            );
+            if (item.received > 0n) {
+              await this.insertReceiptMovement({
+                manager,
+                tenantId: input.tenantId,
+                transferId: input.transferId,
+                transferLine: line,
+                receiptId,
+                receiptLineId,
+                userId: input.userId,
+                type: 'TRANSFER_RECEIPT',
+                quantity: item.received,
+                resultingQuantity: balance.quantity,
+                reason: `Recepción ${header.reference}`,
+                reference: header.reference,
+              });
+            }
+            if (item.discrepancy > 0n) {
+              await this.insertReceiptMovement({
+                manager,
+                tenantId: input.tenantId,
+                transferId: input.transferId,
+                transferLine: line,
+                receiptId,
+                receiptLineId,
+                userId: input.userId,
+                type: 'TRANSFER_DISCREPANCY',
+                quantity: item.discrepancy,
+                resultingQuantity: balance.quantity,
+                reason: input.dto.discrepancyReason!,
+                reference: header.reference,
+              });
+            }
+          }
+          const [progress] = await manager.query<
+            Array<{ pending: number | string }>
+          >(
+            `SELECT COUNT(*) AS pending FROM inventory_transfer_lines
+             WHERE tenant_id = ? AND transfer_id = ?
+               AND received_quantity + discrepancy_quantity < quantity`,
+            [input.tenantId, input.transferId],
+          );
+          const status =
+            Number(progress.pending) === 0 ? 'RECEIVED' : 'PARTIALLY_RECEIVED';
+          await manager.query(
+            'UPDATE inventory_transfers SET status = ? WHERE id = ? AND tenant_id = ?',
+            [status, input.transferId, input.tenantId],
+          );
+          const transfer = await this.findDocument(
+            manager,
+            input.tenantId,
+            input.transferId,
+          );
+          if (!transfer) throw new InventoryTransferNotFoundError();
+          return { transfer, replay: false };
+        },
+      );
+    } catch (error) {
+      if (!this.isDuplicate(error)) throw error;
+      const existing = await this.findReceiptByKey(
+        this.dataSource.manager,
+        input.tenantId,
+        input.idempotencyKey,
+      );
+      if (
+        !existing ||
+        existing.transferId !== input.transferId ||
+        existing.fingerprint !== fingerprint
+      ) {
+        throw new InventoryTransferIdempotencyConflictError();
+      }
+      const transfer = await this.findDocument(
+        this.dataSource.manager,
+        input.tenantId,
+        input.transferId,
+      );
+      if (!transfer) throw new InventoryTransferNotFoundError();
+      return { transfer, replay: true };
+    }
+  }
+
   async cancel(
     tenantId: string,
     transferId: string,
@@ -450,6 +767,24 @@ export class InventoryTransferRepository {
     return transfer ? { transfer, fingerprint: row.request_fingerprint } : null;
   }
 
+  private async findReceiptByKey(
+    manager: EntityManager,
+    tenantId: string,
+    key: string,
+  ): Promise<{ transferId: string; fingerprint: string } | null> {
+    const [row] = await manager.query<
+      Array<{ transfer_id: string; request_fingerprint: string }>
+    >(
+      `SELECT transfer_id, request_fingerprint
+       FROM inventory_transfer_receipts
+       WHERE tenant_id = ? AND idempotency_key = ? LIMIT 1`,
+      [tenantId, key],
+    );
+    return row
+      ? { transferId: row.transfer_id, fingerprint: row.request_fingerprint }
+      : null;
+  }
+
   private async findDocument(
     manager: EntityManager,
     tenantId: string,
@@ -479,6 +814,7 @@ export class InventoryTransferRepository {
     );
     if (!header) return null;
     const lines = await this.findLineRows(manager, tenantId, transferId);
+    const receipts = await this.findReceipts(manager, tenantId, transferId);
     return {
       id: header.id,
       status: header.status,
@@ -501,6 +837,7 @@ export class InventoryTransferRepository {
         },
       },
       lines: lines.map((line) => this.toLine(line)),
+      receipts,
       createdBy: {
         id: header.created_user_id,
         email: header.created_user_email,
@@ -533,6 +870,7 @@ export class InventoryTransferRepository {
   ): Promise<TransferLineRow[]> {
     return manager.query<TransferLineRow[]>(
       `SELECT tl.id, tl.line_number, tl.quantity,
+              tl.received_quantity, tl.discrepancy_quantity,
               p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
               p.active AS product_active,
               sl.id AS source_location_id, sl.name AS source_location_name,
@@ -548,6 +886,63 @@ export class InventoryTransferRepository {
        WHERE tl.tenant_id = ? AND tl.transfer_id = ?
        ORDER BY tl.line_number, tl.id`,
       [tenantId, transferId],
+    );
+  }
+
+  private async findReceipts(
+    manager: EntityManager,
+    tenantId: string,
+    transferId: string,
+  ): Promise<InventoryTransferReceiptData[]> {
+    const headers = await manager.query<ReceiptHeaderRow[]>(
+      `SELECT r.id, r.discrepancy_reason, r.created_at,
+              u.id AS received_user_id, u.email AS received_user_email
+       FROM inventory_transfer_receipts r
+       INNER JOIN users u ON u.id = r.received_by_user_id AND u.tenant_id = r.tenant_id
+       WHERE r.tenant_id = ? AND r.transfer_id = ?
+       ORDER BY r.created_at, r.id`,
+      [tenantId, transferId],
+    );
+    return Promise.all(
+      headers.map(async (header) => {
+        const lines = await manager.query<ReceiptLineRow[]>(
+          `SELECT rl.id, rl.line_number, rl.transfer_line_id,
+                  p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
+                  rl.received_quantity, rl.discrepancy_quantity
+           FROM inventory_transfer_receipt_lines rl
+           INNER JOIN inventory_transfer_lines tl
+             ON tl.id = rl.transfer_line_id AND tl.tenant_id = rl.tenant_id
+           INNER JOIN products p ON p.id = tl.product_id AND p.tenant_id = rl.tenant_id
+           WHERE rl.tenant_id = ? AND rl.receipt_id = ?
+           ORDER BY rl.line_number, rl.id`,
+          [tenantId, header.id],
+        );
+        return {
+          id: header.id,
+          discrepancyReason: header.discrepancy_reason,
+          receivedBy: {
+            id: header.received_user_id,
+            email: header.received_user_email,
+          },
+          createdAt: new Date(header.created_at).toISOString(),
+          lines: lines.map((line) => ({
+            id: line.id,
+            lineNumber: Number(line.line_number),
+            transferLineId: line.transfer_line_id,
+            product: {
+              id: line.product_id,
+              name: line.product_name,
+              sku: line.product_sku,
+            },
+            receivedQuantity: this.fromUnits(
+              this.toUnits(line.received_quantity),
+            ),
+            discrepancyQuantity: this.fromUnits(
+              this.toUnits(line.discrepancy_quantity),
+            ),
+          })),
+        };
+      }),
     );
   }
 
@@ -697,7 +1092,70 @@ export class InventoryTransferRepository {
     );
   }
 
+  private async insertReceiptMovement(input: {
+    manager: EntityManager;
+    tenantId: string;
+    transferId: string;
+    transferLine: TransferLineRow;
+    receiptId: string;
+    receiptLineId: string;
+    userId: string;
+    type: 'TRANSFER_RECEIPT' | 'TRANSFER_DISCREPANCY';
+    quantity: bigint;
+    resultingQuantity: bigint;
+    reason: string;
+    reference: string;
+  }): Promise<void> {
+    const movementKey = `receipt:${input.receiptId}:${input.transferLine.line_number}:${input.type}`;
+    const isReceipt = input.type === 'TRANSFER_RECEIPT';
+    const quantityChange = isReceipt
+      ? '0.000'
+      : this.fromUnits(-input.quantity);
+    const fingerprint = createHash('sha256')
+      .update(
+        JSON.stringify({
+          receiptId: input.receiptId,
+          receiptLineId: input.receiptLineId,
+          type: input.type,
+          quantity: this.fromUnits(input.quantity),
+        }),
+      )
+      .digest('hex');
+    await input.manager.query(
+      `INSERT INTO inventory_movements
+        (id, tenant_id, product_id, location_id, type, from_state, to_state,
+         state_quantity, quantity_change, resulting_quantity, reason, reference,
+         idempotency_key, request_fingerprint, created_by_user_id,
+         transfer_id, transfer_line_id, receipt_id, receipt_line_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        randomUUID(),
+        input.tenantId,
+        input.transferLine.product_id,
+        input.transferLine.destination_location_id,
+        input.type,
+        isReceipt ? 'IN_TRANSIT' : null,
+        isReceipt ? 'AVAILABLE' : null,
+        isReceipt ? this.fromUnits(input.quantity) : null,
+        quantityChange,
+        this.fromUnits(input.resultingQuantity),
+        input.reason,
+        input.reference,
+        movementKey,
+        fingerprint,
+        input.userId,
+        input.transferId,
+        input.transferLine.id,
+        input.receiptId,
+        input.receiptLineId,
+      ],
+    );
+  }
+
   private toLine(line: TransferLineRow): InventoryTransferLineData {
+    const received = this.toUnits(line.received_quantity);
+    const discrepancy = this.toUnits(line.discrepancy_quantity);
+    const pending = this.toUnits(line.quantity) - received - discrepancy;
     return {
       id: line.id,
       lineNumber: Number(line.line_number),
@@ -717,6 +1175,9 @@ export class InventoryTransferRepository {
         code: line.destination_location_code,
       },
       quantity: this.fromUnits(this.toUnits(line.quantity)),
+      receivedQuantity: this.fromUnits(received),
+      discrepancyQuantity: this.fromUnits(discrepancy),
+      pendingQuantity: this.fromUnits(pending),
     };
   }
 
