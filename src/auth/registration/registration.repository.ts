@@ -88,10 +88,11 @@ export class RegistrationRepository {
         (?, ?, 'CASH_REGISTER_MOVE'),
         (?, ?, 'ACCESS_MANAGE'),
         (?, ?, 'AUDIT_VIEW'), (?, ?, 'AUDIT_EXPORT'),
+        (?, ?, 'SUPPLIERS_MANAGE'),
         (?, ?, 'INVENTORY_VIEW'), (?, ?, 'INVENTORY_ADJUST'),
         (?, ?, 'INVENTORY_TRANSFER'), (?, ?, 'INVENTORY_COUNT'),
         (?, ?, 'INVENTORY_APPROVE')`,
-      Array.from({ length: 17 }, () => [role.id, tenant.id]).flat(),
+      Array.from({ length: 18 }, () => [role.id, tenant.id]).flat(),
     );
     await manager.update(
       RegistrationRequestEntity,

@@ -51,6 +51,8 @@ describe('UInventario API (e2e)', () => {
       'inventory_transfer_lines',
       'inventory_transfers',
       'inventory_balances',
+      'supplier_contacts',
+      'suppliers',
       'products',
       'brands',
       'categories',
@@ -898,6 +900,7 @@ describe('UInventario API (e2e)', () => {
                   'SALES_DISCOUNT',
                   'SALES_MANAGE',
                   'SALES_VOID',
+                  'SUPPLIERS_MANAGE',
                   'TENANT_MANAGE',
                 ],
               },
@@ -926,6 +929,274 @@ describe('UInventario API (e2e)', () => {
               nextStep: 'APPLICATION',
             },
           });
+        });
+    });
+  });
+
+  describe('supplier management', () => {
+    beforeEach(resetIdentityData);
+
+    async function completeSupplierOnboarding(
+      email: string,
+      cookie: string,
+    ): Promise<void> {
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: `${email} Legal`,
+          tradeName: email,
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Sucursal Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Principal',
+          locationName: 'Ubicación General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Principal' })
+        .expect(200);
+    }
+
+    it('creates, searches, updates and deactivates tenant-scoped suppliers', async () => {
+      await registerAccount('supplier-primary-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      const supplier = {
+        legalName: 'Café Mayorista, S.A. de C.V.',
+        tradeName: 'Café Mayorista',
+        taxIdentifier: 'ABC010203AB1',
+        contacts: [
+          {
+            name: 'Ana Compras',
+            email: 'ANA.COMPRAS@PROVEEDOR.EXAMPLE',
+            phone: '+52 55 1000 2000',
+            role: 'Ventas',
+            primary: true,
+          },
+        ],
+      };
+
+      await request(app.getHttpServer())
+        .post('/api/v1/suppliers')
+        .set('Cookie', cookie)
+        .send(supplier)
+        .expect(403);
+      await completeSupplierOnboarding(registrationPayload.email, cookie);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/suppliers')
+        .set('Cookie', cookie)
+        .send({ ...supplier, taxIdentifier: 'INVALID' })
+        .expect(400)
+        .expect(
+          ({ body }: { body: { code?: string; identifierType?: string } }) => {
+            expect(body.code).toBe('INVALID_SUPPLIER_TAX_IDENTIFIER');
+            expect(body.identifierType).toBe('RFC');
+          },
+        );
+
+      let created!: { id: string; version: number };
+      await request(app.getHttpServer())
+        .post('/api/v1/suppliers')
+        .set('Cookie', cookie)
+        .send(supplier)
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: typeof created & Record<string, unknown> };
+          }) => {
+            created = body.data;
+            expect(body.data).toMatchObject({
+              legalName: supplier.legalName,
+              tradeName: supplier.tradeName,
+              countryCode: 'MX',
+              identifierType: 'RFC',
+              taxIdentifier: supplier.taxIdentifier,
+              active: true,
+              version: 1,
+              contacts: [
+                {
+                  name: 'Ana Compras',
+                  email: 'ana.compras@proveedor.example',
+                  primary: true,
+                },
+              ],
+            });
+          },
+        );
+
+      for (const q of ['mayorista', 'ana.compras', 'ABC010203']) {
+        await request(app.getHttpServer())
+          .get('/api/v1/suppliers')
+          .query({ q, page: 1, pageSize: 10 })
+          .set('Cookie', cookie)
+          .expect(200)
+          .expect(
+            ({
+              body,
+            }: {
+              body: { data: Array<{ id: string }>; meta: object };
+            }) => {
+              expect(body.data).toEqual([
+                expect.objectContaining({ id: created.id }),
+              ]);
+              expect(body.meta).toMatchObject({
+                pagination: { page: 1, pageSize: 10, total: 1, totalPages: 1 },
+              });
+            },
+          );
+      }
+
+      await request(app.getHttpServer())
+        .post('/api/v1/suppliers')
+        .set('Cookie', cookie)
+        .send({
+          ...supplier,
+          legalName: 'Duplicado',
+          taxIdentifier: 'ABC-010203-AB1',
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SUPPLIER_IDENTIFIER_ALREADY_EXISTS');
+        });
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/suppliers/${created.id}`)
+        .set('Cookie', cookie)
+        .send({
+          ...supplier,
+          version: created.version,
+          contacts: [
+            ...supplier.contacts,
+            { name: 'Otra persona', email: 'otra@example.com', primary: true },
+          ],
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('MULTIPLE_PRIMARY_SUPPLIER_CONTACTS');
+        });
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/suppliers/${created.id}`)
+        .set('Cookie', cookie)
+        .send({
+          ...supplier,
+          legalName: 'Café Mayorista Actualizado',
+          version: created.version,
+          contacts: [
+            { name: 'Luis Ventas', phone: '+52 55 2000 3000', primary: true },
+          ],
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              legalName: 'Café Mayorista Actualizado',
+              version: 2,
+              contacts: [{ name: 'Luis Ventas', email: null, primary: true }],
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/suppliers/${created.id}`)
+        .set('Cookie', cookie)
+        .send({ ...supplier, version: 1 })
+        .expect(409)
+        .expect(
+          ({ body }: { body: { code?: string; currentVersion?: number } }) => {
+            expect(body.code).toBe('SUPPLIER_VERSION_CONFLICT');
+            expect(body.currentVersion).toBe(2);
+          },
+        );
+
+      const secondary = {
+        organizationName: 'Otra empresa',
+        email: 'other-supplier@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'supplier-secondary-registration')
+        .send(secondary)
+        .expect(201);
+      const secondaryCookie = await createPersistedSession(secondary.email);
+      await completeSupplierOnboarding(secondary.email, secondaryCookie);
+      await request(app.getHttpServer())
+        .post('/api/v1/suppliers')
+        .set('Cookie', secondaryCookie)
+        .send(supplier)
+        .expect(201);
+      await request(app.getHttpServer())
+        .get(`/api/v1/suppliers/${created.id}`)
+        .set('Cookie', secondaryCookie)
+        .expect(404);
+
+      await request(app.getHttpServer())
+        .delete(`/api/v1/suppliers/${created.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { active: false, version: 3 } });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/suppliers')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toHaveLength(0);
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/suppliers')
+        .query({ status: 'ALL' })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [{ id: created.id, active: false }],
+          });
+        });
+
+      const [audit] = await dataSource.query<
+        Array<{ event_count: number | string; pii: number | string }>
+      >(
+        `SELECT COUNT(*) AS event_count,
+                SUM(CASE WHEN after_data LIKE '%ana.compras%' THEN 1 ELSE 0 END) AS pii
+         FROM audit_events WHERE entity_type = 'SUPPLIER' AND entity_id = ?`,
+        [created.id],
+      );
+      expect(Number(audit.event_count)).toBe(3);
+      expect(Number(audit.pii)).toBe(0);
+
+      const [admin] = await dataSource.query<
+        Array<{ role_id: string; tenant_id: string }>
+      >(
+        `SELECT ur.role_id, u.tenant_id FROM users u
+         INNER JOIN user_roles ur ON ur.user_id = u.id AND ur.tenant_id = u.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'SUPPLIERS_MANAGE'`,
+        [admin.role_id, admin.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/suppliers')
+        .set('Cookie', cookie)
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PERMISSION_DENIED');
         });
     });
   });

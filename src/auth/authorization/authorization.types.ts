@@ -11,6 +11,7 @@ export const APP_PERMISSIONS = [
   'ACCESS_MANAGE',
   'AUDIT_VIEW',
   'AUDIT_EXPORT',
+  'SUPPLIERS_MANAGE',
   'INVENTORY_VIEW',
   'INVENTORY_ADJUST',
   'INVENTORY_TRANSFER',
@@ -39,4 +40,5 @@ export const OPERATIONAL_PERMISSIONS = [
   'CASH_REGISTER_MOVE',
   'AUDIT_VIEW',
   'AUDIT_EXPORT',
+  'SUPPLIERS_MANAGE',
 ] as const satisfies readonly AppPermission[];
