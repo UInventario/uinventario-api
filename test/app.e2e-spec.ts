@@ -211,7 +211,7 @@ describe('UInventario API (e2e)', () => {
   describe('session', () => {
     beforeEach(resetIdentityData);
 
-    it('authenticates and stores only a hash of the opaque cookie token', async () => {
+    it('authenticates, rotates once under refresh races and revokes on logout', async () => {
       await registerAccount('session-success-registration');
 
       const login = await request(app.getHttpServer())
@@ -251,6 +251,53 @@ describe('UInventario API (e2e)', () => {
       );
       expect(stored.token_hash).toHaveLength(64);
       expect(stored.token_hash).not.toBe(rawToken);
+
+      const oldCookie = setCookie[0].split(';', 1)[0];
+      const refreshAttempts = await Promise.all([
+        request(app.getHttpServer())
+          .post('/api/v1/auth/sessions/refresh')
+          .set('Cookie', oldCookie),
+        request(app.getHttpServer())
+          .post('/api/v1/auth/sessions/refresh')
+          .set('Cookie', oldCookie),
+      ]);
+      expect(refreshAttempts.map(({ status }) => status).sort()).toEqual([
+        200, 401,
+      ]);
+
+      const refresh = refreshAttempts.find(({ status }) => status === 200)!;
+      const refreshedCookie = (
+        refresh.headers['set-cookie'] as unknown as string[]
+      )[0].split(';', 1)[0];
+      expect(refreshedCookie).not.toBe(oldCookie);
+
+      const [rotated] = await dataSource.query<
+        Array<{ token_hash: string; revoked_at: Date | null }>
+      >('SELECT token_hash, revoked_at FROM sessions');
+      expect(rotated.token_hash).not.toBe(stored.token_hash);
+      expect(rotated.revoked_at).toBeNull();
+
+      await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Cookie', oldCookie)
+        .expect(401);
+      await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Cookie', refreshedCookie)
+        .expect(200);
+
+      const logout = await request(app.getHttpServer())
+        .delete('/api/v1/auth/sessions/current')
+        .set('Cookie', refreshedCookie)
+        .expect(204);
+      const clearedCookie = logout.headers['set-cookie'] as unknown as string[];
+      expect(clearedCookie[0]).toContain('uinventario_session=;');
+      expect(clearedCookie[0]).toContain('Expires=Thu, 01 Jan 1970');
+
+      await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Cookie', refreshedCookie)
+        .expect(401);
     });
 
     it('returns the same non-sensitive error for a wrong password or email', async () => {

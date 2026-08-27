@@ -12,10 +12,14 @@ interface IdentityRow {
   tenant_id: string;
   tenant_name: string;
   onboarding_completed_at: Date | null;
+  expires_at?: Date;
   roles: string | null;
 }
 
-export interface LoginIdentity extends Omit<SessionIdentity, 'sessionId'> {
+export interface LoginIdentity extends Omit<
+  SessionIdentity,
+  'sessionId' | 'expiresAt'
+> {
   passwordHash: string;
 }
 
@@ -89,6 +93,7 @@ export class SessionRepository {
       `
         SELECT
           s.id AS session_id,
+          s.expires_at,
           u.id AS user_id,
           u.email,
           t.id AS tenant_id,
@@ -113,6 +118,7 @@ export class SessionRepository {
 
     return {
       sessionId: row.session_id,
+      expiresAt: new Date(row.expires_at!),
       user: {
         id: row.user_id,
         email: row.email,
@@ -121,6 +127,36 @@ export class SessionRepository {
       tenant: { id: row.tenant_id, name: row.tenant_name },
       nextStep: row.onboarding_completed_at ? 'APPLICATION' : 'ONBOARDING',
     };
+  }
+
+  async rotateSession(
+    sessionId: string,
+    currentTokenHash: string,
+    nextTokenHash: string,
+    expiresAt: Date,
+    now: Date,
+  ): Promise<boolean> {
+    const result = await this.dataSource
+      .createQueryBuilder()
+      .update(SessionEntity)
+      .set({ tokenHash: nextTokenHash, expiresAt })
+      .where('id = :sessionId', { sessionId })
+      .andWhere('token_hash = :currentTokenHash', { currentTokenHash })
+      .andWhere('revoked_at IS NULL')
+      .andWhere('expires_at > :now', { now })
+      .execute();
+
+    return result.affected === 1;
+  }
+
+  async revokeSession(sessionId: string, revokedAt: Date): Promise<void> {
+    await this.dataSource
+      .createQueryBuilder()
+      .update(SessionEntity)
+      .set({ revokedAt })
+      .where('id = :sessionId', { sessionId })
+      .andWhere('revoked_at IS NULL')
+      .execute();
   }
 
   private parseRoles(roles: string | null): string[] {
