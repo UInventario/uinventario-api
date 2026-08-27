@@ -1,8 +1,17 @@
-import { ConflictException, Injectable } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { CatalogRepository } from './catalog.repository';
 import { ProductIdentifierConflictError } from './catalog.errors';
-import { CatalogOptionsResponse, ProductResponse } from './catalog.types';
+import {
+  CatalogOptionsResponse,
+  ProductListResponse,
+  ProductResponse,
+} from './catalog.types';
 import { CreateProductDto } from './dto/create-product.dto';
+import { ListProductsDto } from './dto/list-products.dto';
 
 @Injectable()
 export class CatalogService {
@@ -40,5 +49,33 @@ export class CatalogService {
       data: await this.catalog.getOptions(tenantId),
       meta: { apiVersion: '1' },
     };
+  }
+
+  async listProducts(
+    tenantId: string,
+    query: ListProductsDto,
+  ): Promise<ProductListResponse> {
+    const { products, total } = await this.catalog.listProducts(
+      tenantId,
+      query,
+    );
+    return {
+      data: products,
+      meta: {
+        apiVersion: '1',
+        pagination: {
+          page: query.page,
+          pageSize: query.pageSize,
+          total,
+          totalPages: Math.ceil(total / query.pageSize),
+        },
+      },
+    };
+  }
+
+  async getProduct(tenantId: string, id: string): Promise<ProductResponse> {
+    const product = await this.catalog.getProduct(tenantId, id);
+    if (!product) throw new NotFoundException();
+    return { data: product, meta: { apiVersion: '1' } };
   }
 }

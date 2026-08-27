@@ -798,6 +798,45 @@ describe('UInventario API (e2e)', () => {
           });
         });
 
+      const [primaryProduct] = await dataSource.query<Array<{ id: string }>>(
+        'SELECT id FROM products WHERE normalized_sku = ? LIMIT 1',
+        [product.sku],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', primaryCookie)
+        .send({ name: 'Té verde', sku: 'TE-1', cost: '20.00', price: '30.00' })
+        .expect(201);
+
+      for (const search of ['cafe-500', '345678', 'molido']) {
+        await request(app.getHttpServer())
+          .get('/api/v1/products')
+          .query({ q: ` ${search} `, page: 1, pageSize: 1 })
+          .set('Cookie', primaryCookie)
+          .expect(200)
+          .expect(({ body }: { body: unknown }) => {
+            expect(body).toMatchObject({
+              data: [{ id: primaryProduct.id, sku: product.sku }],
+              meta: {
+                pagination: { page: 1, pageSize: 1, total: 1, totalPages: 1 },
+              },
+            });
+          });
+      }
+      await request(app.getHttpServer())
+        .get('/api/v1/products')
+        .query({ page: 2, pageSize: 1 })
+        .set('Cookie', primaryCookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            meta: {
+              pagination: { page: 2, pageSize: 1, total: 2, totalPages: 2 },
+            },
+          });
+          expect((body as { data: unknown[] }).data).toHaveLength(1);
+        });
+
       await request(app.getHttpServer())
         .post('/api/v1/products')
         .set('Cookie', primaryCookie)
@@ -837,6 +876,21 @@ describe('UInventario API (e2e)', () => {
         .send(product)
         .expect(201);
 
+      const [secondaryProduct] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT p.id FROM products p
+         INNER JOIN users u ON u.tenant_id = p.tenant_id
+         WHERE u.normalized_email = ? AND p.normalized_sku = ? LIMIT 1`,
+        [secondary.email, product.sku],
+      );
+      await request(app.getHttpServer())
+        .get(`/api/v1/products/${primaryProduct.id}`)
+        .set('Cookie', primaryCookie)
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/products/${secondaryProduct.id}`)
+        .set('Cookie', primaryCookie)
+        .expect(404);
+
       const [counts] = await dataSource.query<
         Array<{
           products: number | string;
@@ -846,7 +900,7 @@ describe('UInventario API (e2e)', () => {
       >(`SELECT (SELECT COUNT(*) FROM products) AS products,
                 (SELECT COUNT(*) FROM categories) AS categories,
                 (SELECT COUNT(*) FROM brands) AS brands`);
-      expect(Number(counts.products)).toBe(2);
+      expect(Number(counts.products)).toBe(3);
       expect(Number(counts.categories)).toBe(2);
       expect(Number(counts.brands)).toBe(2);
 

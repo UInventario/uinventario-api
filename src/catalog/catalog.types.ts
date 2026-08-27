@@ -22,3 +22,16 @@ export interface CatalogOptionsResponse {
   };
   meta: { apiVersion: '1' };
 }
+
+export interface ProductListResponse {
+  data: ProductData[];
+  meta: {
+    apiVersion: '1';
+    pagination: {
+      page: number;
+      pageSize: number;
+      total: number;
+      totalPages: number;
+    };
+  };
+}

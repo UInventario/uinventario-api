@@ -4,6 +4,7 @@ import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { CreateProductDto } from './dto/create-product.dto';
 import { ProductIdentifierConflictError } from './catalog.errors';
 import { CatalogOptionsResponse, ProductData } from './catalog.types';
+import { ListProductsDto } from './dto/list-products.dto';
 
 interface ProductRow {
   id: string;
@@ -93,6 +94,44 @@ export class CatalogRepository {
     return { categories, brands };
   }
 
+  async listProducts(
+    tenantId: string,
+    query: ListProductsDto,
+  ): Promise<{ products: ProductData[]; total: number }> {
+    const search = query.q ? `%${query.q.trim()}%` : null;
+    const where = search
+      ? `p.tenant_id = ? AND
+         (p.name LIKE ? OR p.normalized_sku LIKE ? OR p.barcode LIKE ?)`
+      : 'p.tenant_id = ?';
+    const parameters = search
+      ? [tenantId, search, search.toUpperCase(), search]
+      : [tenantId];
+    const offset = (query.page - 1) * query.pageSize;
+    const [rows, countRows] = await Promise.all([
+      this.dataSource.query<ProductRow[]>(
+        `${this.productSelect()} WHERE ${where}
+         ORDER BY p.created_at DESC, p.id DESC LIMIT ? OFFSET ?`,
+        [...parameters, query.pageSize, offset],
+      ),
+      this.dataSource.query<Array<{ total: number | string }>>(
+        `SELECT COUNT(*) AS total FROM products p WHERE ${where}`,
+        parameters,
+      ),
+    ]);
+    return {
+      products: rows.map((row) => this.toProduct(row)),
+      total: Number(countRows[0]?.total ?? 0),
+    };
+  }
+
+  async getProduct(tenantId: string, id: string): Promise<ProductData | null> {
+    const rows = await this.dataSource.query<ProductRow[]>(
+      `${this.productSelect()} WHERE p.id = ? AND p.tenant_id = ? LIMIT 1`,
+      [id, tenantId],
+    );
+    return rows[0] ? this.toProduct(rows[0]) : null;
+  }
+
   private async findOrCreateClassification(
     manager: EntityManager,
     table: 'categories' | 'brands',
@@ -119,17 +158,23 @@ export class CatalogRepository {
     id: string,
   ): Promise<ProductData | null> {
     const rows = await manager.query<ProductRow[]>(
-      `SELECT p.id, p.name, p.sku, p.barcode, p.cost, p.price, p.active,
-              c.id AS category_id, c.name AS category_name,
-              b.id AS brand_id, b.name AS brand_name
-       FROM products p
-       LEFT JOIN categories c ON c.id = p.category_id AND c.tenant_id = p.tenant_id
-       LEFT JOIN brands b ON b.id = p.brand_id AND b.tenant_id = p.tenant_id
-       WHERE p.id = ? AND p.tenant_id = ? LIMIT 1`,
+      `${this.productSelect()} WHERE p.id = ? AND p.tenant_id = ? LIMIT 1`,
       [id, tenantId],
     );
     const [row] = rows;
-    if (!row) return null;
+    return row ? this.toProduct(row) : null;
+  }
+
+  private productSelect(): string {
+    return `SELECT p.id, p.name, p.sku, p.barcode, p.cost, p.price, p.active,
+                   c.id AS category_id, c.name AS category_name,
+                   b.id AS brand_id, b.name AS brand_name
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id AND c.tenant_id = p.tenant_id
+            LEFT JOIN brands b ON b.id = p.brand_id AND b.tenant_id = p.tenant_id`;
+  }
+
+  private toProduct(row: ProductRow): ProductData {
     return {
       id: row.id,
       name: row.name,

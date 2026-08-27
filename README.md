@@ -32,6 +32,8 @@ el usuario, sus roles y el tenant de esa sesión.
 - `GET/PUT /api/v1/onboarding/initial-cash-register`: crea la caja inicial y completa el onboarding sólo cuando existe todo el contexto operativo.
 - `POST /api/v1/products`: crea un producto con importes decimales exactos e identificadores únicos por tenant.
 - `GET /api/v1/products/options`: recupera categorías y marcas disponibles para el tenant autenticado.
+- `GET /api/v1/products`: lista y busca productos con paginación tenant-scoped.
+- `GET /api/v1/products/:id`: consulta el detalle sólo dentro del tenant autenticado.
 
 Cada login crea una sesión independiente por dispositivo. Las pestañas de un mismo
 navegador comparten la cookie; una rotación invalida el token anterior y logout no
