@@ -25,6 +25,22 @@ export class SessionEntity {
   })
   revokedAt!: Date | null;
 
+  @Column({
+    name: 'active_branch_id',
+    type: 'char',
+    length: 36,
+    nullable: true,
+  })
+  activeBranchId!: string | null;
+
+  @Column({
+    name: 'active_warehouse_id',
+    type: 'char',
+    length: 36,
+    nullable: true,
+  })
+  activeWarehouseId!: string | null;
+
   @CreateDateColumn({ name: 'created_at', type: 'datetime', precision: 6 })
   createdAt!: Date;
 }
