@@ -12,18 +12,16 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { AuditService } from '../audit/audit.service';
-import { PermissionGuard } from '../auth/authorization/permission.guard';
-import { RequirePermissions } from '../auth/authorization/require-permissions.decorator';
 import { SessionGuard } from '../auth/session/session.guard';
 import type { AuthenticatedRequest } from '../auth/session/session.types';
 import { CreateSupplierDto } from './dto/create-supplier.dto';
 import { ListSuppliersDto } from './dto/list-suppliers.dto';
 import { UpdateSupplierDto } from './dto/update-supplier.dto';
 import { SupplierService } from './supplier.service';
+import { SupplierAccessGuard } from './supplier-access.guard';
 
 @Controller('suppliers')
-@UseGuards(SessionGuard, PermissionGuard)
-@RequirePermissions('SUPPLIERS_MANAGE')
+@UseGuards(SessionGuard, SupplierAccessGuard)
 export class SupplierController {
   constructor(
     private readonly suppliers: SupplierService,

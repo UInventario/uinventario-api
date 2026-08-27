@@ -23,6 +23,7 @@ import { AuditModule } from './audit/audit.module';
 import { OrganizationModule } from './organization/organization.module';
 import { AccessControlModule } from './identity/access-control/access-control.module';
 import { SupplierModule } from './suppliers/supplier.module';
+import { ProcurementModule } from './procurement/procurement.module';
 
 @Module({
   imports: [
@@ -63,6 +64,7 @@ import { SupplierModule } from './suppliers/supplier.module';
     AccessControlModule,
     CatalogModule,
     SupplierModule,
+    ProcurementModule,
     InventoryModule,
     PosModule,
   ],

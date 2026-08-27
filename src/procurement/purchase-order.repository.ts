@@ -1,0 +1,380 @@
+import { Injectable } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+import type { ResultSetHeader } from 'mysql2';
+import { DataSource, EntityManager } from 'typeorm';
+import { ListPurchaseOrdersDto } from './dto/list-purchase-orders.dto';
+import {
+  PurchaseOrderLineDto,
+  SavePurchaseOrderDto,
+} from './dto/save-purchase-order.dto';
+import { UpdatePurchaseOrderDto } from './dto/update-purchase-order.dto';
+import {
+  PurchaseOrderReferenceError,
+  PurchaseOrderStateError,
+  PurchaseOrderVersionConflictError,
+} from './purchase-order.errors';
+import {
+  PurchaseOrderData,
+  PurchaseOrderLineData,
+  PurchaseOrderStatus,
+} from './purchase-order.types';
+
+interface OrderRow {
+  id: string;
+  folio: string;
+  supplier_id: string;
+  supplier_name: string;
+  currency: string;
+  status: PurchaseOrderStatus;
+  notes: string | null;
+  subtotal: string;
+  total: string;
+  version: number | string;
+  created_at: Date | string;
+  updated_at: Date | string;
+}
+
+interface LineRow {
+  id: string;
+  purchase_order_id: string;
+  supplier_product_id: string;
+  product_id: string;
+  product_name: string;
+  product_sku: string;
+  supplier_code: string;
+  quantity: string;
+  unit_cost: string;
+  subtotal: string;
+  notes: string | null;
+}
+
+interface LineReferenceRow {
+  id: string;
+  product_id: string;
+  product_name: string;
+  product_sku: string;
+  supplier_code: string;
+  price_currency: string | null;
+}
+
+interface PersistedLine {
+  input: PurchaseOrderLineDto;
+  reference: LineReferenceRow;
+  subtotal: string;
+}
+
+@Injectable()
+export class PurchaseOrderRepository {
+  constructor(private readonly dataSource: DataSource) {}
+
+  async create(
+    tenantId: string,
+    actorUserId: string,
+    dto: SavePurchaseOrderDto,
+  ): Promise<PurchaseOrderData> {
+    return this.dataSource.transaction(async (manager) => {
+      const lines = await this.prepareLines(manager, tenantId, dto);
+      const total = this.total(lines);
+      const id = randomUUID();
+      const folio = await this.nextFolio(manager, tenantId);
+      await manager.query(
+        `INSERT INTO purchase_orders
+          (id, tenant_id, folio, supplier_id, currency, status, notes,
+           subtotal, total, created_by_user_id)
+         VALUES (?, ?, ?, ?, ?, 'DRAFT', ?, ?, ?, ?)`,
+        [
+          id,
+          tenantId,
+          folio,
+          dto.supplierId,
+          dto.currency,
+          dto.notes ?? null,
+          total,
+          total,
+          actorUserId,
+        ],
+      );
+      await this.insertLines(manager, tenantId, id, lines);
+      return (await this.find(manager, tenantId, id))!;
+    });
+  }
+
+  async update(
+    tenantId: string,
+    id: string,
+    dto: UpdatePurchaseOrderDto,
+  ): Promise<PurchaseOrderData | null> {
+    return this.dataSource.transaction(async (manager) => {
+      const current = await this.find(manager, tenantId, id, true);
+      if (!current) return null;
+      if (current.version !== dto.version) {
+        throw new PurchaseOrderVersionConflictError(current.version);
+      }
+      if (current.status !== 'DRAFT') {
+        throw new PurchaseOrderStateError(current.status);
+      }
+      const lines = await this.prepareLines(manager, tenantId, dto);
+      const total = this.total(lines);
+      const result = await manager.query<ResultSetHeader>(
+        `UPDATE purchase_orders
+         SET supplier_id = ?, currency = ?, notes = ?, subtotal = ?, total = ?,
+             version = version + 1
+         WHERE id = ? AND tenant_id = ? AND version = ? AND status = 'DRAFT'`,
+        [
+          dto.supplierId,
+          dto.currency,
+          dto.notes ?? null,
+          total,
+          total,
+          id,
+          tenantId,
+          dto.version,
+        ],
+      );
+      if (result.affectedRows === 0) {
+        const fresh = await this.find(manager, tenantId, id);
+        if (!fresh) return null;
+        if (fresh.status !== 'DRAFT')
+          throw new PurchaseOrderStateError(fresh.status);
+        throw new PurchaseOrderVersionConflictError(fresh.version);
+      }
+      await manager.query(
+        'DELETE FROM purchase_order_lines WHERE purchase_order_id = ? AND tenant_id = ?',
+        [id, tenantId],
+      );
+      await this.insertLines(manager, tenantId, id, lines);
+      return this.find(manager, tenantId, id);
+    });
+  }
+
+  async list(
+    tenantId: string,
+    query: ListPurchaseOrdersDto,
+  ): Promise<{ orders: PurchaseOrderData[]; total: number }> {
+    const parameters: Array<string | number> = [tenantId];
+    let filter = '';
+    if (query.q) {
+      filter =
+        ' AND (po.folio LIKE ? OR s.legal_name LIKE ? OR s.trade_name LIKE ?)';
+      const search = `%${query.q}%`;
+      parameters.push(search, search, search);
+    }
+    const offset = (query.page - 1) * query.pageSize;
+    const [rows, [count]] = await Promise.all([
+      this.dataSource.query<OrderRow[]>(
+        `${this.select()} WHERE po.tenant_id = ?${filter}
+         ORDER BY po.updated_at DESC, po.id DESC LIMIT ? OFFSET ?`,
+        [...parameters, query.pageSize, offset],
+      ),
+      this.dataSource.query<Array<{ total: number | string }>>(
+        `SELECT COUNT(*) AS total FROM purchase_orders po
+         INNER JOIN suppliers s ON s.id = po.supplier_id AND s.tenant_id = po.tenant_id
+         WHERE po.tenant_id = ?${filter}`,
+        parameters,
+      ),
+    ]);
+    return {
+      orders: await this.withLines(this.dataSource.manager, tenantId, rows),
+      total: Number(count.total),
+    };
+  }
+
+  findById(tenantId: string, id: string): Promise<PurchaseOrderData | null> {
+    return this.find(this.dataSource.manager, tenantId, id);
+  }
+
+  private async prepareLines(
+    manager: EntityManager,
+    tenantId: string,
+    dto: SavePurchaseOrderDto,
+  ): Promise<PersistedLine[]> {
+    const [supplier] = await manager.query<
+      Array<{ exists_value: number | string }>
+    >(
+      `SELECT EXISTS(
+         SELECT 1 FROM suppliers WHERE id = ? AND tenant_id = ? AND active = TRUE
+       ) AS exists_value`,
+      [dto.supplierId, tenantId],
+    );
+    if (!Number(supplier.exists_value))
+      throw new PurchaseOrderReferenceError('SUPPLIER');
+
+    const ids = dto.lines.map((line) => line.supplierProductId);
+    const references = await manager.query<LineReferenceRow[]>(
+      `SELECT sp.id, sp.product_id, p.name AS product_name, p.sku AS product_sku,
+              sp.supplier_code,
+              (SELECT spp.currency FROM supplier_product_prices spp
+               WHERE spp.tenant_id = sp.tenant_id AND spp.supplier_product_id = sp.id
+               ORDER BY spp.valid_from DESC, spp.created_at DESC, spp.id DESC LIMIT 1
+              ) AS price_currency
+       FROM supplier_products sp
+       INNER JOIN products p ON p.id = sp.product_id AND p.tenant_id = sp.tenant_id
+       WHERE sp.tenant_id = ? AND sp.supplier_id = ? AND sp.active = TRUE
+         AND p.active = TRUE AND sp.id IN (${ids.map(() => '?').join(',')})`,
+      [tenantId, dto.supplierId, ...ids],
+    );
+    const byId = new Map(
+      references.map((reference) => [reference.id, reference]),
+    );
+    return dto.lines.map((input) => {
+      const reference = byId.get(input.supplierProductId);
+      if (!reference) throw new PurchaseOrderReferenceError('SUPPLIER_PRODUCT');
+      if (reference.price_currency !== dto.currency) {
+        throw new PurchaseOrderReferenceError('CURRENCY');
+      }
+      return {
+        input,
+        reference,
+        subtotal: this.lineSubtotal(input.quantity, input.unitCost),
+      };
+    });
+  }
+
+  private async nextFolio(
+    manager: EntityManager,
+    tenantId: string,
+  ): Promise<string> {
+    await manager.query(
+      `INSERT INTO purchase_order_sequences (tenant_id, next_number)
+       VALUES (?, 1) ON DUPLICATE KEY UPDATE tenant_id = VALUES(tenant_id)`,
+      [tenantId],
+    );
+    const [sequence] = await manager.query<
+      Array<{ next_number: number | string }>
+    >(
+      'SELECT next_number FROM purchase_order_sequences WHERE tenant_id = ? FOR UPDATE',
+      [tenantId],
+    );
+    const number = BigInt(sequence.next_number);
+    await manager.query(
+      'UPDATE purchase_order_sequences SET next_number = next_number + 1 WHERE tenant_id = ?',
+      [tenantId],
+    );
+    return `OC-${number.toString().padStart(6, '0')}`;
+  }
+
+  private async insertLines(
+    manager: EntityManager,
+    tenantId: string,
+    orderId: string,
+    lines: PersistedLine[],
+  ): Promise<void> {
+    for (const [index, line] of lines.entries()) {
+      await manager.query(
+        `INSERT INTO purchase_order_lines
+          (id, tenant_id, purchase_order_id, supplier_product_id, product_id,
+           position, supplier_code, product_name, product_sku, quantity,
+           unit_cost, subtotal, notes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          randomUUID(),
+          tenantId,
+          orderId,
+          line.reference.id,
+          line.reference.product_id,
+          index + 1,
+          line.reference.supplier_code,
+          line.reference.product_name,
+          line.reference.product_sku,
+          line.input.quantity,
+          line.input.unitCost,
+          line.subtotal,
+          line.input.notes ?? null,
+        ],
+      );
+    }
+  }
+
+  private async find(
+    manager: EntityManager,
+    tenantId: string,
+    id: string,
+    lock = false,
+  ): Promise<PurchaseOrderData | null> {
+    const rows = await manager.query<OrderRow[]>(
+      `${this.select()} WHERE po.id = ? AND po.tenant_id = ? LIMIT 1${lock ? ' FOR UPDATE' : ''}`,
+      [id, tenantId],
+    );
+    if (!rows[0]) return null;
+    return (await this.withLines(manager, tenantId, rows))[0];
+  }
+
+  private async withLines(
+    manager: EntityManager,
+    tenantId: string,
+    rows: OrderRow[],
+  ): Promise<PurchaseOrderData[]> {
+    if (rows.length === 0) return [];
+    const lines = await manager.query<LineRow[]>(
+      `SELECT id, purchase_order_id, supplier_product_id, product_id,
+              product_name, product_sku, supplier_code, quantity, unit_cost,
+              subtotal, notes
+       FROM purchase_order_lines
+       WHERE tenant_id = ? AND purchase_order_id IN (${rows.map(() => '?').join(',')})
+       ORDER BY purchase_order_id, position`,
+      [tenantId, ...rows.map((row) => row.id)],
+    );
+    return rows.map((row) => this.toData(row, lines));
+  }
+
+  private toData(row: OrderRow, lines: LineRow[]): PurchaseOrderData {
+    return {
+      id: row.id,
+      folio: row.folio,
+      supplier: { id: row.supplier_id, name: row.supplier_name },
+      currency: row.currency,
+      status: row.status,
+      notes: row.notes,
+      subtotal: row.subtotal,
+      total: row.total,
+      version: Number(row.version),
+      lines: lines
+        .filter((line) => line.purchase_order_id === row.id)
+        .map((line): PurchaseOrderLineData => ({
+          id: line.id,
+          supplierProductId: line.supplier_product_id,
+          productId: line.product_id,
+          productName: line.product_name,
+          productSku: line.product_sku,
+          supplierCode: line.supplier_code,
+          quantity: line.quantity,
+          unitCost: line.unit_cost,
+          subtotal: line.subtotal,
+          notes: line.notes,
+        })),
+      createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString(),
+    };
+  }
+
+  private select(): string {
+    return `SELECT po.id, po.folio, po.supplier_id,
+                   COALESCE(s.trade_name, s.legal_name) AS supplier_name,
+                   po.currency, po.status, po.notes, po.subtotal, po.total,
+                   po.version, po.created_at, po.updated_at
+            FROM purchase_orders po
+            INNER JOIN suppliers s ON s.id = po.supplier_id AND s.tenant_id = po.tenant_id`;
+  }
+
+  private lineSubtotal(quantity: string, unitCost: string): string {
+    const quantityMilli = this.decimal(quantity, 3);
+    const costCents = this.decimal(unitCost, 2);
+    const subtotalCents = (quantityMilli * costCents + 500n) / 1000n;
+    return this.money(subtotalCents);
+  }
+
+  private total(lines: PersistedLine[]): string {
+    return this.money(
+      lines.reduce((sum, line) => sum + this.decimal(line.subtotal, 2), 0n),
+    );
+  }
+
+  private decimal(value: string, scale: number): bigint {
+    const [whole, fraction = ''] = value.split('.');
+    return BigInt(`${whole}${fraction.padEnd(scale, '0')}`);
+  }
+
+  private money(cents: bigint): string {
+    return `${cents / 100n}.${(cents % 100n).toString().padStart(2, '0')}`;
+  }
+}
