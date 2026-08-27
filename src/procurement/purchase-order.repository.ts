@@ -92,6 +92,10 @@ interface ReceiptLineRow {
   purchase_order_line_id: string;
   received_quantity: string;
   overage_quantity: string;
+  unit_cost: string;
+  total_cost: string;
+  previous_catalog_cost: string;
+  resulting_catalog_cost: string;
 }
 
 interface LineReferenceRow {
@@ -491,7 +495,8 @@ export class PurchaseOrderRepository {
     const receiptLines = receipts.length
       ? await manager.query<ReceiptLineRow[]>(
           `SELECT id, receipt_id, purchase_order_line_id, received_quantity,
-                  overage_quantity
+                  overage_quantity, unit_cost, total_cost,
+                  previous_catalog_cost, resulting_catalog_cost
            FROM purchase_receipt_lines
            WHERE tenant_id = ? AND receipt_id IN (${receipts.map(() => '?').join(',')})
            ORDER BY receipt_id, line_number`,
@@ -561,6 +566,10 @@ export class PurchaseOrderRepository {
               purchaseOrderLineId: line.purchase_order_line_id,
               receivedQuantity: line.received_quantity,
               overageQuantity: line.overage_quantity,
+              unitCost: line.unit_cost,
+              totalCost: line.total_cost,
+              previousCatalogCost: line.previous_catalog_cost,
+              resultingCatalogCost: line.resulting_catalog_cost,
             })),
           createdAt: new Date(receipt.created_at).toISOString(),
         })),

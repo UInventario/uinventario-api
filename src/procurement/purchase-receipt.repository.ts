@@ -23,8 +23,10 @@ interface ReceiptRequestRow {
 
 interface OrderLineRow {
   id: string;
+  product_id: string;
   quantity: string;
   received_quantity: string;
+  unit_cost: string;
 }
 
 @Injectable()
@@ -74,13 +76,24 @@ export class PurchaseReceiptRepository {
           if (existing) return this.replay(existing, input, fingerprint);
 
           const [order] = await manager.query<
-            Array<{ status: PurchaseOrderStatus; version: number | string }>
+            Array<{
+              status: PurchaseOrderStatus;
+              version: number | string;
+              folio: string;
+            }>
           >(
-            `SELECT status, version FROM purchase_orders
+            `SELECT status, version, folio FROM purchase_orders
              WHERE id = ? AND tenant_id = ? FOR UPDATE`,
             [input.orderId, input.tenantId],
           );
           if (!order) throw new PurchaseOrderNotFoundError();
+          const concurrentReplay = await this.findByKey(
+            manager,
+            input.tenantId,
+            input.idempotencyKey,
+          );
+          if (concurrentReplay)
+            return this.replay(concurrentReplay, input, fingerprint);
           if (Number(order.version) !== input.dto.version)
             throw new PurchaseOrderVersionConflictError(Number(order.version));
           if (
@@ -100,7 +113,8 @@ export class PurchaseReceiptRepository {
           if (!location) throw new PurchaseReceiptLocationError();
 
           const orderLines = await manager.query<OrderLineRow[]>(
-            `SELECT id, quantity, received_quantity FROM purchase_order_lines
+            `SELECT id, product_id, quantity, received_quantity, unit_cost
+             FROM purchase_order_lines
              WHERE tenant_id = ? AND purchase_order_id = ? FOR UPDATE`,
             [input.tenantId, input.orderId],
           );
@@ -142,6 +156,44 @@ export class PurchaseReceiptRepository {
             ],
           );
           for (const [index, item] of requested.entries()) {
+            const receiptLineId = randomUUID();
+            const [product] = await manager.query<Array<{ cost: string }>>(
+              `SELECT cost FROM products
+               WHERE id = ? AND tenant_id = ? FOR UPDATE`,
+              [item.orderLine.product_id, input.tenantId],
+            );
+            if (!product) throw new InvalidPurchaseReceiptError();
+            await manager.query(
+              `INSERT INTO inventory_balances
+                (tenant_id, product_id, location_id, quantity)
+               VALUES (?, ?, ?, 0)
+               ON DUPLICATE KEY UPDATE quantity = quantity`,
+              [input.tenantId, item.orderLine.product_id, input.dto.locationId],
+            );
+            const [balance] = await manager.query<
+              Array<{ quantity: string; available_quantity: string }>
+            >(
+              `SELECT quantity, available_quantity FROM inventory_balances
+               WHERE tenant_id = ? AND product_id = ? AND location_id = ?
+               FOR UPDATE`,
+              [input.tenantId, item.orderLine.product_id, input.dto.locationId],
+            );
+            const resultingQuantity =
+              this.toUnits(balance.quantity) + item.received;
+            const resultingAvailable =
+              this.toUnits(balance.available_quantity) + item.received;
+            await manager.query(
+              `UPDATE inventory_balances
+               SET quantity = ?, available_quantity = ?
+               WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
+              [
+                this.fromUnits(resultingQuantity),
+                this.fromUnits(resultingAvailable),
+                input.tenantId,
+                item.orderLine.product_id,
+                input.dto.locationId,
+              ],
+            );
             await manager.query(
               `UPDATE purchase_order_lines
                SET received_quantity = received_quantity + ?
@@ -155,16 +207,65 @@ export class PurchaseReceiptRepository {
             await manager.query(
               `INSERT INTO purchase_receipt_lines
                 (id, tenant_id, receipt_id, purchase_order_line_id, line_number,
-                 received_quantity, overage_quantity)
-               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                 received_quantity, overage_quantity, unit_cost, total_cost,
+                 previous_catalog_cost, resulting_catalog_cost)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
-                randomUUID(),
+                receiptLineId,
                 input.tenantId,
                 receiptId,
                 item.orderLine.id,
                 index + 1,
                 this.fromUnits(item.received),
                 this.fromUnits(item.overage),
+                item.orderLine.unit_cost,
+                this.receiptCost(item.received, item.orderLine.unit_cost),
+                product.cost,
+                item.orderLine.unit_cost,
+              ],
+            );
+            await manager.query(
+              `UPDATE products SET cost = ?, version = version + 1
+               WHERE id = ? AND tenant_id = ?`,
+              [
+                item.orderLine.unit_cost,
+                item.orderLine.product_id,
+                input.tenantId,
+              ],
+            );
+            const movementFingerprint = createHash('sha256')
+              .update(
+                JSON.stringify({
+                  receiptId,
+                  receiptLineId,
+                  productId: item.orderLine.product_id,
+                  locationId: input.dto.locationId,
+                  quantity: this.fromUnits(item.received),
+                  unitCost: item.orderLine.unit_cost,
+                }),
+              )
+              .digest('hex');
+            await manager.query(
+              `INSERT INTO inventory_movements
+                (id, tenant_id, product_id, location_id, type, quantity_change,
+                 resulting_quantity, reason, reference, idempotency_key,
+                 request_fingerprint, created_by_user_id, purchase_receipt_id,
+                 purchase_receipt_line_id)
+               VALUES (?, ?, ?, ?, 'PURCHASE_RECEIPT', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                randomUUID(),
+                input.tenantId,
+                item.orderLine.product_id,
+                input.dto.locationId,
+                this.fromUnits(item.received),
+                this.fromUnits(resultingQuantity),
+                `Recepción de compra ${order.folio}`,
+                input.dto.documentReference,
+                `purchase-receipt:${receiptId}:${index + 1}`,
+                movementFingerprint,
+                input.actorUserId,
+                receiptId,
+                receiptLineId,
               ],
             );
           }
@@ -269,5 +370,16 @@ export class PurchaseReceiptRepository {
 
   private fromUnits(value: bigint): string {
     return `${value / 1000n}.${(value % 1000n).toString().padStart(3, '0')}`;
+  }
+
+  private receiptCost(quantity: bigint, unitCost: string): string {
+    const costCents = this.toDecimal(unitCost, 2);
+    const totalCents = (quantity * costCents + 500n) / 1000n;
+    return `${totalCents / 100n}.${(totalCents % 100n).toString().padStart(2, '0')}`;
+  }
+
+  private toDecimal(value: string, scale: number): bigint {
+    const [whole, fraction = ''] = value.split('.');
+    return BigInt(`${whole}${fraction.padEnd(scale, '0')}`);
   }
 }

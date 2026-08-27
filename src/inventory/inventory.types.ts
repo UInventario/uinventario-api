@@ -14,6 +14,7 @@ export const INVENTORY_MOVEMENT_TYPES = [
   'TRANSFER_DISCREPANCY',
   'SALE',
   'SALE_VOID',
+  'PURCHASE_RECEIPT',
 ] as const;
 
 export type InventoryMovementType = (typeof INVENTORY_MOVEMENT_TYPES)[number];
@@ -27,6 +28,7 @@ export type UserInventoryMovementType = Exclude<
   | 'TRANSFER_DISCREPANCY'
   | 'SALE'
   | 'SALE_VOID'
+  | 'PURCHASE_RECEIPT'
 >;
 export type InventoryStockState =
   'AVAILABLE' | 'RESERVED' | 'DAMAGED' | 'IN_TRANSIT';
@@ -107,7 +109,13 @@ export interface InventoryMovementHistoryItem {
   correlationId: string;
   idempotencyKey: string;
   document: {
-    type: 'MOVEMENT' | 'IMPORT' | 'SALE' | 'TRANSFER' | 'RECEIPT';
+    type:
+      | 'MOVEMENT'
+      | 'IMPORT'
+      | 'SALE'
+      | 'TRANSFER'
+      | 'RECEIPT'
+      | 'PURCHASE_RECEIPT';
     id: string;
     reference: string | null;
   };

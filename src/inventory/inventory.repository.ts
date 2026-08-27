@@ -111,8 +111,9 @@ export class InventoryRepository {
       filters.push(`(
         im.reference LIKE ? OR im.idempotency_key LIKE ? OR im.id LIKE ?
         OR im.sale_id LIKE ? OR im.transfer_id LIKE ? OR im.receipt_id LIKE ?
+        OR im.purchase_receipt_id LIKE ?
       )`);
-      parameters.push(search, search, search, search, search, search);
+      parameters.push(search, search, search, search, search, search, search);
     }
     if (query.type) {
       filters.push('im.type = ?');
@@ -146,6 +147,7 @@ export class InventoryRepository {
           transfer_id: string | null;
           receipt_id: string | null;
           inventory_import_id: string | null;
+          purchase_receipt_id: string | null;
           reason: string;
           reference: string | null;
           created_at: Date | string;
@@ -166,7 +168,7 @@ export class InventoryRepository {
       >(
         `SELECT im.id, im.type, im.quantity_change, im.resulting_quantity,
                 im.idempotency_key, im.sale_id, im.transfer_id, im.receipt_id,
-                im.inventory_import_id,
+                im.inventory_import_id, im.purchase_receipt_id,
                 im.from_state, im.to_state, im.state_quantity,
                 im.reason, im.reference, im.created_at,
                 p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
@@ -214,25 +216,39 @@ export class InventoryRepository {
         },
         responsible: { id: row.user_id, email: row.user_email },
         correlationId:
-          row.sale_id ?? row.transfer_id ?? row.inventory_import_id ?? row.id,
+          row.sale_id ??
+          row.transfer_id ??
+          row.inventory_import_id ??
+          row.purchase_receipt_id ??
+          row.id,
         idempotencyKey: row.idempotency_key,
-        document: row.inventory_import_id
+        document: row.purchase_receipt_id
           ? {
-              type: 'IMPORT',
-              id: row.inventory_import_id,
+              type: 'PURCHASE_RECEIPT',
+              id: row.purchase_receipt_id,
               reference: row.reference,
             }
-          : row.receipt_id
-            ? { type: 'RECEIPT', id: row.receipt_id, reference: row.reference }
-            : row.transfer_id
+          : row.inventory_import_id
+            ? {
+                type: 'IMPORT',
+                id: row.inventory_import_id,
+                reference: row.reference,
+              }
+            : row.receipt_id
               ? {
-                  type: 'TRANSFER',
-                  id: row.transfer_id,
+                  type: 'RECEIPT',
+                  id: row.receipt_id,
                   reference: row.reference,
                 }
-              : row.sale_id
-                ? { type: 'SALE', id: row.sale_id, reference: row.reference }
-                : { type: 'MOVEMENT', id: row.id, reference: row.reference },
+              : row.transfer_id
+                ? {
+                    type: 'TRANSFER',
+                    id: row.transfer_id,
+                    reference: row.reference,
+                  }
+                : row.sale_id
+                  ? { type: 'SALE', id: row.sale_id, reference: row.reference }
+                  : { type: 'MOVEMENT', id: row.id, reference: row.reference },
         stateTransition:
           row.from_state && row.to_state && row.state_quantity
             ? {
