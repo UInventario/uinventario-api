@@ -38,6 +38,7 @@ describe('UInventario API (e2e)', () => {
       'sale_payments',
       'sale_lines',
       'sales',
+      'cash_register_movements',
       'cash_register_shifts',
       'inventory_movements',
       'inventory_transfer_receipt_lines',
@@ -3193,6 +3194,206 @@ describe('UInventario API (e2e)', () => {
       expect(Number(audit.total)).toBe(1);
     });
 
+    it('tracks immutable cash movements, expected balance and explicit reversals', async () => {
+      const { cookie, productId } = await preparePos();
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'cash-movement-sale')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: '120.00',
+        })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [],
+            meta: { currency: 'MXN', expectedCash: '369.90' },
+          });
+        });
+
+      const income = await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'cash-income-supplies')
+        .send({ type: 'INCOME', amount: '50', reason: 'Fondo adicional' })
+        .expect(201);
+      const incomeId = (income.body as { data: { id: string } }).data.id;
+      expect(income.body).toMatchObject({
+        data: {
+          type: 'INCOME',
+          amount: '50.00',
+          reason: 'Fondo adicional',
+          responsible: { email: registrationPayload.email },
+          reversalOf: null,
+          reversed: false,
+        },
+        meta: { expectedCash: '419.90', idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'cash-income-supplies')
+        .send({ type: 'INCOME', amount: '50.00', reason: 'Fondo adicional' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { id: incomeId },
+            meta: { expectedCash: '419.90', idempotentReplay: true },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'cash-income-supplies')
+        .send({ type: 'INCOME', amount: '51.00', reason: 'Fondo adicional' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('IDEMPOTENCY_KEY_REUSED');
+        });
+
+      const withdrawal = await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'cash-withdrawal-supplier')
+        .send({
+          type: 'WITHDRAWAL',
+          amount: '80.00',
+          reason: 'Pago de insumos',
+        })
+        .expect(201);
+      const withdrawalId = (withdrawal.body as { data: { id: string } }).data
+        .id;
+      expect(withdrawal.body).toMatchObject({
+        meta: { expectedCash: '339.90' },
+      });
+
+      const incomeReversal = await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/register-shifts/current/movements/${incomeId}/reversals`,
+        )
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'cash-reverse-income')
+        .send({ reason: 'Ingreso capturado por error' })
+        .expect(201);
+      expect(incomeReversal.body).toMatchObject({
+        data: {
+          type: 'REVERSAL',
+          amount: '50.00',
+          reversalOf: {
+            id: incomeId,
+            type: 'INCOME',
+            reason: 'Fondo adicional',
+          },
+        },
+        meta: { expectedCash: '289.90', idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/register-shifts/current/movements/${incomeId}/reversals`,
+        )
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'cash-reverse-income')
+        .send({ reason: 'Ingreso capturado por error' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { idempotentReplay: true } });
+        });
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/register-shifts/current/movements/${incomeId}/reversals`,
+        )
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'cash-reverse-income-again')
+        .send({ reason: 'Segundo intento' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('CASH_REGISTER_MOVEMENT_ALREADY_REVERSED');
+        });
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/register-shifts/current/movements/${withdrawalId}/reversals`,
+        )
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'cash-reverse-withdrawal')
+        .send({ reason: 'Pago cancelado' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { expectedCash: '369.90' } });
+        });
+
+      const concurrent = await Promise.all(
+        ['cash-limit-a', 'cash-limit-b'].map((key) =>
+          request(app.getHttpServer())
+            .post('/api/v1/pos/register-shifts/current/movements')
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', key)
+            .send({
+              type: 'WITHDRAWAL',
+              amount: '300.00',
+              reason: 'Retiro concurrente',
+            }),
+        ),
+      );
+      expect(concurrent.map(({ status }) => status).sort()).toEqual([201, 409]);
+      expect(
+        concurrent.find(({ status }) => status === 409)?.body,
+      ).toMatchObject({
+        code: 'INSUFFICIENT_EXPECTED_CASH',
+      });
+
+      const history = await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .expect(200);
+      expect(history.body).toMatchObject({ meta: { expectedCash: '69.90' } });
+      const movements = (
+        history.body as {
+          data: Array<{ id: string; type: string; reversed: boolean }>;
+        }
+      ).data;
+      expect(movements).toHaveLength(5);
+      expect(movements.find(({ id }) => id === incomeId)).toMatchObject({
+        reversed: true,
+      });
+      expect(movements.find(({ id }) => id === withdrawalId)).toMatchObject({
+        reversed: true,
+      });
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/pos/register-shifts/current/movements/${withdrawalId}`)
+        .set('Cookie', cookie)
+        .send({ amount: '1.00' })
+        .expect(404);
+      await request(app.getHttpServer())
+        .delete(`/api/v1/pos/register-shifts/current/movements/${withdrawalId}`)
+        .set('Cookie', cookie)
+        .expect(404);
+      const [state] = await dataSource.query<
+        Array<{
+          sales: number | string;
+          movements: number | string;
+          audit_events: number | string;
+        }>
+      >(
+        `SELECT (SELECT COUNT(*) FROM sales) AS sales,
+                (SELECT COUNT(*) FROM cash_register_movements) AS movements,
+                (SELECT COUNT(*) FROM audit_events
+                  WHERE action IN ('CASH_REGISTER_MOVEMENT_CREATED',
+                    'CASH_REGISTER_MOVEMENT_REVERSED')) AS audit_events`,
+      );
+      expect({
+        sales: Number(state.sales),
+        movements: Number(state.movements),
+        auditEvents: Number(state.audit_events),
+      }).toEqual({ sales: 1, movements: 5, auditEvents: 5 });
+    });
+
     it('recalculates prices, included tax and totals from server data', async () => {
       const { cookie, productId, locationId } = await preparePos();
       await request(app.getHttpServer())
@@ -4480,6 +4681,7 @@ describe('UInventario API (e2e)', () => {
         '/api/v1/inventory/stock',
         '/api/v1/inventory/transfers',
         '/api/v1/pos/register-shifts/current',
+        '/api/v1/pos/register-shifts/current/movements',
         '/api/v1/pos/sales',
       ]) {
         await request(app.getHttpServer()).get(path).expect(401);
@@ -4511,6 +4713,7 @@ describe('UInventario API (e2e)', () => {
         ['/api/v1/inventory/stock', 'INVENTORY_ACCESS_DENIED'],
         ['/api/v1/inventory/transfers', 'INVENTORY_ACCESS_DENIED'],
         ['/api/v1/pos/register-shifts/current', 'POS_ACCESS_DENIED'],
+        ['/api/v1/pos/register-shifts/current/movements', 'POS_ACCESS_DENIED'],
         ['/api/v1/pos/sales', 'POS_ACCESS_DENIED'],
         ['/api/v1/audit-events', 'AUDIT_ACCESS_DENIED'],
       ]) {

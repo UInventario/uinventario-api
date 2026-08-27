@@ -21,6 +21,9 @@ import { PosService } from './pos.service';
 import { AuditService } from '../audit/audit.service';
 import { OpenCashRegisterShiftDto } from './dto/open-cash-register-shift.dto';
 import { CashRegisterShiftService } from './cash-register-shift.service';
+import { CashRegisterMovementService } from './cash-register-movement.service';
+import { CreateCashRegisterMovementDto } from './dto/create-cash-register-movement.dto';
+import { ReverseCashRegisterMovementDto } from './dto/reverse-cash-register-movement.dto';
 
 @Controller('pos')
 @UseGuards(SessionGuard, PosAccessGuard)
@@ -28,6 +31,7 @@ export class PosController {
   constructor(
     private readonly pos: PosService,
     private readonly shifts: CashRegisterShiftService,
+    private readonly cashMovements: CashRegisterMovementService,
     private readonly audit: AuditService,
   ) {}
 
@@ -40,6 +44,54 @@ export class PosController {
       cashRegisterId: principal.context.cashRegister!.id,
       userId: principal.user.id,
     });
+  }
+
+  @Get('register-shifts/current/movements')
+  listCashMovements(@Req() request: AuthenticatedRequest) {
+    const { principal } = request;
+    return this.cashMovements.list(this.cashContext(principal));
+  }
+
+  @Post('register-shifts/current/movements')
+  async createCashMovement(
+    @Req() request: AuthenticatedRequest,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: CreateCashRegisterMovementDto,
+  ) {
+    const { principal } = request;
+    const result = await this.cashMovements.create(
+      this.cashContext(principal),
+      dto,
+      idempotencyKey,
+    );
+    await this.auditCashMovement(
+      request,
+      result.data.id,
+      'CASH_REGISTER_MOVEMENT_CREATED',
+    );
+    return result;
+  }
+
+  @Post('register-shifts/current/movements/:movementId/reversals')
+  async reverseCashMovement(
+    @Req() request: AuthenticatedRequest,
+    @Param('movementId', ParseUUIDPipe) movementId: string,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: ReverseCashRegisterMovementDto,
+  ) {
+    const { principal } = request;
+    const result = await this.cashMovements.reverse(
+      this.cashContext(principal),
+      movementId,
+      dto.reason,
+      idempotencyKey,
+    );
+    await this.auditCashMovement(
+      request,
+      result.data.id,
+      'CASH_REGISTER_MOVEMENT_REVERSED',
+    );
+    return result;
   }
 
   @Post('register-shifts')
@@ -137,5 +189,30 @@ export class PosController {
       deduplicate: true,
     });
     return result;
+  }
+
+  private cashContext(principal: AuthenticatedRequest['principal']) {
+    return {
+      tenantId: principal.tenant.id,
+      branchId: principal.context.branch!.id,
+      cashRegisterId: principal.context.cashRegister!.id,
+      userId: principal.user.id,
+    };
+  }
+
+  private async auditCashMovement(
+    request: AuthenticatedRequest,
+    entityId: string,
+    action: string,
+  ): Promise<void> {
+    await this.audit.record({
+      tenantId: request.principal.tenant.id,
+      actorUserId: request.principal.user.id,
+      action,
+      entityType: 'CASH_REGISTER_MOVEMENT',
+      entityId,
+      correlationId: request.requestId!,
+      deduplicate: true,
+    });
   }
 }
