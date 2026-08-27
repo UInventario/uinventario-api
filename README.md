@@ -61,6 +61,8 @@ MySQL 8.4 local corre en Docker con volumen persistente. Dev y Prod reciben una 
 El mapeo verificado de nombres, IDs y números de proyecto para Dev/Prod está en
 [`docs/operations/gcp-projects.md`](docs/operations/gcp-projects.md). Todo comando
 de despliegue debe indicar el Project ID explícitamente.
+El contrato validado de variables y nombres de Secret Manager está en
+[`docs/operations/environment-contract.md`](docs/operations/environment-contract.md).
 
 ## Aislamiento multiempresa
 
