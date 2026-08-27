@@ -34,7 +34,11 @@ interface OrganizationRow {
 export class OrganizationRepository {
   constructor(private readonly dataSource: DataSource) {}
 
-  async list(tenantId: string): Promise<OrganizationBranchData[]> {
+  async list(
+    tenantId: string,
+    userId: string,
+    administrator: boolean,
+  ): Promise<OrganizationBranchData[]> {
     const rows = await this.dataSource.query<OrganizationRow[]>(
       `SELECT b.id AS branch_id, b.name AS branch_name, b.timezone,
               b.active AS branch_active,
@@ -46,10 +50,15 @@ export class OrganizationRepository {
        LEFT JOIN warehouses w ON w.branch_id = b.id AND w.tenant_id = b.tenant_id
        LEFT JOIN locations l ON l.warehouse_id = w.id AND l.tenant_id = b.tenant_id
        WHERE b.tenant_id = ?
+         AND (? = TRUE OR EXISTS (
+           SELECT 1 FROM user_branch_access uba
+           WHERE uba.user_id = ? AND uba.tenant_id = b.tenant_id
+             AND uba.branch_id = b.id
+         ))
        ORDER BY (b.onboarding_key = 'INITIAL') DESC, b.created_at, b.id,
                 (w.onboarding_key = 'INITIAL') DESC, w.created_at, w.id,
                 (l.onboarding_key = 'INITIAL') DESC, l.created_at, l.id`,
-      [tenantId],
+      [tenantId, administrator, userId],
     );
     return this.toBranches(rows);
   }

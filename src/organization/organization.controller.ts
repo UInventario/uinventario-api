@@ -30,7 +30,11 @@ export class OrganizationController {
 
   @Get('branches')
   list(@Req() request: AuthenticatedRequest) {
-    return this.organization.list(request.principal.tenant.id);
+    return this.organization.list(
+      request.principal.tenant.id,
+      request.principal.user.id,
+      request.principal.user.roles.includes('ADMIN'),
+    );
   }
 
   @Post('branches')

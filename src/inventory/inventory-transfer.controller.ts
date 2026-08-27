@@ -13,13 +13,14 @@ import {
 import { AuditService } from '../audit/audit.service';
 import { SessionGuard } from '../auth/session/session.guard';
 import type { AuthenticatedRequest } from '../auth/session/session.types';
+import { PermissionGuard } from '../auth/authorization/permission.guard';
+import { RequirePermissions } from '../auth/authorization/require-permissions.decorator';
 import { CreateInventoryTransferDto } from './dto/create-inventory-transfer.dto';
 import { ReceiveInventoryTransferDto } from './dto/receive-inventory-transfer.dto';
-import { InventoryAccessGuard } from './inventory-access.guard';
 import { InventoryTransferService } from './inventory-transfer.service';
 
 @Controller('inventory/transfers')
-@UseGuards(SessionGuard, InventoryAccessGuard)
+@UseGuards(SessionGuard, PermissionGuard)
 export class InventoryTransferController {
   constructor(
     private readonly transfers: InventoryTransferService,
@@ -27,19 +28,29 @@ export class InventoryTransferController {
   ) {}
 
   @Get()
+  @RequirePermissions('INVENTORY_VIEW')
   list(@Req() request: AuthenticatedRequest) {
-    return this.transfers.list(request.principal.tenant.id);
+    return this.transfers.list(
+      request.principal.tenant.id,
+      request.principal.context.branch!.id,
+    );
   }
 
   @Get(':transferId')
+  @RequirePermissions('INVENTORY_VIEW')
   get(
     @Req() request: AuthenticatedRequest,
     @Param('transferId', new ParseUUIDPipe()) transferId: string,
   ) {
-    return this.transfers.get(request.principal.tenant.id, transferId);
+    return this.transfers.get(
+      request.principal.tenant.id,
+      request.principal.context.branch!.id,
+      transferId,
+    );
   }
 
   @Post()
+  @RequirePermissions('INVENTORY_TRANSFER')
   async create(
     @Req() request: AuthenticatedRequest,
     @Headers('idempotency-key') idempotencyKey: string | undefined,
@@ -62,6 +73,7 @@ export class InventoryTransferController {
   }
 
   @Post(':transferId/dispatch')
+  @RequirePermissions('INVENTORY_APPROVE')
   @HttpCode(200)
   async dispatch(
     @Req() request: AuthenticatedRequest,
@@ -71,6 +83,7 @@ export class InventoryTransferController {
     const result = await this.transfers.dispatch({
       tenantId: request.principal.tenant.id,
       transferId,
+      originWarehouseId: request.principal.context.warehouse!.id,
       userId: request.principal.user.id,
       idempotencyKey,
     });
@@ -84,6 +97,7 @@ export class InventoryTransferController {
   }
 
   @Post(':transferId/receipts')
+  @RequirePermissions('INVENTORY_TRANSFER')
   @HttpCode(200)
   async receive(
     @Req() request: AuthenticatedRequest,
@@ -109,6 +123,7 @@ export class InventoryTransferController {
   }
 
   @Post(':transferId/cancel')
+  @RequirePermissions('INVENTORY_APPROVE')
   @HttpCode(200)
   async cancel(
     @Req() request: AuthenticatedRequest,
@@ -117,6 +132,7 @@ export class InventoryTransferController {
     const result = await this.transfers.cancel(
       request.principal.tenant.id,
       transferId,
+      request.principal.context.warehouse!.id,
       request.principal.user.id,
     );
     await this.record(request, 'INVENTORY_TRANSFER_CANCELLED', result.data.id);

@@ -101,11 +101,19 @@ interface BalanceState {
 export class InventoryTransferRepository {
   constructor(private readonly dataSource: DataSource) {}
 
-  async list(tenantId: string): Promise<InventoryTransferData[]> {
+  async list(
+    tenantId: string,
+    branchId: string,
+  ): Promise<InventoryTransferData[]> {
     const rows = await this.dataSource.query<Array<{ id: string }>>(
-      `SELECT id FROM inventory_transfers
-       WHERE tenant_id = ? ORDER BY created_at DESC, id DESC LIMIT 100`,
-      [tenantId],
+      `SELECT t.id FROM inventory_transfers t
+       INNER JOIN warehouses origin ON origin.id = t.origin_warehouse_id
+         AND origin.tenant_id = t.tenant_id
+       INNER JOIN warehouses destination ON destination.id = t.destination_warehouse_id
+         AND destination.tenant_id = t.tenant_id
+       WHERE t.tenant_id = ? AND (origin.branch_id = ? OR destination.branch_id = ?)
+       ORDER BY t.created_at DESC, t.id DESC LIMIT 100`,
+      [tenantId, branchId, branchId],
     );
     return Promise.all(
       rows.map(
@@ -153,6 +161,12 @@ export class InventoryTransferRepository {
       return await this.dataSource.transaction(
         'READ COMMITTED',
         async (manager) => {
+          await this.assertWarehouseAccess(
+            manager,
+            input.tenantId,
+            input.userId,
+            input.dto.destinationWarehouseId,
+          );
           const replay = await this.findByCreationKey(
             manager,
             input.tenantId,
@@ -242,6 +256,7 @@ export class InventoryTransferRepository {
   async dispatch(input: {
     tenantId: string;
     transferId: string;
+    originWarehouseId: string;
     userId: string;
     idempotencyKey: string;
   }): Promise<{ transfer: InventoryTransferData; replay: boolean }> {
@@ -262,8 +277,8 @@ export class InventoryTransferRepository {
             `SELECT status, dispatch_idempotency_key, reference, reason,
                   origin_warehouse_id, destination_warehouse_id
            FROM inventory_transfers
-           WHERE id = ? AND tenant_id = ? FOR UPDATE`,
-            [input.transferId, input.tenantId],
+           WHERE id = ? AND tenant_id = ? AND origin_warehouse_id = ? FOR UPDATE`,
+            [input.transferId, input.tenantId, input.originWarehouseId],
           );
           if (!header) throw new InventoryTransferNotFoundError();
           if (header.status === 'DISPATCHED') {
@@ -494,7 +509,11 @@ export class InventoryTransferRepository {
               input.tenantId,
               input.transferId,
             );
-            if (!transfer) throw new InventoryTransferNotFoundError();
+            if (
+              !transfer ||
+              transfer.destinationWarehouse.id !== input.destinationWarehouseId
+            )
+              throw new InventoryTransferNotFoundError();
             return { transfer, replay: true };
           }
           const [header] = await manager.query<
@@ -722,6 +741,7 @@ export class InventoryTransferRepository {
   async cancel(
     tenantId: string,
     transferId: string,
+    originWarehouseId: string,
     userId: string,
   ): Promise<InventoryTransferData> {
     return this.dataSource.transaction('READ COMMITTED', async (manager) => {
@@ -729,8 +749,8 @@ export class InventoryTransferRepository {
         Array<{ status: InventoryTransferStatus }>
       >(
         `SELECT status FROM inventory_transfers
-         WHERE id = ? AND tenant_id = ? FOR UPDATE`,
-        [transferId, tenantId],
+         WHERE id = ? AND tenant_id = ? AND origin_warehouse_id = ? FOR UPDATE`,
+        [transferId, tenantId, originWarehouseId],
       );
       if (!header) throw new InventoryTransferNotFoundError();
       if (header.status === 'DISPATCHED')
@@ -962,6 +982,32 @@ export class InventoryTransferRepository {
        WHERE origin.id = ? AND origin.tenant_id = ? AND origin.active = TRUE
          AND origin.id <> destination.id LIMIT 1`,
       [destinationWarehouseId, originWarehouseId, tenantId],
+    );
+    if (!row) throw new InvalidInventoryTransferTargetError();
+  }
+
+  private async assertWarehouseAccess(
+    manager: EntityManager,
+    tenantId: string,
+    userId: string,
+    warehouseId: string,
+  ): Promise<void> {
+    const [row] = await manager.query<Array<{ id: string }>>(
+      `SELECT w.id FROM warehouses w
+       WHERE w.id = ? AND w.tenant_id = ? AND w.active = TRUE
+         AND (
+           EXISTS (
+             SELECT 1 FROM user_roles ur
+             INNER JOIN roles r ON r.id = ur.role_id AND r.tenant_id = ur.tenant_id
+             WHERE ur.user_id = ? AND ur.tenant_id = ? AND r.code = 'ADMIN'
+           )
+           OR EXISTS (
+             SELECT 1 FROM user_branch_access uba
+             WHERE uba.user_id = ? AND uba.tenant_id = ? AND uba.branch_id = w.branch_id
+           )
+         )
+       LIMIT 1`,
+      [warehouseId, tenantId, userId, tenantId, userId, tenantId],
     );
     if (!row) throw new InvalidInventoryTransferTargetError();
   }

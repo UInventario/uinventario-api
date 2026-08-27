@@ -1,0 +1,21 @@
+export const APP_PERMISSIONS = [
+  'TENANT_MANAGE',
+  'PRODUCTS_MANAGE',
+  'SALES_MANAGE',
+  'ACCESS_MANAGE',
+  'INVENTORY_VIEW',
+  'INVENTORY_ADJUST',
+  'INVENTORY_TRANSFER',
+  'INVENTORY_COUNT',
+  'INVENTORY_APPROVE',
+] as const;
+
+export type AppPermission = (typeof APP_PERMISSIONS)[number];
+
+export const INVENTORY_PERMISSIONS = [
+  'INVENTORY_VIEW',
+  'INVENTORY_ADJUST',
+  'INVENTORY_TRANSFER',
+  'INVENTORY_COUNT',
+  'INVENTORY_APPROVE',
+] as const satisfies readonly AppPermission[];

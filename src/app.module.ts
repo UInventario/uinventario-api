@@ -21,6 +21,7 @@ import { PosModule } from './pos/pos.module';
 import { PasswordResetModule } from './auth/password-reset/password-reset.module';
 import { AuditModule } from './audit/audit.module';
 import { OrganizationModule } from './organization/organization.module';
+import { AccessControlModule } from './identity/access-control/access-control.module';
 
 @Module({
   imports: [
@@ -58,6 +59,7 @@ import { OrganizationModule } from './organization/organization.module';
     AuditModule,
     OnboardingModule,
     OrganizationModule,
+    AccessControlModule,
     CatalogModule,
     InventoryModule,
     PosModule,

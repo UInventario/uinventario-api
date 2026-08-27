@@ -3,6 +3,7 @@ import {
   Controller,
   Get,
   Headers,
+  NotFoundException,
   Param,
   ParseUUIDPipe,
   Post,
@@ -12,17 +13,18 @@ import {
 } from '@nestjs/common';
 import { SessionGuard } from '../auth/session/session.guard';
 import type { AuthenticatedRequest } from '../auth/session/session.types';
+import { PermissionGuard } from '../auth/authorization/permission.guard';
+import { RequirePermissions } from '../auth/authorization/require-permissions.decorator';
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
 import { CreateInventoryStateTransitionDto } from './dto/create-inventory-state-transition.dto';
 import { GetInventoryBalanceDto } from './dto/get-inventory-balance.dto';
 import { ListInventoryStockDto } from './dto/list-inventory-stock.dto';
 import { ListInventoryMovementsDto } from './dto/list-inventory-movements.dto';
-import { InventoryAccessGuard } from './inventory-access.guard';
 import { InventoryService } from './inventory.service';
 import { AuditService } from '../audit/audit.service';
 
 @Controller('inventory')
-@UseGuards(SessionGuard, InventoryAccessGuard)
+@UseGuards(SessionGuard, PermissionGuard)
 export class InventoryController {
   constructor(
     private readonly inventory: InventoryService,
@@ -30,19 +32,27 @@ export class InventoryController {
   ) {}
 
   @Get('stock')
+  @RequirePermissions('INVENTORY_VIEW')
   listStock(
     @Req() request: AuthenticatedRequest,
     @Query() query: ListInventoryStockDto,
   ) {
+    this.assertRequestedScope(
+      query.branchId,
+      query.warehouseId,
+      request.principal.context.branch!.id,
+      request.principal.context.warehouse!.id,
+    );
     return this.inventory.listStock(
       request.principal.tenant.id,
-      query.branchId ?? request.principal.context.branch!.id,
-      query.warehouseId ?? request.principal.context.warehouse!.id,
+      request.principal.context.branch!.id,
+      request.principal.context.warehouse!.id,
       query,
     );
   }
 
   @Get('movements')
+  @RequirePermissions('INVENTORY_VIEW')
   listMovements(
     @Req() request: AuthenticatedRequest,
     @Query() query: ListInventoryMovementsDto,
@@ -55,6 +65,7 @@ export class InventoryController {
   }
 
   @Get('locations')
+  @RequirePermissions('INVENTORY_VIEW')
   listLocations(@Req() request: AuthenticatedRequest) {
     return this.inventory.listLocations(
       request.principal.tenant.id,
@@ -63,6 +74,7 @@ export class InventoryController {
   }
 
   @Get('products/:productId/balance')
+  @RequirePermissions('INVENTORY_VIEW')
   getBalance(
     @Req() request: AuthenticatedRequest,
     @Param('productId', new ParseUUIDPipe()) productId: string,
@@ -77,6 +89,7 @@ export class InventoryController {
   }
 
   @Post('movements')
+  @RequirePermissions('INVENTORY_ADJUST')
   async createMovement(
     @Req() request: AuthenticatedRequest,
     @Headers('idempotency-key') idempotencyKey: string | undefined,
@@ -102,6 +115,7 @@ export class InventoryController {
   }
 
   @Post('state-transitions')
+  @RequirePermissions('INVENTORY_ADJUST')
   async createStateTransition(
     @Req() request: AuthenticatedRequest,
     @Headers('idempotency-key') idempotencyKey: string | undefined,
@@ -124,5 +138,19 @@ export class InventoryController {
       deduplicate: true,
     });
     return result;
+  }
+
+  private assertRequestedScope(
+    branchId: string | undefined,
+    warehouseId: string | undefined,
+    activeBranchId: string,
+    activeWarehouseId: string,
+  ): void {
+    if (
+      (branchId !== undefined && branchId !== activeBranchId) ||
+      (warehouseId !== undefined && warehouseId !== activeWarehouseId)
+    ) {
+      throw new NotFoundException('Inventory scope not found.');
+    }
   }
 }

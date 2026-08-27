@@ -53,8 +53,10 @@ describe('UInventario API (e2e)', () => {
       'branches',
       'sessions',
       'registration_requests',
+      'user_branch_access',
       'user_roles',
       'users',
+      'role_permissions',
       'roles',
       'tenants',
     ]) {
@@ -859,10 +861,15 @@ describe('UInventario API (e2e)', () => {
               user: {
                 roles: ['ADMIN'],
                 permissions: [
-                  'TENANT_MANAGE',
+                  'ACCESS_MANAGE',
+                  'INVENTORY_ADJUST',
+                  'INVENTORY_APPROVE',
+                  'INVENTORY_COUNT',
+                  'INVENTORY_TRANSFER',
+                  'INVENTORY_VIEW',
                   'PRODUCTS_MANAGE',
-                  'STOCK_MANAGE',
                   'SALES_MANAGE',
+                  'TENANT_MANAGE',
                 ],
               },
               context: {
@@ -2480,6 +2487,7 @@ describe('UInventario API (e2e)', () => {
         app.get(InventoryTransferRepository).dispatch({
           tenantId: principal.tenant_id,
           transferId: rollbackTransferId,
+          originWarehouseId: originWarehouse.id,
           userId: randomUUID(),
           idempotencyKey: 'transfer-dispatch-rollback',
         }),
@@ -3936,6 +3944,412 @@ describe('UInventario API (e2e)', () => {
     });
   });
 
+  describe('Inventory access delegation', () => {
+    beforeEach(resetIdentityData);
+
+    it('delegates granular tenant roles and enforces branch scope', async () => {
+      await registerAccount('access-primary-registration');
+      const adminCookie = await createPersistedSession(
+        registrationPayload.email,
+      );
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', adminCookie)
+        .send({
+          legalName: 'Accesos, S.A.',
+          tradeName: 'Accesos',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      const initial = await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', adminCookie)
+        .send({
+          branchName: 'Sucursal Centro',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Centro',
+          locationName: 'General Centro',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', adminCookie)
+        .send({ name: 'Caja Centro' })
+        .expect(200);
+      const initialData = (
+        initial.body as {
+          data: {
+            branch: { id: string };
+            warehouse: { id: string };
+            location: { id: string };
+          };
+        }
+      ).data;
+      const initialBranchId = initialData.branch.id;
+      const second = await request(app.getHttpServer())
+        .post('/api/v1/organization/branches')
+        .set('Cookie', adminCookie)
+        .send({
+          name: 'Sucursal Norte',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Norte',
+          locationName: 'General Norte',
+          locationCode: 'NORTE',
+        })
+        .expect(201);
+      const secondBranchId = (second.body as { data: { id: string } }).data.id;
+      const secondWarehouse = (
+        second.body as {
+          data: {
+            warehouses: Array<{ id: string; locations: Array<{ id: string }> }>;
+          };
+        }
+      ).data.warehouses[0];
+      const third = await request(app.getHttpServer())
+        .post('/api/v1/organization/branches')
+        .set('Cookie', adminCookie)
+        .send({
+          name: 'Sucursal Sur',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Sur',
+          locationName: 'General Sur',
+          locationCode: 'SUR',
+        })
+        .expect(201);
+      const thirdWarehouse = (
+        third.body as {
+          data: {
+            warehouses: Array<{ id: string; locations: Array<{ id: string }> }>;
+          };
+        }
+      ).data.warehouses[0];
+      const product = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', adminCookie)
+        .send({
+          name: 'Producto de acceso',
+          sku: 'ACCESS-1',
+          cost: '5.00',
+          price: '10.00',
+        })
+        .expect(201);
+      const productId = (product.body as { data: { id: string } }).data.id;
+      const hiddenTransfer = await request(app.getHttpServer())
+        .post('/api/v1/inventory/transfers')
+        .set('Cookie', adminCookie)
+        .set('Idempotency-Key', 'access-hidden-transfer')
+        .send({
+          destinationWarehouseId: thirdWarehouse.id,
+          reference: 'ACCESS-HIDDEN',
+          reason: 'Transferencia fuera del alcance del operador',
+          lines: [
+            {
+              productId,
+              sourceLocationId: initialData.location.id,
+              destinationLocationId: thirdWarehouse.locations[0].id,
+              quantity: '1',
+            },
+          ],
+        })
+        .expect(201);
+      const hiddenTransferId = (hiddenTransfer.body as { data: { id: string } })
+        .data.id;
+
+      const viewer = await request(app.getHttpServer())
+        .post('/api/v1/access/roles')
+        .set('Cookie', adminCookie)
+        .send({
+          name: 'Consulta de inventario',
+          permissions: ['INVENTORY_VIEW'],
+        })
+        .expect(201);
+      const operator = await request(app.getHttpServer())
+        .post('/api/v1/access/roles')
+        .set('Cookie', adminCookie)
+        .send({
+          name: 'Operación de inventario',
+          permissions: [
+            'INVENTORY_VIEW',
+            'INVENTORY_ADJUST',
+            'INVENTORY_TRANSFER',
+          ],
+        })
+        .expect(201);
+      const approver = await request(app.getHttpServer())
+        .post('/api/v1/access/roles')
+        .set('Cookie', adminCookie)
+        .send({
+          name: 'Aprobación de inventario',
+          permissions: [
+            'INVENTORY_VIEW',
+            'INVENTORY_COUNT',
+            'INVENTORY_APPROVE',
+          ],
+        })
+        .expect(201);
+      const viewerRoleId = (viewer.body as { data: { id: string } }).data.id;
+      const operatorRoleId = (operator.body as { data: { id: string } }).data
+        .id;
+      const approverRoleId = (approver.body as { data: { id: string } }).data
+        .id;
+      const staffPassword = 'Personal-2026!';
+      const staff = await request(app.getHttpServer())
+        .post('/api/v1/access/users')
+        .set('Cookie', adminCookie)
+        .send({
+          email: 'inventario@example.com',
+          password: staffPassword,
+          roleIds: [viewerRoleId],
+          branchIds: [initialBranchId],
+        })
+        .expect(201);
+      const staffId = (staff.body as { data: { id: string } }).data.id;
+      const viewerLogin = await request(app.getHttpServer())
+        .post('/api/v1/auth/sessions')
+        .send({ email: 'inventario@example.com', password: staffPassword })
+        .expect(200);
+      const viewerCookie = (
+        viewerLogin.headers['set-cookie'] as unknown as string[]
+      )[0].split(';')[0];
+      expect(viewerLogin.body).toMatchObject({
+        data: {
+          user: { permissions: ['INVENTORY_VIEW'] },
+          context: { branch: { id: initialBranchId } },
+        },
+      });
+      await request(app.getHttpServer())
+        .get('/api/v1/products')
+        .set('Cookie', viewerCookie)
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .set('Cookie', viewerCookie)
+        .expect(200);
+      for (const path of [
+        '/api/v1/inventory/movements',
+        '/api/v1/inventory/transfers',
+      ]) {
+        await request(app.getHttpServer())
+          .post(path)
+          .set('Cookie', viewerCookie)
+          .send({})
+          .expect(403)
+          .expect(({ body }: { body: { code?: string } }) => {
+            expect(body.code).toBe('INVENTORY_ACCESS_DENIED');
+          });
+      }
+      await request(app.getHttpServer())
+        .get('/api/v1/access/roles')
+        .set('Cookie', viewerCookie)
+        .expect(403);
+      await request(app.getHttpServer())
+        .get('/api/v1/organization/branches')
+        .set('Cookie', viewerCookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: Array<{ id: string }> } }) => {
+          expect(body.data.map(({ id }) => id)).toEqual([initialBranchId]);
+        });
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/access/users/${staffId}`)
+        .set('Cookie', adminCookie)
+        .send({ roleIds: [operatorRoleId], branchIds: [secondBranchId] })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Cookie', viewerCookie)
+        .expect(401);
+      const operatorLogin = await request(app.getHttpServer())
+        .post('/api/v1/auth/sessions')
+        .send({ email: 'inventario@example.com', password: staffPassword })
+        .expect(200);
+      const operatorCookie = (
+        operatorLogin.headers['set-cookie'] as unknown as string[]
+      )[0].split(';')[0];
+      expect(operatorLogin.body).toMatchObject({
+        data: {
+          user: {
+            permissions: [
+              'INVENTORY_ADJUST',
+              'INVENTORY_TRANSFER',
+              'INVENTORY_VIEW',
+            ],
+          },
+          context: { branch: { id: secondBranchId } },
+        },
+      });
+      await request(app.getHttpServer())
+        .patch('/api/v1/auth/sessions/current/context')
+        .set('Cookie', operatorCookie)
+        .send({
+          branchId: initialBranchId,
+          warehouseId: (initial.body as { data: { warehouse: { id: string } } })
+            .data.warehouse.id,
+        })
+        .expect(404);
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', operatorCookie)
+        .send({})
+        .expect(400);
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/transfers')
+        .set('Cookie', operatorCookie)
+        .set('Idempotency-Key', 'operator-unassigned-destination')
+        .send({
+          destinationWarehouseId: initialData.warehouse.id,
+          reference: 'ACCESS-DENIED',
+          reason: 'Destino fuera de sucursales asignadas',
+          lines: [
+            {
+              productId,
+              sourceLocationId: secondWarehouse.locations[0].id,
+              destinationLocationId: initialData.location.id,
+              quantity: '1',
+            },
+          ],
+        })
+        .expect(400);
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/transfers/${hiddenTransferId}`)
+        .set('Cookie', operatorCookie)
+        .expect(404);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/transfers')
+        .set('Cookie', operatorCookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: Array<{ id: string }> } }) => {
+          expect(body.data.map(({ id }) => id)).not.toContain(hiddenTransferId);
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${randomUUID()}/dispatch`)
+        .set('Cookie', operatorCookie)
+        .set('Idempotency-Key', 'operator-cannot-approve')
+        .expect(403);
+
+      const approvalUser = await request(app.getHttpServer())
+        .post('/api/v1/access/users')
+        .set('Cookie', adminCookie)
+        .send({
+          email: 'aprobador@example.com',
+          password: 'Aprobador-2026!',
+          roleIds: [approverRoleId],
+          branchIds: [initialBranchId],
+        })
+        .expect(201);
+      expect(approvalUser.body).toMatchObject({
+        data: {
+          roles: [
+            {
+              permissions: [
+                'INVENTORY_APPROVE',
+                'INVENTORY_COUNT',
+                'INVENTORY_VIEW',
+              ],
+            },
+          ],
+        },
+      });
+      const approvalLogin = await request(app.getHttpServer())
+        .post('/api/v1/auth/sessions')
+        .send({ email: 'aprobador@example.com', password: 'Aprobador-2026!' })
+        .expect(200);
+      const approvalCookie = (
+        approvalLogin.headers['set-cookie'] as unknown as string[]
+      )[0].split(';')[0];
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/transfers')
+        .set('Cookie', approvalCookie)
+        .send({})
+        .expect(403);
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${randomUUID()}/dispatch`)
+        .set('Cookie', approvalCookie)
+        .set('Idempotency-Key', 'approver-can-approve')
+        .expect(404);
+
+      const [adminRole] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT r.id FROM roles r
+         INNER JOIN users u ON u.tenant_id = r.tenant_id
+         WHERE u.normalized_email = ? AND r.code = 'ADMIN'`,
+        [registrationPayload.email],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/access/users')
+        .set('Cookie', adminCookie)
+        .send({
+          email: 'admin-no-delegable@example.com',
+          password: 'Delegacion-2026!',
+          roleIds: [adminRole.id],
+          branchIds: [initialBranchId],
+        })
+        .expect(400);
+      await request(app.getHttpServer())
+        .get('/api/v1/audit-events')
+        .query({ pageSize: 50 })
+        .set('Cookie', adminCookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: Array<{ action: string }> } }) => {
+          const actions = body.data.map(({ action }) => action);
+          expect(actions).toContain('ACCESS_ROLE_CREATED');
+          expect(actions).toContain('ACCESS_USER_CREATED');
+          expect(actions).toContain('ACCESS_USER_UPDATED');
+        });
+
+      const otherPayload = {
+        organizationName: 'Otra empresa',
+        email: 'otra-admin@example.com',
+        password: 'Correcta-2026!',
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'access-other-registration')
+        .send(otherPayload)
+        .expect(201);
+      const otherCookie = await createPersistedSession(otherPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Otra Empresa, S.A.',
+          tradeName: 'Otra',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      const otherLocation = await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Sucursal Ajena',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Ajena',
+          locationName: 'General Ajena',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Caja Ajena' })
+        .expect(200);
+      const otherRole = await request(app.getHttpServer())
+        .post('/api/v1/access/roles')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Rol ajeno', permissions: ['INVENTORY_VIEW'] })
+        .expect(201);
+      await request(app.getHttpServer())
+        .patch(`/api/v1/access/users/${staffId}`)
+        .set('Cookie', otherCookie)
+        .send({
+          roleIds: [(otherRole.body as { data: { id: string } }).data.id],
+          branchIds: [
+            (otherLocation.body as { data: { branch: { id: string } } }).data
+              .branch.id,
+          ],
+        })
+        .expect(404);
+    });
+  });
+
   describe('Core role authorization matrix', () => {
     beforeEach(resetIdentityData);
 
@@ -3966,8 +4380,8 @@ describe('UInventario API (e2e)', () => {
         principal.id,
       ]);
       await dataSource.query(
-        'INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)',
-        [principal.id, staffRoleId],
+        'INSERT INTO user_roles (user_id, role_id, tenant_id) VALUES (?, ?, ?)',
+        [principal.id, staffRoleId, principal.tenant_id],
       );
 
       for (const [path, code] of [
@@ -4261,8 +4675,8 @@ describe('UInventario API (e2e)', () => {
         principal.id,
       ]);
       await dataSource.query(
-        'INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)',
-        [principal.id, staffRoleId],
+        'INSERT INTO user_roles (user_id, role_id, tenant_id) VALUES (?, ?, ?)',
+        [principal.id, staffRoleId, principal.tenant_id],
       );
       await request(app.getHttpServer())
         .get('/api/v1/audit-events')

@@ -117,6 +117,7 @@ export class SessionService {
   ): Promise<SessionResponse> {
     const context = await this.sessions.changeContext(
       principal.sessionId,
+      principal.user.id,
       principal.tenant.id,
       dto.branchId,
       dto.warehouseId,
