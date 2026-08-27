@@ -15,3 +15,9 @@ export class CatalogClassificationConflictError extends Error {
     super('CATALOG_CLASSIFICATION_CONFLICT');
   }
 }
+
+export class ProductCodeAmbiguousError extends Error {
+  constructor() {
+    super('PRODUCT_CODE_AMBIGUOUS');
+  }
+}

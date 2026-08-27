@@ -5,6 +5,7 @@ import type { ResultSetHeader } from 'mysql2';
 import { CreateProductDto } from './dto/create-product.dto';
 import {
   CatalogClassificationConflictError,
+  ProductCodeAmbiguousError,
   ProductIdentifierConflictError,
   ProductVersionConflictError,
 } from './catalog.errors';
@@ -219,6 +220,20 @@ export class CatalogRepository {
       `${this.productSelect()} WHERE p.id = ? AND p.tenant_id = ? LIMIT 1`,
       [id, tenantId],
     );
+    return rows[0] ? this.toProduct(rows[0]) : null;
+  }
+
+  async resolveCode(
+    tenantId: string,
+    code: string,
+  ): Promise<ProductData | null> {
+    const rows = await this.dataSource.query<ProductRow[]>(
+      `${this.productSelect()} WHERE p.tenant_id = ?
+         AND (p.normalized_sku = ? OR p.barcode = ?)
+       ORDER BY p.id LIMIT 2`,
+      [tenantId, this.normalize(code), code],
+    );
+    if (rows.length > 1) throw new ProductCodeAmbiguousError();
     return rows[0] ? this.toProduct(rows[0]) : null;
   }
 
