@@ -1,7 +1,10 @@
 import { Injectable } from '@nestjs/common';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
-import { PosIdempotencyConflictError } from './pos.errors';
+import {
+  PosIdempotencyConflictError,
+  PosInsufficientStockError,
+} from './pos.errors';
 import { CashSaleData, PosCartQuoteResponse } from './pos.types';
 
 interface SaleRow {
@@ -26,6 +29,12 @@ interface SaleRow {
   amount_received: string;
   amount_applied: string;
   change_amount: string;
+}
+
+interface StockAllocation {
+  locationId: string;
+  quantityChange: string;
+  resultingQuantity: string;
 }
 
 @Injectable()
@@ -53,87 +62,188 @@ export class SalesRepository {
     change: string;
   }): Promise<{ sale: CashSaleData; replay: boolean }> {
     try {
-      return await this.dataSource.transaction(async (manager) => {
-        const replay = await this.findWithManager(
-          manager,
-          input.tenantId,
-          input.idempotencyKey,
-        );
-        if (replay) {
-          if (replay.fingerprint !== input.fingerprint)
-            throw new PosIdempotencyConflictError();
-          return { sale: replay.sale, replay: true };
-        }
-        const saleId = randomUUID();
-        const receiptNumber = `V-${saleId.replaceAll('-', '').slice(0, 12).toUpperCase()}`;
-        await manager.query(
-          `INSERT INTO sales
+      return await this.dataSource.transaction(
+        'READ COMMITTED',
+        async (manager) => {
+          const replay = await this.findWithManager(
+            manager,
+            input.tenantId,
+            input.idempotencyKey,
+          );
+          if (replay) {
+            if (replay.fingerprint !== input.fingerprint)
+              throw new PosIdempotencyConflictError();
+            return { sale: replay.sale, replay: true };
+          }
+          const allocations = new Map<string, StockAllocation[]>();
+          let insufficientProductId: string | null = null;
+          for (const line of [...input.quote.lines].sort((left, right) =>
+            left.product.id.localeCompare(right.product.id),
+          )) {
+            const balances = await manager.query<
+              Array<{ location_id: string; quantity: string }>
+            >(
+              `SELECT ib.location_id, ib.quantity
+             FROM inventory_balances ib
+             INNER JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
+             WHERE ib.tenant_id = ? AND ib.product_id = ? AND l.warehouse_id = ?
+             ORDER BY l.created_at, l.id FOR UPDATE`,
+              [
+                input.tenantId,
+                line.product.id,
+                input.quote.context.warehouse.id,
+              ],
+            );
+            let remaining = this.toQuantityUnits(line.quantity);
+            const lineAllocations: StockAllocation[] = [];
+            for (const balance of balances) {
+              if (remaining === 0n) break;
+              const available = this.toQuantityUnits(balance.quantity);
+              const taken = available < remaining ? available : remaining;
+              if (taken === 0n) continue;
+              lineAllocations.push({
+                locationId: balance.location_id,
+                quantityChange: this.fromQuantityUnits(-taken),
+                resultingQuantity: this.fromQuantityUnits(available - taken),
+              });
+              remaining -= taken;
+            }
+            allocations.set(line.product.id, lineAllocations);
+            if (remaining > 0n) insufficientProductId = line.product.id;
+          }
+          const replayAfterLock = await this.findWithManager(
+            manager,
+            input.tenantId,
+            input.idempotencyKey,
+          );
+          if (replayAfterLock) {
+            if (replayAfterLock.fingerprint !== input.fingerprint)
+              throw new PosIdempotencyConflictError();
+            return { sale: replayAfterLock.sale, replay: true };
+          }
+          if (insufficientProductId) {
+            throw new PosInsufficientStockError(insufficientProductId);
+          }
+          const saleId = randomUUID();
+          const receiptNumber = `V-${saleId.replaceAll('-', '').slice(0, 12).toUpperCase()}`;
+          await manager.query(
+            `INSERT INTO sales
             (id, tenant_id, branch_id, warehouse_id, cash_register_id,
              created_by_user_id, receipt_number, currency, tax_rate, subtotal,
              tax_total, total, status, idempotency_key, request_fingerprint)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
-          [
-            saleId,
-            input.tenantId,
-            input.quote.context.branch.id,
-            input.quote.context.warehouse.id,
-            input.quote.context.cashRegister.id,
-            input.userId,
-            receiptNumber,
-            input.quote.currency,
-            input.quote.taxRate,
-            input.quote.totals.subtotal,
-            input.quote.totals.tax,
-            input.quote.totals.total,
-            input.idempotencyKey,
-            input.fingerprint,
-          ],
-        );
-        for (const [index, line] of input.quote.lines.entries()) {
-          await manager.query(
-            `INSERT INTO sale_lines
+            [
+              saleId,
+              input.tenantId,
+              input.quote.context.branch.id,
+              input.quote.context.warehouse.id,
+              input.quote.context.cashRegister.id,
+              input.userId,
+              receiptNumber,
+              input.quote.currency,
+              input.quote.taxRate,
+              input.quote.totals.subtotal,
+              input.quote.totals.tax,
+              input.quote.totals.total,
+              input.idempotencyKey,
+              input.fingerprint,
+            ],
+          );
+          for (const [index, line] of input.quote.lines.entries()) {
+            const saleLineId = randomUUID();
+            await manager.query(
+              `INSERT INTO sale_lines
               (id, tenant_id, sale_id, line_number, product_id, product_name,
                product_sku, quantity, unit_price, subtotal, tax, total)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                saleLineId,
+                input.tenantId,
+                saleId,
+                index + 1,
+                line.product.id,
+                line.product.name,
+                line.product.sku,
+                line.quantity,
+                line.unitPrice,
+                line.subtotal,
+                line.tax,
+                line.total,
+              ],
+            );
+            for (const [allocationIndex, allocation] of (
+              allocations.get(line.product.id) ?? []
+            ).entries()) {
+              await manager.query(
+                `UPDATE inventory_balances SET quantity = ?
+               WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
+                [
+                  allocation.resultingQuantity,
+                  input.tenantId,
+                  line.product.id,
+                  allocation.locationId,
+                ],
+              );
+              const movementKey = `sale:${saleId}:${index + 1}:${allocationIndex + 1}`;
+              const movementFingerprint = createHash('sha256')
+                .update(
+                  JSON.stringify({
+                    saleId,
+                    saleLineId,
+                    productId: line.product.id,
+                    locationId: allocation.locationId,
+                    quantityChange: allocation.quantityChange,
+                  }),
+                )
+                .digest('hex');
+              await manager.query(
+                `INSERT INTO inventory_movements
+                (id, tenant_id, product_id, location_id, type, quantity_change,
+                 resulting_quantity, reason, reference, idempotency_key,
+                 request_fingerprint, created_by_user_id, sale_id, sale_line_id)
+               VALUES (?, ?, ?, ?, 'SALE', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                  randomUUID(),
+                  input.tenantId,
+                  line.product.id,
+                  allocation.locationId,
+                  allocation.quantityChange,
+                  allocation.resultingQuantity,
+                  `Venta ${receiptNumber}`,
+                  receiptNumber,
+                  movementKey,
+                  movementFingerprint,
+                  input.userId,
+                  saleId,
+                  saleLineId,
+                ],
+              );
+            }
+          }
+          await manager.query(
+            `INSERT INTO sale_payments
+            (id, tenant_id, sale_id, method, currency, amount_received,
+             amount_applied, change_amount)
+           VALUES (?, ?, ?, 'CASH', ?, ?, ?, ?)`,
             [
               randomUUID(),
               input.tenantId,
               saleId,
-              index + 1,
-              line.product.id,
-              line.product.name,
-              line.product.sku,
-              line.quantity,
-              line.unitPrice,
-              line.subtotal,
-              line.tax,
-              line.total,
+              input.quote.currency,
+              input.amountReceived,
+              input.quote.totals.total,
+              input.change,
             ],
           );
-        }
-        await manager.query(
-          `INSERT INTO sale_payments
-            (id, tenant_id, sale_id, method, currency, amount_received,
-             amount_applied, change_amount)
-           VALUES (?, ?, ?, 'CASH', ?, ?, ?, ?)`,
-          [
-            randomUUID(),
+          const created = await this.findWithManager(
+            manager,
             input.tenantId,
-            saleId,
-            input.quote.currency,
-            input.amountReceived,
-            input.quote.totals.total,
-            input.change,
-          ],
-        );
-        const created = await this.findWithManager(
-          manager,
-          input.tenantId,
-          input.idempotencyKey,
-        );
-        if (!created) throw new Error('CREATED_CASH_SALE_NOT_FOUND');
-        return { sale: created.sale, replay: false };
-      });
+            input.idempotencyKey,
+          );
+          if (!created) throw new Error('CREATED_CASH_SALE_NOT_FOUND');
+          return { sale: created.sale, replay: false };
+        },
+      );
     } catch (error) {
       if (!this.isDuplicate(error)) throw error;
       const replay = await this.findByIdempotency(
@@ -236,6 +346,20 @@ export class SalesRepository {
   private decimal(value: string, scale: number): string {
     const [whole, fraction = ''] = value.split('.');
     return `${whole}.${fraction.padEnd(scale, '0').slice(0, scale)}`;
+  }
+
+  private toQuantityUnits(value: string): bigint {
+    const negative = value.startsWith('-');
+    const unsigned = negative ? value.slice(1) : value;
+    const [whole, fraction = ''] = unsigned.split('.');
+    const units = BigInt(whole) * 1000n + BigInt(fraction.padEnd(3, '0'));
+    return negative ? -units : units;
+  }
+
+  private fromQuantityUnits(value: bigint): string {
+    const sign = value < 0n ? '-' : '';
+    const absolute = value < 0n ? -value : value;
+    return `${sign}${absolute / 1000n}.${String(absolute % 1000n).padStart(3, '0')}`;
   }
 
   private isDuplicate(error: unknown): boolean {

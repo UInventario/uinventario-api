@@ -1,4 +1,4 @@
-export type InventoryMovementType = 'INITIAL' | 'ENTRY' | 'ADJUSTMENT';
+export type InventoryMovementType = 'INITIAL' | 'ENTRY' | 'ADJUSTMENT' | 'SALE';
 
 export interface InventoryLocationData {
   id: string;

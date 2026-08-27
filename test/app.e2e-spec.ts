@@ -5,6 +5,8 @@ import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
 import { DataSource } from 'typeorm';
 import { createHash, randomUUID } from 'node:crypto';
+import { SalesRepository } from '../src/pos/sales.repository';
+import { PosCartQuoteResponse } from '../src/pos/pos.types';
 
 describe('UInventario API (e2e)', () => {
   let app: INestApplication<App>;
@@ -1277,7 +1279,7 @@ describe('UInventario API (e2e)', () => {
     }
 
     it('recalculates prices, included tax and totals from server data', async () => {
-      const { cookie, productId } = await preparePos();
+      const { cookie, productId, locationId } = await preparePos();
       await request(app.getHttpServer())
         .post('/api/v1/pos/cart/quote')
         .set('Cookie', cookie)
@@ -1398,15 +1400,134 @@ describe('UInventario API (e2e)', () => {
           sales: number | string;
           line_count: number | string;
           payments: number | string;
+          sale_movements: number | string;
+          balance: string;
         }>
-      >(`SELECT (SELECT COUNT(*) FROM sales) AS sales,
+      >(
+        `SELECT (SELECT COUNT(*) FROM sales) AS sales,
                 (SELECT COUNT(*) FROM sale_lines) AS line_count,
-                (SELECT COUNT(*) FROM sale_payments) AS payments`);
+                (SELECT COUNT(*) FROM sale_payments) AS payments,
+                (SELECT COUNT(*) FROM inventory_movements WHERE type = 'SALE') AS sale_movements,
+                (SELECT quantity FROM inventory_balances
+                  WHERE product_id = ? AND location_id = ?) AS balance`,
+        [productId, locationId],
+      );
       expect({
         sales: Number(saleCounts.sales),
         lines: Number(saleCounts.line_count),
         payments: Number(saleCounts.payments),
-      }).toEqual({ sales: 1, lines: 1, payments: 1 });
+        saleMovements: Number(saleCounts.sale_movements),
+        balance: saleCounts.balance,
+      }).toEqual({
+        sales: 1,
+        lines: 1,
+        payments: 1,
+        saleMovements: 1,
+        balance: '2.500',
+      });
+      const [trace] = await dataSource.query<
+        Array<{
+          sale_id: string;
+          sale_line_id: string;
+          location_id: string;
+          quantity_change: string;
+          resulting_quantity: string;
+        }>
+      >(`SELECT sale_id, sale_line_id, location_id, quantity_change, resulting_quantity
+         FROM inventory_movements WHERE type = 'SALE'`);
+      expect(trace).toMatchObject({
+        sale_id: saleBodies[0].data.id,
+        location_id: locationId,
+        quantity_change: '-2.500',
+        resulting_quantity: '2.500',
+      });
+      expect(trace.sale_line_id).toBeTruthy();
+    });
+
+    it('prevents concurrent sales from overselling stock', async () => {
+      const { cookie, productId, locationId } = await preparePos();
+      const payload = {
+        lines: [{ productId, quantity: '3' }],
+        cashReceived: '400.00',
+      };
+
+      const responses = await Promise.all(
+        ['pos-concurrent-a', 'pos-concurrent-b'].map((key) =>
+          request(app.getHttpServer())
+            .post('/api/v1/pos/sales/cash')
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', key)
+            .send(payload),
+        ),
+      );
+
+      expect(responses.map(({ status }) => status).sort()).toEqual([201, 409]);
+      expect(
+        responses.find(({ status }) => status === 409)?.body,
+      ).toMatchObject({ code: 'INSUFFICIENT_STOCK', productId });
+      const [state] = await dataSource.query<
+        Array<{
+          sales: number | string;
+          sale_movements: number | string;
+          balance: string;
+        }>
+      >(
+        `SELECT (SELECT COUNT(*) FROM sales) AS sales,
+                (SELECT COUNT(*) FROM inventory_movements WHERE type = 'SALE') AS sale_movements,
+                (SELECT quantity FROM inventory_balances
+                  WHERE product_id = ? AND location_id = ?) AS balance`,
+        [productId, locationId],
+      );
+      expect({
+        sales: Number(state.sales),
+        saleMovements: Number(state.sale_movements),
+        balance: state.balance,
+      }).toEqual({ sales: 1, saleMovements: 1, balance: '2.000' });
+    });
+
+    it('rolls back the stock decrement when payment persistence fails', async () => {
+      const { cookie, productId, locationId } = await preparePos();
+      const quoteResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [{ productId, quantity: '2' }] })
+        .expect(200);
+      const quote = (quoteResponse.body as PosCartQuoteResponse).data;
+      const [principal] = await dataSource.query<
+        Array<{ id: string; tenant_id: string }>
+      >('SELECT id, tenant_id FROM users WHERE normalized_email = ? LIMIT 1', [
+        registrationPayload.email,
+      ]);
+
+      await expect(
+        app.get(SalesRepository).persistCashSale({
+          tenantId: principal.tenant_id,
+          userId: principal.id,
+          idempotencyKey: 'pos-payment-rollback',
+          fingerprint: 'f'.repeat(64),
+          quote,
+          amountReceived: '10000000000000.00',
+          change: '0.00',
+        }),
+      ).rejects.toThrow();
+      const [state] = await dataSource.query<
+        Array<{
+          sales: number | string;
+          sale_movements: number | string;
+          balance: string;
+        }>
+      >(
+        `SELECT (SELECT COUNT(*) FROM sales) AS sales,
+                (SELECT COUNT(*) FROM inventory_movements WHERE type = 'SALE') AS sale_movements,
+                (SELECT quantity FROM inventory_balances
+                  WHERE product_id = ? AND location_id = ?) AS balance`,
+        [productId, locationId],
+      );
+      expect({
+        sales: Number(state.sales),
+        saleMovements: Number(state.sale_movements),
+        balance: state.balance,
+      }).toEqual({ sales: 0, saleMovements: 0, balance: '5.000' });
     });
 
     it('rejects insufficient stock, inactive and nonexistent products', async () => {
