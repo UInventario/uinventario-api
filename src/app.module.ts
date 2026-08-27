@@ -10,6 +10,7 @@ import { SessionModule } from './auth/session/session.module';
 import { appConfig } from './config/app.config';
 import { databaseConfig } from './config/database.config';
 import { sessionConfig } from './config/session.config';
+import { CatalogModule } from './catalog/catalog.module';
 import { validationSchema } from './config/validation.schema';
 import { HealthModule } from './health/health.module';
 import { OnboardingModule } from './onboarding/onboarding.module';
@@ -41,6 +42,7 @@ import { OnboardingModule } from './onboarding/onboarding.module';
     RegistrationModule,
     SessionModule,
     OnboardingModule,
+    CatalogModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })
