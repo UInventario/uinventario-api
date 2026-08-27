@@ -22,5 +22,6 @@ import { InventoryImportService } from './inventory-import.service';
     InventoryImportService,
     PermissionGuard,
   ],
+  exports: [InventoryService],
 })
 export class InventoryModule {}

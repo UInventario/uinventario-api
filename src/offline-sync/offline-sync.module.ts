@@ -5,15 +5,21 @@ import { OfflineBootstrapRepository } from './offline-bootstrap.repository';
 import { OfflineBootstrapService } from './offline-bootstrap.service';
 import { OfflineChangesRepository } from './offline-changes.repository';
 import { OfflineChangesService } from './offline-changes.service';
+import { InventoryModule } from '../inventory/inventory.module';
+import { PosModule } from '../pos/pos.module';
+import { OfflineCommandRepository } from './offline-command.repository';
+import { OfflineCommandService } from './offline-command.service';
 
 @Module({
-  imports: [SessionModule],
+  imports: [SessionModule, InventoryModule, PosModule],
   controllers: [OfflineBootstrapController],
   providers: [
     OfflineBootstrapRepository,
     OfflineBootstrapService,
     OfflineChangesRepository,
     OfflineChangesService,
+    OfflineCommandRepository,
+    OfflineCommandService,
   ],
 })
 export class OfflineSyncModule {}

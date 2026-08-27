@@ -42,6 +42,9 @@ describe('UInventario API (e2e)', () => {
     for (const table of [
       'audit_events',
       'audit_chain_heads',
+      'offline_commands',
+      'offline_device_sequences',
+      'offline_sync_tombstones',
       'password_reset_tokens',
       'sale_payments',
       'sale_lines',
@@ -9168,6 +9171,206 @@ describe('UInventario API (e2e)', () => {
         .get('/api/v1/offline/bootstrap')
         .query({ deviceId })
         .expect(401);
+    });
+
+    it('applies offline commands once, preserves causal order and resumes partial batches', async () => {
+      const payload = {
+        organizationName: 'Comandos Offline',
+        email: 'offline-commands@example.com',
+        password: 'Offline-Commands-2026!',
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'offline-commands-registration')
+        .send(payload)
+        .expect(201);
+      const cookie = await createPersistedSession(payload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Comandos Offline, S.A. de C.V.',
+          tradeName: 'Comandos Offline',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      const location = await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Sucursal Offline',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Offline',
+          locationName: 'General Offline',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Offline' })
+        .expect(200);
+      const product = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto comando offline',
+          sku: 'OFFLINE-COMMAND-1',
+          cost: '5.00',
+          price: '9.00',
+        })
+        .expect(201);
+      const current = await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Cookie', cookie)
+        .expect(200);
+      const identity = (
+        current.body as {
+          data: {
+            tenant: { id: string };
+            user: { id: string };
+            context: {
+              branch: { id: string };
+              cashRegister: { id: string };
+            };
+          };
+        }
+      ).data;
+      const productId = (product.body as { data: { id: string } }).data.id;
+      const locationId = (
+        location.body as { data: { location: { id: string } } }
+      ).data.location.id;
+      const deviceId = randomUUID();
+      const scope = {
+        tenantId: identity.tenant.id,
+        userId: identity.user.id,
+        deviceId,
+        branchId: identity.context.branch.id,
+        cashRegisterId: identity.context.cashRegister.id,
+      };
+      const firstCommand = {
+        protocolVersion: '1.0',
+        commandId: randomUUID(),
+        idempotencyKey: `offline-command-${randomUUID()}`,
+        scope,
+        sequence: 1,
+        createdAt: new Date().toISOString(),
+        kind: 'INVENTORY_MOVEMENT',
+        payload: {
+          productId,
+          locationId,
+          type: 'INITIAL',
+          quantity: '3',
+          reason: 'Comando offline inicial',
+        },
+      };
+      const first = await request(app.getHttpServer())
+        .post('/api/v1/offline/commands/batch')
+        .set('Cookie', cookie)
+        .send({ commands: [firstCommand] })
+        .expect(201);
+      const replay = await request(app.getHttpServer())
+        .post('/api/v1/offline/commands/batch')
+        .set('Cookie', cookie)
+        .send({ commands: [firstCommand] })
+        .expect(201);
+      expect(first.body).toMatchObject({
+        data: { results: [{ status: 'CONFIRMED', replay: false }] },
+      });
+      expect(replay.body).toMatchObject({
+        data: { results: [{ status: 'CONFIRMED', replay: true }] },
+      });
+      const firstResult = (
+        first.body as { data: { results: Array<{ result: unknown }> } }
+      ).data.results[0].result;
+      const replayResult = (
+        replay.body as { data: { results: Array<{ result: unknown }> } }
+      ).data.results[0].result;
+      expect(replayResult).toEqual(firstResult);
+
+      const partial = await request(app.getHttpServer())
+        .post('/api/v1/offline/commands/batch')
+        .set('Cookie', cookie)
+        .send({
+          commands: [
+            {
+              ...firstCommand,
+              commandId: randomUUID(),
+              idempotencyKey: `offline-command-${randomUUID()}`,
+              sequence: 2,
+              payload: {
+                ...firstCommand.payload,
+                productId: randomUUID(),
+                type: 'ENTRY',
+              },
+            },
+            {
+              ...firstCommand,
+              commandId: randomUUID(),
+              idempotencyKey: `offline-command-${randomUUID()}`,
+              sequence: 3,
+              payload: {
+                ...firstCommand.payload,
+                type: 'ENTRY',
+                quantity: '2',
+                reason: 'Reanudación causal',
+                reference: 'OFFLINE-ENTRY-2',
+              },
+            },
+          ],
+        })
+        .expect(201);
+      expect(partial.body).toMatchObject({
+        data: {
+          results: [
+            { sequence: 2, status: 'ERROR' },
+            { sequence: 3, status: 'CONFIRMED' },
+          ],
+        },
+      });
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/balance`)
+        .set('Cookie', cookie)
+        .query({ locationId })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({ data: { quantity: '5.000' } }),
+        );
+
+      await request(app.getHttpServer())
+        .post('/api/v1/offline/commands/batch')
+        .set('Cookie', cookie)
+        .send({
+          commands: [
+            {
+              ...firstCommand,
+              commandId: randomUUID(),
+              idempotencyKey: `offline-command-${randomUUID()}`,
+              sequence: 5,
+            },
+          ],
+        })
+        .expect(409)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            code: 'OFFLINE_COMMAND_SEQUENCE_GAP',
+            expectedSequence: 4,
+          }),
+        );
+      await request(app.getHttpServer())
+        .post('/api/v1/offline/commands/batch')
+        .set('Cookie', cookie)
+        .send({
+          commands: [
+            {
+              ...firstCommand,
+              commandId: randomUUID(),
+              idempotencyKey: `offline-command-${randomUUID()}`,
+              scope: { ...scope, tenantId: randomUUID() },
+              sequence: 4,
+            },
+          ],
+        })
+        .expect(403);
     });
   });
 

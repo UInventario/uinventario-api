@@ -29,5 +29,6 @@ import { PermissionGuard } from '../auth/authorization/permission.guard';
     PosService,
     PosAccessGuard,
   ],
+  exports: [PosService],
 })
 export class PosModule {}
