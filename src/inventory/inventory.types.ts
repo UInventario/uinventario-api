@@ -6,6 +6,7 @@ export const INVENTORY_MOVEMENT_TYPES = [
   'LOSS',
   'DAMAGE',
   'ADJUSTMENT',
+  'IMPORT',
   'STATE_TRANSITION',
   'TRANSFER_OUT',
   'TRANSFER_IN',
@@ -19,6 +20,7 @@ export type InventoryMovementType = (typeof INVENTORY_MOVEMENT_TYPES)[number];
 export type UserInventoryMovementType = Exclude<
   InventoryMovementType,
   | 'STATE_TRANSITION'
+  | 'IMPORT'
   | 'TRANSFER_OUT'
   | 'TRANSFER_IN'
   | 'TRANSFER_RECEIPT'
@@ -105,7 +107,7 @@ export interface InventoryMovementHistoryItem {
   correlationId: string;
   idempotencyKey: string;
   document: {
-    type: 'MOVEMENT' | 'SALE' | 'TRANSFER' | 'RECEIPT';
+    type: 'MOVEMENT' | 'IMPORT' | 'SALE' | 'TRANSFER' | 'RECEIPT';
     id: string;
     reference: string | null;
   };

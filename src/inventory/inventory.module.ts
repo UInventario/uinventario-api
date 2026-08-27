@@ -7,6 +7,8 @@ import { InventoryService } from './inventory.service';
 import { InventoryTransferController } from './inventory-transfer.controller';
 import { InventoryTransferRepository } from './inventory-transfer.repository';
 import { InventoryTransferService } from './inventory-transfer.service';
+import { InventoryImportRepository } from './inventory-import.repository';
+import { InventoryImportService } from './inventory-import.service';
 
 @Module({
   imports: [SessionModule],
@@ -16,6 +18,8 @@ import { InventoryTransferService } from './inventory-transfer.service';
     InventoryService,
     InventoryTransferRepository,
     InventoryTransferService,
+    InventoryImportRepository,
+    InventoryImportService,
     PermissionGuard,
   ],
 })
