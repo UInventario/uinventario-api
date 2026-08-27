@@ -1967,6 +1967,372 @@ describe('UInventario API (e2e)', () => {
     });
   });
 
+  describe('core tenant isolation matrix', () => {
+    beforeEach(resetIdentityData);
+
+    interface TenantFixture {
+      cookie: string;
+      tenantId: string;
+      userId: string;
+      branchId: string;
+      warehouseId: string;
+      locationId: string;
+      cashRegisterId: string;
+      productId: string;
+      saleId: string;
+      email: string;
+      organizationName: string;
+    }
+
+    async function provisionTenant(
+      suffix: string,
+      organizationName: string,
+      email: string,
+    ): Promise<TenantFixture> {
+      const registration = await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', `tenant-matrix-registration-${suffix}`)
+        .send({
+          organizationName,
+          email,
+          password: registrationPayload.password,
+        })
+        .expect(201);
+      const tenantId = (
+        registration.body as { data: { tenant: { id: string } } }
+      ).data.tenant.id;
+      const cookie = await createPersistedSession(email);
+
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: `${organizationName}, S.A. de C.V.`,
+          tradeName: organizationName,
+          countryCode: 'MX',
+        })
+        .expect(200);
+      const locationResponse = await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: `Sucursal ${suffix}`,
+          timezone: 'America/Mexico_City',
+          warehouseName: `Bodega ${suffix}`,
+          locationName: `General ${suffix}`,
+        })
+        .expect(200);
+      const locationContext = (
+        locationResponse.body as {
+          data: {
+            branch: { id: string };
+            warehouse: { id: string };
+            location: { id: string };
+          };
+        }
+      ).data;
+      const registerResponse = await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: `Caja ${suffix}` })
+        .expect(200);
+      const cashRegisterId = (
+        registerResponse.body as { data: { cashRegister: { id: string } } }
+      ).data.cashRegister.id;
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: `Producto ${suffix}`,
+          sku: 'TENANT-MATRIX',
+          cost: '5.00',
+          price: '10.00',
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', `tenant-matrix-stock-${suffix}`)
+        .send({
+          productId,
+          locationId: locationContext.location.id,
+          type: 'INITIAL',
+          quantity: '5',
+          reason: 'Prueba de aislamiento',
+          reference: `MATRIX-${suffix}`,
+        })
+        .expect(201);
+      const saleResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', `tenant-matrix-sale-${suffix}`)
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: '10.00',
+        })
+        .expect(201);
+      const saleId = (saleResponse.body as { data: { id: string } }).data.id;
+      const [user] = await dataSource.query<Array<{ id: string }>>(
+        'SELECT id FROM users WHERE normalized_email = ? LIMIT 1',
+        [email],
+      );
+
+      return {
+        cookie,
+        tenantId,
+        userId: user.id,
+        branchId: locationContext.branch.id,
+        warehouseId: locationContext.warehouse.id,
+        locationId: locationContext.location.id,
+        cashRegisterId,
+        productId,
+        saleId,
+        email,
+        organizationName,
+      };
+    }
+
+    it('keeps company, operational context, catalog, stock and sales opaque across tenants', async () => {
+      const primary = await provisionTenant(
+        'A',
+        'Empresa Matriz A',
+        'matrix-a@example.com',
+      );
+      const foreign = await provisionTenant(
+        'B',
+        'Empresa Matriz B',
+        'matrix-b@example.com',
+      );
+
+      await request(app.getHttpServer())
+        .get('/api/v1/onboarding/company')
+        .set('Cookie', primary.cookie)
+        .set('X-Tenant-Id', foreign.tenantId)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { company: { tradeName: primary.organizationName } },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Cookie', primary.cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              user: { email: primary.email },
+              tenant: { id: primary.tenantId },
+              context: {
+                branch: { id: primary.branchId },
+                warehouse: { id: primary.warehouseId },
+                cashRegister: { id: primary.cashRegisterId },
+              },
+            },
+          });
+        });
+
+      const missingProductId = randomUUID();
+      const foreignProduct = await request(app.getHttpServer())
+        .get(`/api/v1/products/${foreign.productId}`)
+        .set('Cookie', primary.cookie)
+        .expect(404);
+      const missingProduct = await request(app.getHttpServer())
+        .get(`/api/v1/products/${missingProductId}`)
+        .set('Cookie', primary.cookie)
+        .expect(404);
+      expect(foreignProduct.body).toEqual(missingProduct.body);
+
+      const productUpdate = {
+        name: 'Intento ajeno',
+        sku: 'FOREIGN-UPDATE',
+        cost: '1.00',
+        price: '2.00',
+        version: 1,
+      };
+      const foreignUpdate = await request(app.getHttpServer())
+        .patch(`/api/v1/products/${foreign.productId}`)
+        .set('Cookie', primary.cookie)
+        .send(productUpdate)
+        .expect(404);
+      const missingUpdate = await request(app.getHttpServer())
+        .patch(`/api/v1/products/${missingProductId}`)
+        .set('Cookie', primary.cookie)
+        .send(productUpdate)
+        .expect(404);
+      expect(foreignUpdate.body).toEqual(missingUpdate.body);
+
+      const products = await request(app.getHttpServer())
+        .get('/api/v1/products')
+        .set('Cookie', primary.cookie)
+        .expect(200);
+      expect(
+        (products.body as { data: Array<{ id: string }> }).data.map(
+          ({ id }) => id,
+        ),
+      ).toEqual([primary.productId]);
+
+      for (const [productId, locationId, missingProduct, missingLocation] of [
+        [
+          foreign.productId,
+          primary.locationId,
+          randomUUID(),
+          primary.locationId,
+        ],
+        [
+          primary.productId,
+          foreign.locationId,
+          primary.productId,
+          randomUUID(),
+        ],
+      ]) {
+        const foreignMovement = await request(app.getHttpServer())
+          .post('/api/v1/inventory/movements')
+          .set('Cookie', primary.cookie)
+          .set('Idempotency-Key', `tenant-matrix-rejected-${locationId}`)
+          .send({
+            productId,
+            locationId,
+            type: 'ENTRY',
+            quantity: '1',
+            reason: 'Intento ajeno',
+          })
+          .expect(404);
+        const missingMovement = await request(app.getHttpServer())
+          .post('/api/v1/inventory/movements')
+          .set('Cookie', primary.cookie)
+          .set('Idempotency-Key', `tenant-matrix-missing-${locationId}`)
+          .send({
+            productId: missingProduct,
+            locationId: missingLocation,
+            type: 'ENTRY',
+            quantity: '1',
+            reason: 'Intento inexistente',
+          })
+          .expect(404);
+        expect(foreignMovement.body).toEqual(missingMovement.body);
+      }
+      const foreignBalance = await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${foreign.productId}/balance`)
+        .query({ locationId: primary.locationId })
+        .set('Cookie', primary.cookie)
+        .expect(404);
+      const missingBalance = await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${randomUUID()}/balance`)
+        .query({ locationId: primary.locationId })
+        .set('Cookie', primary.cookie)
+        .expect(404);
+      expect(foreignBalance.body).toEqual(missingBalance.body);
+      const foreignStockScope = await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .query({
+          branchId: foreign.branchId,
+          warehouseId: foreign.warehouseId,
+        })
+        .set('Cookie', primary.cookie)
+        .expect(404);
+      const missingStockScope = await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .query({ branchId: randomUUID(), warehouseId: randomUUID() })
+        .set('Cookie', primary.cookie)
+        .expect(404);
+      expect(foreignStockScope.body).toEqual(missingStockScope.body);
+
+      const movements = await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .set('Cookie', primary.cookie)
+        .expect(200);
+      const movementProducts = (
+        movements.body as { data: Array<{ product: { id: string } }> }
+      ).data.map(({ product }) => product.id);
+      expect(new Set(movementProducts)).toEqual(new Set([primary.productId]));
+      expect(movementProducts).not.toContain(foreign.productId);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .query({ productId: foreign.productId })
+        .set('Cookie', primary.cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toEqual([]);
+        });
+
+      const missingSaleId = randomUUID();
+      const foreignSale = await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${foreign.saleId}`)
+        .set('Cookie', primary.cookie)
+        .expect(404);
+      const missingSale = await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${missingSaleId}`)
+        .set('Cookie', primary.cookie)
+        .expect(404);
+      expect(foreignSale.body).toEqual(missingSale.body);
+
+      const sales = await request(app.getHttpServer())
+        .get('/api/v1/pos/sales')
+        .set('Cookie', primary.cookie)
+        .expect(200);
+      expect(
+        (sales.body as { data: Array<{ id: string }> }).data.map(
+          ({ id }) => id,
+        ),
+      ).toEqual([primary.saleId]);
+      for (const query of [
+        { cashRegisterId: foreign.cashRegisterId },
+        { userId: foreign.userId },
+      ]) {
+        const foreignFilteredSales = await request(app.getHttpServer())
+          .get('/api/v1/pos/sales')
+          .query(query)
+          .set('Cookie', primary.cookie)
+          .expect(200);
+        const filterName = Object.keys(query)[0];
+        const missingFilteredSales = await request(app.getHttpServer())
+          .get('/api/v1/pos/sales')
+          .query({ [filterName]: randomUUID() })
+          .set('Cookie', primary.cookie)
+          .expect(200);
+        expect(foreignFilteredSales.body).toEqual(missingFilteredSales.body);
+        expect((foreignFilteredSales.body as { data: unknown[] }).data).toEqual(
+          [],
+        );
+      }
+
+      const foreignQuote = await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', primary.cookie)
+        .send({ lines: [{ productId: foreign.productId, quantity: '1' }] })
+        .expect(404);
+      const missingQuote = await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', primary.cookie)
+        .send({ lines: [{ productId: randomUUID(), quantity: '1' }] })
+        .expect(404);
+      expect(foreignQuote.body).toEqual(missingQuote.body);
+
+      const foreignSaleAttempt = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', primary.cookie)
+        .set('Idempotency-Key', 'tenant-matrix-foreign-sale')
+        .send({
+          lines: [{ productId: foreign.productId, quantity: '1' }],
+          cashReceived: '10.00',
+        })
+        .expect(404);
+      const missingSaleAttempt = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', primary.cookie)
+        .set('Idempotency-Key', 'tenant-matrix-missing-sale')
+        .send({
+          lines: [{ productId: randomUUID(), quantity: '1' }],
+          cashReceived: '10.00',
+        })
+        .expect(404);
+      expect(foreignSaleAttempt.body).toEqual(missingSaleAttempt.body);
+    });
+  });
+
   afterAll(async () => {
     await app.close();
   });

@@ -57,6 +57,19 @@ compuestas impiden relacionar recursos de tenants distintos.
 
 MySQL 8.4 local corre en Docker con volumen persistente. Dev y Prod reciben una `DATABASE_URL` independiente mediante secretos; el repositorio no contiene credenciales productivas.
 
+## Aislamiento multiempresa
+
+El tenant y el contexto operativo siempre se derivan de la sesión; los IDs enviados
+en headers o cuerpos no pueden cambiarlo. Las consultas y escrituras Core filtran por
+tenant y, cuando corresponde, por la sucursal, bodega y caja activas. Los recursos
+ajenos se responden igual que los inexistentes para no revelar su existencia.
+
+La matriz E2E `core tenant isolation matrix` valida empresa, contexto operativo,
+catálogo, stock, movimientos y ventas con dos tenants reales. Actualmente no existen
+jobs ni cachés con datos de negocio; la configuración es global y no almacena estado
+de tenants. Cualquier job, caché o logging estructurado futuro que transporte datos de
+negocio deberá incluir y validar explícitamente `tenantId`.
+
 ## Gates
 
 ```bash
