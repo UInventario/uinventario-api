@@ -51,6 +51,11 @@ export class OfflineCommandRepository {
         ) {
           throw new OfflineCommandConflictError();
         }
+        await manager.query(
+          `UPDATE offline_commands SET replay_count = replay_count + 1
+           WHERE command_id = ?`,
+          [existing.command_id],
+        );
         return this.result(existing, true);
       }
       const expected = Number(sequence.last_sequence) + 1;
