@@ -1358,9 +1358,15 @@ describe('UInventario API (e2e)', () => {
       const productId = (productResponse.body as { data: { id: string } }).data
         .id;
       const [location] = await dataSource.query<
-        Array<{ id: string; warehouse_id: string; branch_id: string }>
+        Array<{
+          id: string;
+          name: string;
+          warehouse_id: string;
+          branch_id: string;
+          user_id: string;
+        }>
       >(
-        `SELECT l.id, l.warehouse_id, w.branch_id FROM locations l
+        `SELECT l.id, l.name, l.warehouse_id, w.branch_id, u.id AS user_id FROM locations l
          INNER JOIN warehouses w ON w.id = l.warehouse_id AND w.tenant_id = l.tenant_id
          INNER JOIN users u ON u.tenant_id = l.tenant_id
          WHERE u.normalized_email = ? LIMIT 1`,
@@ -1576,24 +1582,83 @@ describe('UInventario API (e2e)', () => {
             },
           });
         });
-      await request(app.getHttpServer())
+      const adjustmentHistory = await request(app.getHttpServer())
         .get('/api/v1/inventory/movements')
         .query({ productId, type: 'ADJUSTMENT' })
         .set('Cookie', cookie)
+        .expect(200);
+      const adjustment = (
+        adjustmentHistory.body as {
+          data: Array<{
+            id: string;
+            previousQuantity: string;
+            resultingQuantity: string;
+            correlationId: string;
+            idempotencyKey: string;
+            document: { type: string; id: string; reference: string | null };
+          }>;
+        }
+      ).data[0];
+      expect(adjustmentHistory.body).toMatchObject({
+        data: [
+          {
+            direction: 'OUT',
+            quantityChange: '-0.500',
+            previousQuantity: '14.500',
+            resultingQuantity: '14.000',
+            reason: 'Conteo físico',
+            reference: 'CONTEO-002',
+            idempotencyKey: 'inventory-adjustment-002',
+            document: { type: 'MOVEMENT', reference: 'CONTEO-002' },
+          },
+        ],
+      });
+      expect(adjustment.correlationId).toBe(adjustment.id);
+      expect(adjustment.document.id).toBe(adjustment.id);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .query({
+          locationId: location.id,
+          userId: location.user_id,
+          location: location.name,
+          responsible: registrationPayload.email,
+          document: 'inventory-adjustment-002',
+        })
+        .set('Cookie', cookie)
         .expect(200)
-        .expect(({ body }: { body: unknown }) => {
-          expect(body).toMatchObject({
-            data: [
-              {
-                direction: 'OUT',
-                quantityChange: '-0.500',
-                resultingQuantity: '14.000',
-                reason: 'Conteo físico',
-                reference: 'CONTEO-002',
-              },
-            ],
-          });
+        .expect(({ body }: { body: { data: Array<{ id: string }> } }) => {
+          expect(body.data.map(({ id }) => id)).toEqual([adjustment.id]);
         });
+      const firstMovementPage = await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .query({ page: 1, pageSize: 2 })
+        .set('Cookie', cookie)
+        .expect(200);
+      const repeatedMovementPage = await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .query({ page: 1, pageSize: 2 })
+        .set('Cookie', cookie)
+        .expect(200);
+      expect(repeatedMovementPage.body).toEqual(firstMovementPage.body);
+      await request(app.getHttpServer())
+        .patch(`/api/v1/inventory/movements/${adjustment.id}`)
+        .set('Cookie', cookie)
+        .send({ reason: 'Intento de mutación' })
+        .expect(404);
+      await request(app.getHttpServer())
+        .delete(`/api/v1/inventory/movements/${adjustment.id}`)
+        .set('Cookie', cookie)
+        .expect(404);
+      const [persistedMovement] = await dataSource.query<
+        Array<{ reason: string; idempotency_key: string }>
+      >(
+        'SELECT reason, idempotency_key FROM inventory_movements WHERE id = ?',
+        [adjustment.id],
+      );
+      expect(persistedMovement).toEqual({
+        reason: 'Conteo físico',
+        idempotency_key: 'inventory-adjustment-002',
+      });
       await request(app.getHttpServer())
         .get('/api/v1/inventory/movements')
         .query({ dateFrom: '2099-01-01' })
@@ -2678,6 +2743,45 @@ describe('UInventario API (e2e)', () => {
       );
       expect(Number(movementSummary.transfers)).toBe(8);
       expect(Number(movementSummary.movement_total)).toBe(-1);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .query({ document: 'TR-001', pageSize: 10 })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: Array<{
+                type: string;
+                correlationId: string;
+                document: { type: string; id: string };
+              }>;
+            };
+          }) => {
+            expect(body.data).toHaveLength(4);
+            expect(body.data.map(({ type }) => type).sort()).toEqual([
+              'TRANSFER_DISCREPANCY',
+              'TRANSFER_IN',
+              'TRANSFER_RECEIPT',
+              'TRANSFER_RECEIPT',
+            ]);
+            expect(
+              body.data.every(
+                ({ correlationId }) => correlationId === transferId,
+              ),
+            ).toBe(true);
+            expect(body.data.map(({ document }) => document.type)).toContain(
+              'RECEIPT',
+            );
+            expect(
+              body.data
+                .filter(({ document }) => document.type === 'RECEIPT')
+                .every(({ document }) => document.id !== transferId),
+            ).toBe(true);
+          },
+        );
     });
 
     it('rejects products and locations outside the active tenant', async () => {
