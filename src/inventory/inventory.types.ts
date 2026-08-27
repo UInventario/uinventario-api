@@ -7,13 +7,15 @@ export const INVENTORY_MOVEMENT_TYPES = [
   'DAMAGE',
   'ADJUSTMENT',
   'STATE_TRANSITION',
+  'TRANSFER_OUT',
+  'TRANSFER_IN',
   'SALE',
 ] as const;
 
 export type InventoryMovementType = (typeof INVENTORY_MOVEMENT_TYPES)[number];
 export type UserInventoryMovementType = Exclude<
   InventoryMovementType,
-  'STATE_TRANSITION' | 'SALE'
+  'STATE_TRANSITION' | 'TRANSFER_OUT' | 'TRANSFER_IN' | 'SALE'
 >;
 export type InventoryStockState =
   'AVAILABLE' | 'RESERVED' | 'DAMAGED' | 'IN_TRANSIT';

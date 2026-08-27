@@ -38,6 +38,8 @@ describe('UInventario API (e2e)', () => {
       'sale_lines',
       'sales',
       'inventory_movements',
+      'inventory_transfer_lines',
+      'inventory_transfers',
       'inventory_balances',
       'products',
       'brands',
@@ -2205,6 +2207,248 @@ describe('UInventario API (e2e)', () => {
         });
     });
 
+    it('dispatches transfers atomically, idempotently and only from available stock', async () => {
+      await registerAccount('transfer-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeInventoryOnboarding(registrationPayload.email, cookie);
+      const organization = await request(app.getHttpServer())
+        .get('/api/v1/organization/branches')
+        .set('Cookie', cookie)
+        .expect(200);
+      const origin = (
+        organization.body as {
+          data: Array<{
+            id: string;
+            warehouses: Array<{ id: string; locations: Array<{ id: string }> }>;
+          }>;
+        }
+      ).data[0];
+      const destinationResponse = await request(app.getHttpServer())
+        .post('/api/v1/organization/branches')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Sucursal Destino',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Destino',
+          locationName: 'Recepción',
+          locationCode: 'DEST',
+        })
+        .expect(201);
+      const destination = (
+        destinationResponse.body as {
+          data: {
+            id: string;
+            warehouses: Array<{ id: string; locations: Array<{ id: string }> }>;
+          };
+        }
+      ).data;
+      const originWarehouse = origin.warehouses[0];
+      const destinationWarehouse = destination.warehouses[0];
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto transferible',
+          sku: 'TRANSFER-1',
+          cost: '4.00',
+          price: '8.00',
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'transfer-initial-stock')
+        .send({
+          productId,
+          locationId: originWarehouse.locations[0].id,
+          type: 'INITIAL',
+          quantity: '10',
+          reason: 'Stock para transferir',
+        })
+        .expect(201);
+
+      const transferInput = (quantity: string, reference: string) => ({
+        destinationWarehouseId: destinationWarehouse.id,
+        reference,
+        reason: 'Reabasto entre sucursales',
+        lines: [
+          {
+            productId,
+            sourceLocationId: originWarehouse.locations[0].id,
+            destinationLocationId: destinationWarehouse.locations[0].id,
+            quantity,
+          },
+        ],
+      });
+      const created = await request(app.getHttpServer())
+        .post('/api/v1/inventory/transfers')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'transfer-create-main')
+        .send(transferInput('6', 'TR-001'))
+        .expect(201);
+      const transferId = (created.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/transfers')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'transfer-create-main')
+        .send(transferInput('6', 'TR-001'))
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { id: transferId, status: 'DRAFT' },
+            meta: { idempotentReplay: true },
+          });
+        });
+
+      const cancellable = await request(app.getHttpServer())
+        .post('/api/v1/inventory/transfers')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'transfer-create-cancel')
+        .send(transferInput('1', 'TR-CANCEL'))
+        .expect(201);
+      const cancellableId = (cancellable.body as { data: { id: string } }).data
+        .id;
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${cancellableId}/cancel`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              id: cancellableId,
+              status: 'CANCELLED',
+              cancelledBy: { email: registrationPayload.email },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${cancellableId}/dispatch`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'transfer-dispatch-cancelled')
+        .expect(409);
+
+      const simultaneousReplay = await Promise.all(
+        ['first', 'second'].map(() =>
+          request(app.getHttpServer())
+            .post(`/api/v1/inventory/transfers/${transferId}/dispatch`)
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', 'transfer-dispatch-main'),
+        ),
+      );
+      expect(simultaneousReplay.map(({ status }) => status)).toEqual([
+        200, 200,
+      ]);
+      expect(
+        simultaneousReplay.map(
+          ({ body }) =>
+            (body as { meta: { idempotentReplay: boolean } }).meta
+              .idempotentReplay,
+        ),
+      ).toContain(true);
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${transferId}/dispatch`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'transfer-dispatch-other')
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('TRANSFER_STATUS_CONFLICT');
+        });
+
+      const competingTransfers = await Promise.all(
+        ['A', 'B'].map(async (suffix) => {
+          const response = await request(app.getHttpServer())
+            .post('/api/v1/inventory/transfers')
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', `transfer-create-competing-${suffix}`)
+            .send(transferInput('3', `TR-COMPETE-${suffix}`))
+            .expect(201);
+          return (response.body as { data: { id: string } }).data.id;
+        }),
+      );
+      const competingDispatches = await Promise.all(
+        competingTransfers.map((id, index) =>
+          request(app.getHttpServer())
+            .post(`/api/v1/inventory/transfers/${id}/dispatch`)
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', `transfer-dispatch-competing-${index}`),
+        ),
+      );
+      expect(competingDispatches.map(({ status }) => status).sort()).toEqual([
+        200, 409,
+      ]);
+      expect(
+        competingDispatches.find(({ status }) => status === 409)?.body,
+      ).toMatchObject({ code: 'INSUFFICIENT_AVAILABLE_STOCK' });
+
+      const balances = await dataSource.query<
+        Array<{
+          location_id: string;
+          quantity: string;
+          available_quantity: string;
+          in_transit_quantity: string;
+        }>
+      >(
+        `SELECT location_id, quantity, available_quantity, in_transit_quantity
+         FROM inventory_balances WHERE product_id = ? ORDER BY location_id`,
+        [productId],
+      );
+      const source = balances.find(
+        ({ location_id }) => location_id === originWarehouse.locations[0].id,
+      )!;
+      const target = balances.find(
+        ({ location_id }) =>
+          location_id === destinationWarehouse.locations[0].id,
+      )!;
+      expect(source).toMatchObject({
+        quantity: '1.000',
+        available_quantity: '1.000',
+        in_transit_quantity: '0.000',
+      });
+      expect(target).toMatchObject({
+        quantity: '9.000',
+        available_quantity: '0.000',
+        in_transit_quantity: '9.000',
+      });
+      expect(Number(source.quantity) + Number(target.quantity)).toBe(10);
+
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/transfers/${transferId}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              id: transferId,
+              status: 'DISPATCHED',
+              reference: 'TR-001',
+              reason: 'Reabasto entre sucursales',
+              originWarehouse: { id: originWarehouse.id },
+              destinationWarehouse: { id: destinationWarehouse.id },
+              lines: [
+                {
+                  product: { id: productId, sku: 'TRANSFER-1' },
+                  quantity: '6.000',
+                },
+              ],
+              createdBy: { email: registrationPayload.email },
+              dispatchedBy: { email: registrationPayload.email },
+            },
+          });
+        });
+      const [movementSummary] = await dataSource.query<
+        Array<{ transfers: number | string; movement_total: string }>
+      >(
+        `SELECT COUNT(*) AS transfers, SUM(quantity_change) AS movement_total
+         FROM inventory_movements
+         WHERE transfer_id IS NOT NULL AND product_id = ?`,
+        [productId],
+      );
+      expect(Number(movementSummary.transfers)).toBe(4);
+      expect(Number(movementSummary.movement_total)).toBe(0);
+    });
+
     it('rejects products and locations outside the active tenant', async () => {
       await registerAccount('inventory-isolation-primary');
       const primaryCookie = await createPersistedSession(
@@ -2221,6 +2465,18 @@ describe('UInventario API (e2e)', () => {
         .expect(201);
       const productId = (productResponse.body as { data: { id: string } }).data
         .id;
+
+      const primaryOrganization = await request(app.getHttpServer())
+        .get('/api/v1/organization/branches')
+        .set('Cookie', primaryCookie)
+        .expect(200);
+      const primaryLocationId = (
+        primaryOrganization.body as {
+          data: Array<{
+            warehouses: Array<{ locations: Array<{ id: string }> }>;
+          }>;
+        }
+      ).data[0].warehouses[0].locations[0].id;
 
       const secondary = {
         organizationName: 'Otra Tienda',
@@ -2243,6 +2499,58 @@ describe('UInventario API (e2e)', () => {
          WHERE u.normalized_email = ? LIMIT 1`,
         [secondary.email],
       );
+      const foreignDestinationResponse = await request(app.getHttpServer())
+        .post('/api/v1/organization/branches')
+        .set('Cookie', secondaryCookie)
+        .send({
+          name: 'Destino aislado',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega destino aislada',
+          locationName: 'Recepcion aislada',
+          locationCode: 'ISO-DEST',
+        })
+        .expect(201);
+      const foreignDestination = (
+        foreignDestinationResponse.body as {
+          data: {
+            warehouses: Array<{ id: string; locations: Array<{ id: string }> }>;
+          };
+        }
+      ).data.warehouses[0];
+      const foreignProductResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', secondaryCookie)
+        .send({
+          name: 'Producto de otro tenant',
+          sku: 'FOREIGN-TRANSFER',
+          cost: '1.00',
+          price: '2.00',
+        })
+        .expect(201);
+      const foreignProductId = (
+        foreignProductResponse.body as { data: { id: string } }
+      ).data.id;
+      const foreignTransferResponse = await request(app.getHttpServer())
+        .post('/api/v1/inventory/transfers')
+        .set('Cookie', secondaryCookie)
+        .set('Idempotency-Key', 'foreign-transfer-create')
+        .send({
+          destinationWarehouseId: foreignDestination.id,
+          reference: 'FOREIGN-001',
+          reason: 'Transferencia de otro tenant',
+          lines: [
+            {
+              productId: foreignProductId,
+              sourceLocationId: foreignLocation.id,
+              destinationLocationId: foreignDestination.locations[0].id,
+              quantity: '1',
+            },
+          ],
+        })
+        .expect(201);
+      const foreignTransferId = (
+        foreignTransferResponse.body as { data: { id: string } }
+      ).data.id;
 
       const foreignContext = await request(app.getHttpServer())
         .patch('/api/v1/auth/sessions/current/context')
@@ -2258,6 +2566,43 @@ describe('UInventario API (e2e)', () => {
         .send({ branchId: randomUUID(), warehouseId: randomUUID() })
         .expect(404);
       expect(foreignContext.body).toEqual(missingContext.body);
+
+      const foreignTransfer = await request(app.getHttpServer())
+        .get(`/api/v1/inventory/transfers/${foreignTransferId}`)
+        .set('Cookie', primaryCookie)
+        .expect(404);
+      const missingTransfer = await request(app.getHttpServer())
+        .get(`/api/v1/inventory/transfers/${randomUUID()}`)
+        .set('Cookie', primaryCookie)
+        .expect(404);
+      expect(foreignTransfer.body).toEqual(missingTransfer.body);
+
+      const invalidTransferInput = (destinationWarehouseId: string) => ({
+        destinationWarehouseId,
+        reference: 'ISOLATION-001',
+        reason: 'No debe revelar recursos externos',
+        lines: [
+          {
+            productId,
+            sourceLocationId: primaryLocationId,
+            destinationLocationId: foreignDestination.locations[0].id,
+            quantity: '1',
+          },
+        ],
+      });
+      const foreignTransferAttempt = await request(app.getHttpServer())
+        .post('/api/v1/inventory/transfers')
+        .set('Cookie', primaryCookie)
+        .set('Idempotency-Key', 'inventory-foreign-transfer')
+        .send(invalidTransferInput(foreignDestination.id))
+        .expect(400);
+      const missingTransferAttempt = await request(app.getHttpServer())
+        .post('/api/v1/inventory/transfers')
+        .set('Cookie', primaryCookie)
+        .set('Idempotency-Key', 'inventory-missing-transfer')
+        .send(invalidTransferInput(randomUUID()))
+        .expect(400);
+      expect(foreignTransferAttempt.body).toEqual(missingTransferAttempt.body);
 
       const organizations = await request(app.getHttpServer())
         .get('/api/v1/organization/branches')
@@ -3232,6 +3577,7 @@ describe('UInventario API (e2e)', () => {
         '/api/v1/onboarding/company',
         '/api/v1/products',
         '/api/v1/inventory/stock',
+        '/api/v1/inventory/transfers',
         '/api/v1/pos/sales',
       ]) {
         await request(app.getHttpServer()).get(path).expect(401);
@@ -3261,6 +3607,7 @@ describe('UInventario API (e2e)', () => {
         ['/api/v1/onboarding/company', 'ONBOARDING_ACCESS_DENIED'],
         ['/api/v1/products', 'PRODUCT_ACCESS_DENIED'],
         ['/api/v1/inventory/stock', 'INVENTORY_ACCESS_DENIED'],
+        ['/api/v1/inventory/transfers', 'INVENTORY_ACCESS_DENIED'],
         ['/api/v1/pos/sales', 'POS_ACCESS_DENIED'],
         ['/api/v1/audit-events', 'AUDIT_ACCESS_DENIED'],
       ]) {
@@ -3292,6 +3639,28 @@ describe('UInventario API (e2e)', () => {
           quantity: '1',
           reason: 'Intento sin permiso',
           reference: 'DENIED-001',
+        })
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVENTORY_ACCESS_DENIED');
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/transfers')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'staff-transfer-denied')
+        .send({
+          destinationWarehouseId: randomUUID(),
+          reference: 'DENIED-TRANSFER',
+          reason: 'Intento sin permiso',
+          lines: [
+            {
+              productId: randomUUID(),
+              sourceLocationId: randomUUID(),
+              destinationLocationId: randomUUID(),
+              quantity: '1',
+            },
+          ],
         })
         .expect(403)
         .expect(({ body }: { body: { code?: string } }) => {
