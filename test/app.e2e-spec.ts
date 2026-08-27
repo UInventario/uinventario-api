@@ -52,6 +52,9 @@ describe('UInventario API (e2e)', () => {
       'inventory_transfer_lines',
       'inventory_transfers',
       'inventory_balances',
+      'purchase_order_lines',
+      'purchase_orders',
+      'purchase_order_sequences',
       'supplier_product_prices',
       'supplier_products',
       'supplier_contacts',
@@ -899,6 +902,7 @@ describe('UInventario API (e2e)', () => {
                   'INVENTORY_TRANSFER',
                   'INVENTORY_VIEW',
                   'PRODUCTS_MANAGE',
+                  'PURCHASE_ORDERS_MANAGE',
                   'SALE_REPRINT',
                   'SALES_DISCOUNT',
                   'SALES_MANAGE',
@@ -1195,8 +1199,9 @@ describe('UInventario API (e2e)', () => {
         [admin.role_id, admin.tenant_id],
       );
       await request(app.getHttpServer())
-        .get('/api/v1/suppliers')
+        .post('/api/v1/suppliers')
         .set('Cookie', cookie)
+        .send({ legalName: 'Sin permiso', taxIdentifier: 'DEF040506CD2' })
         .expect(403)
         .expect(({ body }: { body: { code?: string } }) => {
           expect(body.code).toBe('PERMISSION_DENIED');
@@ -1434,6 +1439,362 @@ describe('UInventario API (e2e)', () => {
         [link.id],
       );
       expect(Number(audit.event_count)).toBe(2);
+    });
+  });
+
+  describe('purchase order drafts', () => {
+    beforeEach(resetIdentityData);
+
+    async function setupProcurement(
+      email: string,
+      cookie: string,
+      suffix: string,
+    ): Promise<{ supplierId: string; supplierProductId: string }> {
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: `${suffix} Legal`,
+          tradeName: suffix,
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Sucursal Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Principal',
+          locationName: 'Ubicación General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Principal' })
+        .expect(200);
+
+      let supplierId = '';
+      await request(app.getHttpServer())
+        .post('/api/v1/suppliers')
+        .set('Cookie', cookie)
+        .send({
+          legalName: `${suffix} Proveedor`,
+          taxIdentifier: 'ABC010203AB1',
+        })
+        .expect(201)
+        .expect(({ body }: { body: { data: { id: string } } }) => {
+          supplierId = body.data.id;
+        });
+      let productId = '';
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: `${suffix} Producto`,
+          sku: `${suffix.toUpperCase()}-1`,
+          cost: '85.40',
+          price: '119.90',
+        })
+        .expect(201)
+        .expect(({ body }: { body: { data: { id: string } } }) => {
+          productId = body.data.id;
+        });
+      let supplierProductId = '';
+      await request(app.getHttpServer())
+        .post('/api/v1/supplier-products')
+        .set('Cookie', cookie)
+        .send({
+          supplierId,
+          productId,
+          supplierCode: `${suffix.toUpperCase()}-PROV-1`,
+          currency: 'MXN',
+          unitCost: '80.00',
+          validFrom: '2026-08-01',
+        })
+        .expect(201)
+        .expect(({ body }: { body: { data: { id: string } } }) => {
+          supplierProductId = body.data.id;
+        });
+      return { supplierId, supplierProductId };
+    }
+
+    it('calculates, edits and isolates tenant-scoped draft orders with sequential folios', async () => {
+      await registerAccount('purchase-order-primary-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      const first = await setupProcurement(
+        registrationPayload.email,
+        cookie,
+        'Principal',
+      );
+
+      let secondProductId = '';
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto Secundario',
+          sku: 'SECOND-1',
+          cost: '25.00',
+          price: '40.00',
+        })
+        .expect(201)
+        .expect(({ body }: { body: { data: { id: string } } }) => {
+          secondProductId = body.data.id;
+        });
+      let secondSupplierProductId = '';
+      await request(app.getHttpServer())
+        .post('/api/v1/supplier-products')
+        .set('Cookie', cookie)
+        .send({
+          supplierId: first.supplierId,
+          productId: secondProductId,
+          supplierCode: 'SECOND-PROV-1',
+          currency: 'MXN',
+          unitCost: '30.00',
+          validFrom: '2026-08-01',
+        })
+        .expect(201)
+        .expect(({ body }: { body: { data: { id: string } } }) => {
+          secondSupplierProductId = body.data.id;
+        });
+
+      const input = {
+        supplierId: first.supplierId,
+        currency: 'MXN',
+        notes: 'Entregar por la mañana',
+        lines: [
+          {
+            supplierProductId: first.supplierProductId,
+            quantity: '2.500',
+            unitCost: '80.00',
+            notes: 'Empaque sellado',
+          },
+          {
+            supplierProductId: secondSupplierProductId,
+            quantity: '0.333',
+            unitCost: '30.00',
+          },
+        ],
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/purchase-orders')
+        .set('Cookie', cookie)
+        .send({ ...input, currency: 'USD' })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVALID_PURCHASE_ORDER_CURRENCY');
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/purchase-orders')
+        .set('Cookie', cookie)
+        .send({ ...input, lines: [input.lines[0], input.lines[0]] })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('DUPLICATE_PURCHASE_ORDER_LINE');
+        });
+
+      let order!: {
+        id: string;
+        folio: string;
+        version: number;
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/purchase-orders')
+        .set('Cookie', cookie)
+        .send(input)
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: typeof order & Record<string, unknown> };
+          }) => {
+            order = body.data;
+            expect(body.data).toMatchObject({
+              folio: 'OC-000001',
+              currency: 'MXN',
+              status: 'DRAFT',
+              subtotal: '209.99',
+              total: '209.99',
+              version: 1,
+              lines: [
+                {
+                  supplierProductId: first.supplierProductId,
+                  quantity: '2.500',
+                  unitCost: '80.00',
+                  subtotal: '200.00',
+                  notes: 'Empaque sellado',
+                },
+                {
+                  supplierProductId: secondSupplierProductId,
+                  quantity: '0.333',
+                  unitCost: '30.00',
+                  subtotal: '9.99',
+                },
+              ],
+            });
+          },
+        );
+
+      const update = {
+        ...input,
+        version: 1,
+        notes: 'Entrega actualizada',
+        lines: [
+          {
+            supplierProductId: first.supplierProductId,
+            quantity: '3.000',
+            unitCost: '79.99',
+          },
+        ],
+      };
+      await request(app.getHttpServer())
+        .patch(`/api/v1/purchase-orders/${order.id}`)
+        .set('Cookie', cookie)
+        .send(update)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              folio: 'OC-000001',
+              subtotal: '239.97',
+              total: '239.97',
+              version: 2,
+              lines: [
+                { quantity: '3.000', unitCost: '79.99', subtotal: '239.97' },
+              ],
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .patch(`/api/v1/purchase-orders/${order.id}`)
+        .set('Cookie', cookie)
+        .send(update)
+        .expect(409)
+        .expect(
+          ({ body }: { body: { code?: string; currentVersion?: number } }) => {
+            expect(body.code).toBe('PURCHASE_ORDER_VERSION_CONFLICT');
+            expect(body.currentVersion).toBe(2);
+          },
+        );
+
+      await request(app.getHttpServer())
+        .get('/api/v1/purchase-orders')
+        .query({ q: 'OC-000001', page: 1, pageSize: 10 })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [{ id: order.id, folio: 'OC-000001', total: '239.97' }],
+            meta: { pagination: { total: 1, totalPages: 1 } },
+          });
+        });
+
+      const secondary = {
+        organizationName: 'Otra empresa de compras',
+        email: 'other-purchase-order@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'purchase-order-secondary-registration')
+        .send(secondary)
+        .expect(201);
+      const secondaryCookie = await createPersistedSession(secondary.email);
+      const secondarySetup = await setupProcurement(
+        secondary.email,
+        secondaryCookie,
+        'Secundaria',
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/purchase-orders')
+        .set('Cookie', secondaryCookie)
+        .send({
+          supplierId: secondarySetup.supplierId,
+          currency: 'MXN',
+          lines: [
+            {
+              supplierProductId: secondarySetup.supplierProductId,
+              quantity: '1.000',
+              unitCost: '80.00',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { folio: 'OC-000001' } });
+        });
+      await request(app.getHttpServer())
+        .get(`/api/v1/purchase-orders/${order.id}`)
+        .set('Cookie', secondaryCookie)
+        .expect(404);
+
+      await dataSource.query(
+        "UPDATE purchase_orders SET status = 'APPROVED' WHERE id = ?",
+        [order.id],
+      );
+      await request(app.getHttpServer())
+        .patch(`/api/v1/purchase-orders/${order.id}`)
+        .set('Cookie', cookie)
+        .send({ ...update, version: 2 })
+        .expect(409)
+        .expect(
+          ({ body }: { body: { code?: string; currentStatus?: string } }) => {
+            expect(body.code).toBe('PURCHASE_ORDER_STATE_CONFLICT');
+            expect(body.currentStatus).toBe('APPROVED');
+          },
+        );
+
+      const [audit] = await dataSource.query<Array<{ total: number | string }>>(
+        `SELECT COUNT(*) AS total FROM audit_events
+         WHERE entity_type = 'PURCHASE_ORDER' AND entity_id = ?`,
+        [order.id],
+      );
+      expect(Number(audit.total)).toBe(2);
+
+      const [admin] = await dataSource.query<
+        Array<{ role_id: string; tenant_id: string }>
+      >(
+        `SELECT ur.role_id, u.tenant_id FROM users u
+         INNER JOIN user_roles ur ON ur.user_id = u.id AND ur.tenant_id = u.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'SUPPLIERS_MANAGE'`,
+        [admin.role_id, admin.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/suppliers')
+        .set('Cookie', cookie)
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/supplier-products')
+        .set('Cookie', cookie)
+        .expect(200);
+      await request(app.getHttpServer())
+        .post('/api/v1/suppliers')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Proveedor bloqueado',
+          taxIdentifier: 'DEF040506CD2',
+        })
+        .expect(403);
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'PURCHASE_ORDERS_MANAGE'`,
+        [admin.role_id, admin.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/purchase-orders')
+        .set('Cookie', cookie)
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PERMISSION_DENIED');
+        });
     });
   });
 

@@ -11,28 +11,30 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { AuditService } from '../audit/audit.service';
+import { PermissionGuard } from '../auth/authorization/permission.guard';
+import { RequirePermissions } from '../auth/authorization/require-permissions.decorator';
 import { SessionGuard } from '../auth/session/session.guard';
 import type { AuthenticatedRequest } from '../auth/session/session.types';
-import { CreateSupplierProductDto } from './dto/create-supplier-product.dto';
-import { ListSupplierProductsDto } from './dto/list-supplier-products.dto';
-import { UpdateSupplierProductDto } from './dto/update-supplier-product.dto';
-import { SupplierProductService } from './supplier-product.service';
-import { SupplierAccessGuard } from './supplier-access.guard';
+import { ListPurchaseOrdersDto } from './dto/list-purchase-orders.dto';
+import { SavePurchaseOrderDto } from './dto/save-purchase-order.dto';
+import { UpdatePurchaseOrderDto } from './dto/update-purchase-order.dto';
+import { PurchaseOrderService } from './purchase-order.service';
 
-@Controller('supplier-products')
-@UseGuards(SessionGuard, SupplierAccessGuard)
-export class SupplierProductController {
+@Controller('purchase-orders')
+@UseGuards(SessionGuard, PermissionGuard)
+@RequirePermissions('PURCHASE_ORDERS_MANAGE')
+export class PurchaseOrderController {
   constructor(
-    private readonly links: SupplierProductService,
+    private readonly orders: PurchaseOrderService,
     private readonly audit: AuditService,
   ) {}
 
   @Get()
   list(
     @Req() request: AuthenticatedRequest,
-    @Query() query: ListSupplierProductsDto,
+    @Query() query: ListPurchaseOrdersDto,
   ) {
-    return this.links.list(request.principal.tenant.id, query);
+    return this.orders.list(request.principal.tenant.id, query);
   }
 
   @Get(':id')
@@ -40,15 +42,15 @@ export class SupplierProductController {
     @Req() request: AuthenticatedRequest,
     @Param('id', new ParseUUIDPipe()) id: string,
   ) {
-    return this.links.get(request.principal.tenant.id, id);
+    return this.orders.get(request.principal.tenant.id, id);
   }
 
   @Post()
   async create(
     @Req() request: AuthenticatedRequest,
-    @Body() dto: CreateSupplierProductDto,
+    @Body() dto: SavePurchaseOrderDto,
   ) {
-    const result = await this.links.create(
+    const result = await this.orders.create(
       request.principal.tenant.id,
       request.principal.user.id,
       dto,
@@ -56,15 +58,15 @@ export class SupplierProductController {
     await this.audit.record({
       tenantId: request.principal.tenant.id,
       actorUserId: request.principal.user.id,
-      action: 'SUPPLIER_PRODUCT_LINKED',
-      entityType: 'SUPPLIER_PRODUCT',
+      action: 'PURCHASE_ORDER_CREATED',
+      entityType: 'PURCHASE_ORDER',
       entityId: result.data.id,
       correlationId: request.requestId!,
       after: {
+        folio: result.data.folio,
         supplierId: result.data.supplier.id,
-        productId: result.data.product.id,
-        currency: result.data.prices[0].currency,
-        unitCost: result.data.prices[0].unitCost,
+        currency: result.data.currency,
+        total: result.data.total,
       },
     });
     return result;
@@ -74,29 +76,28 @@ export class SupplierProductController {
   async update(
     @Req() request: AuthenticatedRequest,
     @Param('id', new ParseUUIDPipe()) id: string,
-    @Body() dto: UpdateSupplierProductDto,
+    @Body() dto: UpdatePurchaseOrderDto,
   ) {
-    const before = await this.links.get(request.principal.tenant.id, id);
-    const result = await this.links.update(
+    const before = await this.orders.get(request.principal.tenant.id, id);
+    const result = await this.orders.update(
       request.principal.tenant.id,
-      request.principal.user.id,
       id,
       dto,
     );
     await this.audit.record({
       tenantId: request.principal.tenant.id,
       actorUserId: request.principal.user.id,
-      action: 'SUPPLIER_PRICE_CHANGED',
-      entityType: 'SUPPLIER_PRODUCT',
+      action: 'PURCHASE_ORDER_UPDATED',
+      entityType: 'PURCHASE_ORDER',
       entityId: id,
       correlationId: request.requestId!,
       before: {
-        currency: before.data.prices[0].currency,
-        unitCost: before.data.prices[0].unitCost,
+        version: before.data.version,
+        total: before.data.total,
       },
       after: {
-        currency: result.data.prices[0].currency,
-        unitCost: result.data.prices[0].unitCost,
+        version: result.data.version,
+        total: result.data.total,
       },
     });
     return result;
