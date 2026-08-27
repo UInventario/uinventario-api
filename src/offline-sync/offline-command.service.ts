@@ -14,12 +14,12 @@ import type { AppPermission } from '../auth/authorization/authorization.types';
 import { AuditService } from '../audit/audit.service';
 import { CreateInventoryMovementDto } from '../inventory/dto/create-inventory-movement.dto';
 import { InventoryService } from '../inventory/inventory.service';
-import { CreateCashSaleDto } from '../pos/dto/create-cash-sale.dto';
 import { PosService } from '../pos/pos.service';
 import {
   OfflineCommandBatchDto,
   OfflineCommandDto,
 } from './dto/offline-command-batch.dto';
+import { OfflineCashSaleCommandDto } from './dto/offline-cash-sale-command.dto';
 import {
   OfflineCommandConflictError,
   OfflineCommandSequenceError,
@@ -119,7 +119,10 @@ export class OfflineCommandService {
         const { branch, warehouse, cashRegister } = principal.context;
         if (!branch || !warehouse || !cashRegister)
           throw new ForbiddenException();
-        const payload = await this.payload(CreateCashSaleDto, command.payload);
+        const payload = await this.payload(
+          OfflineCashSaleCommandDto,
+          command.payload,
+        );
         const response = await this.pos.createCashSale({
           tenantId: principal.tenant.id,
           branchId: branch.id,
@@ -128,6 +131,7 @@ export class OfflineCommandService {
           userId: principal.user.id,
           idempotencyKey: command.idempotencyKey,
           dto: payload,
+          expectedSnapshot: payload.snapshot,
         });
         await this.audit.record({
           tenantId: principal.tenant.id,

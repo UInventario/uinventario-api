@@ -24,7 +24,11 @@ import {
 } from './pos.errors';
 import { PosRepository } from './pos.repository';
 import { SalesRepository } from './sales.repository';
-import { CashSaleResponse, PosCartQuoteResponse } from './pos.types';
+import {
+  CashSaleResponse,
+  OfflineCashSaleSnapshot,
+  PosCartQuoteResponse,
+} from './pos.types';
 import { CashRegisterShiftService } from './cash-register-shift.service';
 import { CashRegisterShiftRequiredError } from './cash-register-shift.errors';
 
@@ -137,6 +141,7 @@ export class PosService {
     userId: string;
     idempotencyKey: string | undefined;
     dto: CreateCashSaleDto;
+    expectedSnapshot?: OfflineCashSaleSnapshot;
   }): Promise<CashSaleResponse> {
     this.assertIdempotencyKey(input.idempotencyKey);
     const fingerprint = this.saleFingerprint(input.dto);
@@ -161,6 +166,9 @@ export class PosService {
         userId: input.userId,
         dto: { lines: input.dto.lines, reservationId: input.dto.reservationId },
       });
+      if (input.expectedSnapshot) {
+        this.assertOfflineSnapshot(input.expectedSnapshot, quote.data);
+      }
       const shift = await this.shifts.requireCurrent({
         tenantId: input.tenantId,
         branchId: input.branchId,
@@ -225,6 +233,32 @@ export class PosService {
       }
       throw error;
     }
+  }
+
+  async offlinePolicy(input: {
+    tenantId: string;
+    branchId: string;
+    warehouseId: string;
+    cashRegisterId: string;
+    userId: string;
+  }) {
+    const [shiftResponse, context] = await Promise.all([
+      this.shifts.current(input),
+      this.pos.getContext(input),
+    ]);
+    const shift = shiftResponse.data;
+    if (!shift) return null;
+    const taxRate =
+      this.config.taxRates[context.countryCode] ??
+      this.config.taxRates.DEFAULT ??
+      '0.0000';
+    return {
+      shift,
+      currency: this.currencyFor(context.countryCode),
+      taxRate: this.normalizeTaxRate(taxRate),
+      paymentMethods: ['CASH'] as const,
+      negativeStock: 'DENY' as const,
+    };
   }
 
   async quoteCart(input: {
@@ -385,6 +419,54 @@ export class PosService {
       reservationId: dto.reservationId ?? null,
     };
     return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+  }
+
+  private assertOfflineSnapshot(
+    expected: OfflineCashSaleSnapshot,
+    current: PosCartQuoteResponse['data'],
+  ): void {
+    const expectedValue = {
+      branchId: expected.branchId,
+      warehouseId: expected.warehouseId,
+      cashRegisterId: expected.cashRegisterId,
+      currency: expected.currency,
+      taxRate: expected.taxRate,
+      paymentMethod: expected.paymentMethod,
+      negativeStock: expected.negativeStock,
+      lines: [...expected.lines].sort((left, right) =>
+        left.productId.localeCompare(right.productId),
+      ),
+      totals: expected.totals,
+    };
+    const currentValue = {
+      branchId: current.context.branch.id,
+      warehouseId: current.context.warehouse.id,
+      cashRegisterId: current.context.cashRegister.id,
+      currency: current.currency,
+      taxRate: current.taxRate,
+      paymentMethod: 'CASH' as const,
+      negativeStock: 'DENY' as const,
+      lines: current.lines
+        .map((line) => ({
+          productId: line.product.id,
+          name: line.product.name,
+          sku: line.product.sku,
+          quantity: line.quantity,
+          unitPrice: line.unitPrice,
+          subtotal: line.subtotal,
+          tax: line.tax,
+          total: line.total,
+        }))
+        .sort((left, right) => left.productId.localeCompare(right.productId)),
+      totals: current.totals,
+    };
+    if (JSON.stringify(expectedValue) !== JSON.stringify(currentValue)) {
+      throw new ConflictException({
+        code: 'OFFLINE_SALE_SNAPSHOT_CONFLICT',
+        message:
+          'Precio, impuesto o contexto cambiaron desde la captura offline; la venta requiere conciliación.',
+      });
+    }
   }
 
   private toQuantityUnits(value: string): bigint {

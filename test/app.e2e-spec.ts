@@ -9209,6 +9209,12 @@ describe('UInventario API (e2e)', () => {
         .set('Cookie', cookie)
         .send({ name: 'Caja Offline' })
         .expect(200);
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'offline-command-shift-open')
+        .send({ openingAmount: '100.00' })
+        .expect(201);
       const product = await request(app.getHttpServer())
         .post('/api/v1/products')
         .set('Cookie', cookie)
@@ -9230,6 +9236,7 @@ describe('UInventario API (e2e)', () => {
             user: { id: string };
             context: {
               branch: { id: string };
+              warehouse: { id: string };
               cashRegister: { id: string };
             };
           };
@@ -9240,6 +9247,25 @@ describe('UInventario API (e2e)', () => {
         location.body as { data: { location: { id: string } } }
       ).data.location.id;
       const deviceId = randomUUID();
+      const posBootstrap = await request(app.getHttpServer())
+        .get('/api/v1/offline/bootstrap')
+        .set('Cookie', cookie)
+        .query({ deviceId, pageSize: 500 })
+        .expect(200);
+      expect(
+        (posBootstrap.body as { data: OfflineBootstrapResponseV1 }).data
+          .posPolicy,
+      ).toEqual(
+        expect.objectContaining({
+          kind: 'POS_POLICY',
+          warehouseId: identity.context.warehouse.id,
+          cashRegisterId: identity.context.cashRegister.id,
+          currency: 'MXN',
+          taxRate: '0.1600',
+          paymentMethods: ['CASH'],
+          negativeStock: 'DENY',
+        }),
+      );
       const scope = {
         tenantId: identity.tenant.id,
         userId: identity.user.id,
@@ -9371,6 +9397,187 @@ describe('UInventario API (e2e)', () => {
           ],
         })
         .expect(403);
+
+      const staleQuoteResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [{ productId, quantity: '3' }] })
+        .expect(200);
+      const staleQuote = (
+        staleQuoteResponse.body as {
+          data: {
+            context: {
+              branch: { id: string };
+              warehouse: { id: string };
+              cashRegister: { id: string };
+            };
+            currency: string;
+            taxRate: string;
+            lines: Array<{
+              product: { id: string; name: string; sku: string };
+              quantity: string;
+              unitPrice: string;
+              subtotal: string;
+              tax: string;
+              total: string;
+            }>;
+            totals: { subtotal: string; tax: string; total: string };
+          };
+        }
+      ).data;
+      const cashSnapshot = {
+        capturedAt: new Date().toISOString(),
+        branchId: staleQuote.context.branch.id,
+        warehouseId: staleQuote.context.warehouse.id,
+        cashRegisterId: staleQuote.context.cashRegister.id,
+        currency: staleQuote.currency,
+        taxRate: staleQuote.taxRate,
+        paymentMethod: 'CASH',
+        negativeStock: 'DENY',
+        lines: staleQuote.lines.map((line) => ({
+          productId: line.product.id,
+          name: line.product.name,
+          sku: line.product.sku,
+          quantity: line.quantity,
+          unitPrice: line.unitPrice,
+          subtotal: line.subtotal,
+          tax: line.tax,
+          total: line.total,
+        })),
+        totals: staleQuote.totals,
+      };
+      const cashCommand = {
+        protocolVersion: '1.0',
+        commandId: randomUUID(),
+        idempotencyKey: `offline-sale-${randomUUID()}`,
+        scope,
+        sequence: 4,
+        createdAt: new Date().toISOString(),
+        kind: 'CASH_SALE',
+        payload: {
+          lines: [{ productId, quantity: '3' }],
+          cashReceived: staleQuote.totals.total,
+          snapshot: cashSnapshot,
+        },
+      };
+      const offlineSale = await request(app.getHttpServer())
+        .post('/api/v1/offline/commands/batch')
+        .set('Cookie', cookie)
+        .send({ commands: [cashCommand] })
+        .expect(201);
+      const offlineSaleReplay = await request(app.getHttpServer())
+        .post('/api/v1/offline/commands/batch')
+        .set('Cookie', cookie)
+        .send({ commands: [cashCommand] })
+        .expect(201);
+      expect(offlineSale.body).toMatchObject({
+        data: { results: [{ status: 'CONFIRMED', replay: false }] },
+      });
+      expect(offlineSaleReplay.body).toMatchObject({
+        data: { results: [{ status: 'CONFIRMED', replay: true }] },
+      });
+
+      const secondDeviceCommand = {
+        ...cashCommand,
+        commandId: randomUUID(),
+        idempotencyKey: `offline-sale-${randomUUID()}`,
+        scope: { ...scope, deviceId: randomUUID() },
+        sequence: 1,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/offline/commands/batch')
+        .set('Cookie', cookie)
+        .send({ commands: [secondDeviceCommand] })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: {
+              results: [
+                {
+                  status: 'ERROR',
+                  error: {
+                    status: 409,
+                    details: { code: 'INSUFFICIENT_STOCK' },
+                  },
+                },
+              ],
+            },
+          }),
+        );
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/balance`)
+        .set('Cookie', cookie)
+        .query({ locationId })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({ data: { quantity: '2.000' } }),
+        );
+
+      const priceQuoteResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [{ productId, quantity: '1' }] })
+        .expect(200);
+      const priceQuote = (
+        priceQuoteResponse.body as { data: typeof staleQuote }
+      ).data;
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${productId}`)
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto comando offline',
+          sku: 'OFFLINE-COMMAND-1',
+          cost: '5.00',
+          price: '10.00',
+          version: 1,
+        })
+        .expect(200);
+      const priceConflictCommand = {
+        ...cashCommand,
+        commandId: randomUUID(),
+        idempotencyKey: `offline-sale-${randomUUID()}`,
+        scope: { ...scope, deviceId: randomUUID() },
+        sequence: 1,
+        payload: {
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: priceQuote.totals.total,
+          snapshot: {
+            ...cashSnapshot,
+            capturedAt: new Date().toISOString(),
+            lines: priceQuote.lines.map((line) => ({
+              productId: line.product.id,
+              name: line.product.name,
+              sku: line.product.sku,
+              quantity: line.quantity,
+              unitPrice: line.unitPrice,
+              subtotal: line.subtotal,
+              tax: line.tax,
+              total: line.total,
+            })),
+            totals: priceQuote.totals,
+          },
+        },
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/offline/commands/batch')
+        .set('Cookie', cookie)
+        .send({ commands: [priceConflictCommand] })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: {
+              results: [
+                {
+                  status: 'ERROR',
+                  error: {
+                    status: 409,
+                    details: { code: 'OFFLINE_SALE_SNAPSHOT_CONFLICT' },
+                  },
+                },
+              ],
+            },
+          }),
+        );
     });
   });
 

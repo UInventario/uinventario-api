@@ -30,6 +30,28 @@ export interface PosCartQuoteResponse {
   meta: { apiVersion: '1'; recalculatedAt: string };
 }
 
+export interface OfflineCashSaleSnapshot {
+  capturedAt: string;
+  branchId: string;
+  warehouseId: string;
+  cashRegisterId: string;
+  currency: string;
+  taxRate: string;
+  paymentMethod: 'CASH';
+  negativeStock: 'DENY';
+  lines: Array<{
+    productId: string;
+    name: string;
+    sku: string;
+    quantity: string;
+    unitPrice: string;
+    subtotal: string;
+    tax: string;
+    total: string;
+  }>;
+  totals: { subtotal: string; tax: string; total: string };
+}
+
 export interface CashSaleData {
   id: string;
   receiptNumber: string;

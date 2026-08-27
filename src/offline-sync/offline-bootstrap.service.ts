@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import type { SessionIdentity } from '../auth/session/session.types';
+import { PosService } from '../pos/pos.service';
 import { OfflineBootstrapQueryDto } from './dto/offline-bootstrap-query.dto';
 import { OfflineBootstrapRepository } from './offline-bootstrap.repository';
 import {
@@ -26,7 +27,10 @@ export interface OfflineServerCursorV1 {
 
 @Injectable()
 export class OfflineBootstrapService {
-  constructor(private readonly repository: OfflineBootstrapRepository) {}
+  constructor(
+    private readonly repository: OfflineBootstrapRepository,
+    private readonly pos: PosService,
+  ) {}
 
   async bootstrap(
     principal: SessionIdentity,
@@ -52,6 +56,40 @@ export class OfflineBootstrapService {
         .replace('T', ' ')
         .replace('Z', ''),
     });
+    const { branch, warehouse, cashRegister } = principal.context;
+    let posPolicy: OfflineBootstrapResponseV1['posPolicy'] = null;
+    if (
+      branch &&
+      warehouse &&
+      cashRegister &&
+      principal.user.permissions.includes('SALES_MANAGE')
+    ) {
+      const policy = await this.pos.offlinePolicy({
+        tenantId: principal.tenant.id,
+        branchId: branch.id,
+        warehouseId: warehouse.id,
+        cashRegisterId: cashRegister.id,
+        userId: principal.user.id,
+      });
+      if (policy) {
+        posPolicy = {
+          kind: 'POS_POLICY',
+          id: policy.shift.id,
+          tenantId: principal.tenant.id,
+          version: Math.max(1, new Date(policy.shift.openedAt).getTime()),
+          updatedAt: policy.shift.openedAt,
+          branchId: branch.id,
+          warehouseId: warehouse.id,
+          cashRegisterId: cashRegister.id,
+          shiftId: policy.shift.id,
+          shiftOpenedAt: policy.shift.openedAt,
+          currency: policy.currency,
+          taxRate: policy.taxRate,
+          paymentMethods: ['CASH'],
+          negativeStock: policy.negativeStock,
+        };
+      }
+    }
     const pageEntities = entities.slice(
       cursor.offset,
       cursor.offset + query.pageSize,
@@ -70,6 +108,7 @@ export class OfflineBootstrapService {
           permissions: principal.user.permissions,
         },
       },
+      posPolicy,
       page: {
         initialSyncCursor: this.encode(
           {
