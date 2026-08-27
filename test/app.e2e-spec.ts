@@ -7,6 +7,7 @@ import { DataSource } from 'typeorm';
 import { createHash, randomUUID } from 'node:crypto';
 import { SalesRepository } from '../src/pos/sales.repository';
 import { PosCartQuoteResponse } from '../src/pos/pos.types';
+import { verify } from 'argon2';
 
 describe('UInventario API (e2e)', () => {
   let app: INestApplication<App>;
@@ -33,6 +34,7 @@ describe('UInventario API (e2e)', () => {
   async function resetIdentityData(): Promise<void> {
     await dataSource.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const table of [
+      'password_reset_tokens',
       'sale_payments',
       'sale_lines',
       'sales',
@@ -243,6 +245,84 @@ describe('UInventario API (e2e)', () => {
         Array<{ total: string | number }>
       >('SELECT COUNT(*) AS total FROM tenants');
       expect(Number(total)).toBe(0);
+    });
+  });
+
+  describe('password reset', () => {
+    beforeEach(resetIdentityData);
+
+    it('does not enumerate accounts and consumes valid tokens only once', async () => {
+      await registerAccount('password-reset-registration');
+      const known = await request(app.getHttpServer())
+        .post('/api/v1/auth/password-resets')
+        .send({ email: registrationPayload.email.toUpperCase() })
+        .expect(202);
+      const unknown = await request(app.getHttpServer())
+        .post('/api/v1/auth/password-resets')
+        .send({ email: 'unknown@example.com' })
+        .expect(202);
+      expect(known.body).toEqual(unknown.body);
+
+      const mailbox = await request(app.getHttpServer())
+        .get('/api/v1/auth/password-resets/local-mailbox')
+        .query({ email: registrationPayload.email })
+        .expect(200);
+      const localMessage = mailbox.body as {
+        data: { token: string; resetUrl: string };
+      };
+      const token = localMessage.data.token;
+      expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(localMessage.data.resetUrl).toContain(encodeURIComponent(token));
+      const [persisted] = await dataSource.query<Array<{ token_hash: string }>>(
+        'SELECT token_hash FROM password_reset_tokens LIMIT 1',
+      );
+      expect(persisted.token_hash).not.toBe(token);
+
+      const nextPassword = 'Nueva-Correcta-2026!';
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/password-resets/complete')
+        .send({ token, password: nextPassword })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/password-resets/complete')
+        .send({ token, password: nextPassword })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVALID_PASSWORD_RESET_TOKEN');
+        });
+      const [changedUser] = await dataSource.query<
+        Array<{ password_hash: string }>
+      >('SELECT password_hash FROM users WHERE normalized_email = ? LIMIT 1', [
+        registrationPayload.email,
+      ]);
+      await expect(
+        verify(changedUser.password_hash, registrationPayload.password),
+      ).resolves.toBe(false);
+      await expect(
+        verify(changedUser.password_hash, nextPassword),
+      ).resolves.toBe(true);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/password-resets')
+        .send({ email: registrationPayload.email })
+        .expect(202);
+      const expiredMailbox = await request(app.getHttpServer())
+        .get('/api/v1/auth/password-resets/local-mailbox')
+        .query({ email: registrationPayload.email })
+        .expect(200);
+      const expiredToken = (expiredMailbox.body as { data: { token: string } })
+        .data.token;
+      await dataSource.query(
+        'UPDATE password_reset_tokens SET expires_at = ? WHERE used_at IS NULL',
+        [new Date(Date.now() - 60_000)],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/password-resets/complete')
+        .send({ token: expiredToken, password: 'Otra-Correcta-2026!' })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVALID_PASSWORD_RESET_TOKEN');
+        });
     });
   });
 
