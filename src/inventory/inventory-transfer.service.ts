@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { CreateInventoryTransferDto } from './dto/create-inventory-transfer.dto';
+import { ReceiveInventoryTransferDto } from './dto/receive-inventory-transfer.dto';
 import {
   DuplicateInventoryTransferLineError,
   InvalidInventoryTransferTargetError,
@@ -12,6 +13,9 @@ import {
   InventoryTransferInsufficientStockError,
   InventoryTransferNotFoundError,
   InventoryTransferStatusConflictError,
+  InvalidInventoryTransferReceiptError,
+  InventoryTransferDiscrepancyReasonRequiredError,
+  InventoryTransferReceiptExceedsPendingError,
 } from './inventory-transfer.errors';
 import { InventoryTransferRepository } from './inventory-transfer.repository';
 import {
@@ -89,6 +93,24 @@ export class InventoryTransferService {
     }));
   }
 
+  async receive(input: {
+    tenantId: string;
+    transferId: string;
+    destinationWarehouseId: string;
+    userId: string;
+    idempotencyKey: string | undefined;
+    dto: ReceiveInventoryTransferDto;
+  }): Promise<InventoryTransferResponse> {
+    const idempotencyKey = this.idempotencyKey(input.idempotencyKey);
+    return this.mapErrors(async () => {
+      const result = await this.transfers.receive({ ...input, idempotencyKey });
+      return {
+        data: result.transfer,
+        meta: { apiVersion: '1', idempotentReplay: result.replay },
+      };
+    });
+  }
+
   private idempotencyKey(value: string | undefined): string {
     if (!value || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(value)) {
       throw new BadRequestException({
@@ -134,6 +156,24 @@ export class InventoryTransferService {
         throw new ConflictException({
           code: 'TRANSFER_STATUS_CONFLICT',
           message: 'La transferencia ya no permite esta operación.',
+        });
+      }
+      if (error instanceof InvalidInventoryTransferReceiptError) {
+        throw new BadRequestException({
+          code: 'INVALID_TRANSFER_RECEIPT',
+          message: 'La recepción contiene líneas o cantidades no válidas.',
+        });
+      }
+      if (error instanceof InventoryTransferDiscrepancyReasonRequiredError) {
+        throw new BadRequestException({
+          code: 'TRANSFER_DISCREPANCY_REASON_REQUIRED',
+          message: 'Las diferencias de recepción requieren un motivo.',
+        });
+      }
+      if (error instanceof InventoryTransferReceiptExceedsPendingError) {
+        throw new ConflictException({
+          code: 'TRANSFER_RECEIPT_EXCEEDS_PENDING',
+          message: 'La cantidad supera lo pendiente de recibir.',
         });
       }
       throw error;
