@@ -83,11 +83,14 @@ export class RegistrationRepository {
       `INSERT INTO role_permissions (role_id, tenant_id, permission) VALUES
         (?, ?, 'TENANT_MANAGE'), (?, ?, 'PRODUCTS_MANAGE'),
         (?, ?, 'SALES_MANAGE'), (?, ?, 'SALES_VOID'),
+        (?, ?, 'SALES_DISCOUNT'), (?, ?, 'SALE_REPRINT'),
+        (?, ?, 'CASH_REGISTER_OPEN'), (?, ?, 'CASH_REGISTER_CLOSE'),
+        (?, ?, 'CASH_REGISTER_MOVE'),
         (?, ?, 'ACCESS_MANAGE'),
         (?, ?, 'INVENTORY_VIEW'), (?, ?, 'INVENTORY_ADJUST'),
         (?, ?, 'INVENTORY_TRANSFER'), (?, ?, 'INVENTORY_COUNT'),
         (?, ?, 'INVENTORY_APPROVE')`,
-      Array.from({ length: 10 }, () => [role.id, tenant.id]).flat(),
+      Array.from({ length: 15 }, () => [role.id, tenant.id]).flat(),
     );
     await manager.update(
       RegistrationRequestEntity,

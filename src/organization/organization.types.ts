@@ -18,6 +18,7 @@ export interface OrganizationBranchData {
   timezone: string;
   active: boolean;
   warehouses: OrganizationWarehouseData[];
+  cashRegisters: Array<{ id: string; name: string; code: string }>;
 }
 
 export interface OrganizationListResponse {
@@ -32,6 +33,11 @@ export interface OrganizationBranchResponse {
 
 export interface OrganizationWarehouseResponse {
   data: OrganizationWarehouseData & { branchId: string };
+  meta: { apiVersion: '1' };
+}
+
+export interface OrganizationCashRegisterResponse {
+  data: { id: string; name: string; code: string; branchId: string };
   meta: { apiVersion: '1' };
 }
 

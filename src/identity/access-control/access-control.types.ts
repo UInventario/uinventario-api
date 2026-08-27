@@ -11,5 +11,11 @@ export interface AccessUserData {
   email: string;
   roles: AccessRoleData[];
   branches: Array<{ id: string; name: string }>;
+  cashRegisters: Array<{
+    id: string;
+    name: string;
+    code: string;
+    branchId: string;
+  }>;
   manageable: boolean;
 }

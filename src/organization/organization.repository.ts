@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { CreateBranchDto } from './dto/create-branch.dto';
+import { CreateCashRegisterDto } from './dto/create-cash-register.dto';
 import { CreateWarehouseDto } from './dto/create-warehouse.dto';
 import { UpdateBranchDto } from './dto/update-branch.dto';
 import { UpdateWarehouseDto } from './dto/update-warehouse.dto';
@@ -60,7 +61,13 @@ export class OrganizationRepository {
                 (l.onboarding_key = 'INITIAL') DESC, l.created_at, l.id`,
       [tenantId, administrator, userId],
     );
-    return this.toBranches(rows);
+    const branches = this.toBranches(rows);
+    await this.attachCashRegisters(
+      branches,
+      tenantId,
+      administrator ? null : userId,
+    );
+    return branches;
   }
 
   async createBranch(
@@ -153,6 +160,28 @@ export class OrganizationRepository {
       throw error;
     }
     return (await this.findWarehouse(tenantId, warehouseId))!;
+  }
+
+  async createCashRegister(
+    tenantId: string,
+    branchId: string,
+    dto: CreateCashRegisterDto,
+  ): Promise<{ id: string; name: string; code: string; branchId: string }> {
+    const id = randomUUID();
+    try {
+      await this.dataSource.transaction(async (manager) => {
+        await this.assertActiveBranch(manager, tenantId, branchId);
+        await manager.query(
+          `INSERT INTO cash_registers (id, tenant_id, branch_id, name, code)
+           VALUES (?, ?, ?, ?, ?)`,
+          [id, tenantId, branchId, dto.name, dto.code],
+        );
+      });
+    } catch (error) {
+      if (this.isDuplicate(error)) throw new OrganizationNameConflictError();
+      throw error;
+    }
+    return { id, name: dto.name, code: dto.code, branchId };
   }
 
   async updateWarehouse(
@@ -250,7 +279,9 @@ export class OrganizationRepository {
        ORDER BY w.created_at, w.id, l.created_at, l.id`,
       [tenantId, branchId],
     );
-    return this.toBranches(rows)[0] ?? null;
+    const branches = this.toBranches(rows);
+    await this.attachCashRegisters(branches, tenantId, null);
+    return branches[0] ?? null;
   }
 
   private async findWarehouse(
@@ -312,6 +343,7 @@ export class OrganizationRepository {
           timezone: row.timezone,
           active: Boolean(row.branch_active),
           warehouses: [],
+          cashRegisters: [],
         };
         branches.set(row.branch_id, branch);
       }
@@ -337,6 +369,36 @@ export class OrganizationRepository {
       }
     }
     return [...branches.values()];
+  }
+
+  private async attachCashRegisters(
+    branches: OrganizationBranchData[],
+    tenantId: string,
+    userId: string | null,
+  ): Promise<void> {
+    if (branches.length === 0) return;
+    const rows = await this.dataSource.query<
+      Array<{ id: string; name: string; code: string; branch_id: string }>
+    >(
+      `SELECT cr.id, cr.name, cr.code, cr.branch_id
+       FROM cash_registers cr
+       WHERE cr.tenant_id = ? AND cr.branch_id IN (?)
+         AND (? IS NULL OR EXISTS (
+           SELECT 1 FROM user_cash_register_access ucra
+           WHERE ucra.user_id = ? AND ucra.tenant_id = cr.tenant_id
+             AND ucra.branch_id = cr.branch_id AND ucra.cash_register_id = cr.id
+         ))
+       ORDER BY cr.created_at, cr.id`,
+      [tenantId, branches.map((branch) => branch.id), userId, userId],
+    );
+    const byId = new Map(branches.map((branch) => [branch.id, branch]));
+    for (const row of rows) {
+      byId.get(row.branch_id)?.cashRegisters.push({
+        id: row.id,
+        name: row.name,
+        code: row.code,
+      });
+    }
   }
 
   private async assertActiveBranch(

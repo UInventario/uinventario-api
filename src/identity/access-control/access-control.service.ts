@@ -60,6 +60,7 @@ export class AccessControlService {
         passwordHash,
         roleIds: dto.roleIds,
         branchIds: dto.branchIds,
+        cashRegisterIds: dto.cashRegisterIds ?? [],
       }),
       meta: { apiVersion: '1' as const },
     }));
@@ -78,6 +79,7 @@ export class AccessControlService {
         userId,
         roleIds: dto.roleIds,
         branchIds: dto.branchIds,
+        cashRegisterIds: dto.cashRegisterIds ?? [],
       }),
       meta: { apiVersion: '1' as const },
     }));

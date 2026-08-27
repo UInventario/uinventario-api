@@ -80,6 +80,11 @@ export class AccessControlRepository {
           tenantId,
           user.id,
         ),
+        cashRegisters: await this.userCashRegisters(
+          this.dataSource.manager,
+          tenantId,
+          user.id,
+        ),
         manageable: user.id !== actorUserId && Number(user.administrator) === 0,
       })),
     );
@@ -93,6 +98,7 @@ export class AccessControlRepository {
     passwordHash: string;
     roleIds: string[];
     branchIds: string[];
+    cashRegisterIds: string[];
   }): Promise<AccessUserData> {
     const id = randomUUID();
     try {
@@ -102,6 +108,7 @@ export class AccessControlRepository {
           input.tenantId,
           input.roleIds,
           input.branchIds,
+          input.cashRegisterIds,
         );
         await manager.query(
           `INSERT INTO users (id, tenant_id, email, normalized_email, password_hash)
@@ -120,6 +127,7 @@ export class AccessControlRepository {
           id,
           input.roleIds,
           input.branchIds,
+          input.cashRegisterIds,
         );
         return this.findUser(manager, input.tenantId, input.actorUserId, id);
       });
@@ -135,6 +143,7 @@ export class AccessControlRepository {
     userId: string;
     roleIds: string[];
     branchIds: string[];
+    cashRegisterIds: string[];
   }): Promise<AccessUserData> {
     if (input.userId === input.actorUserId)
       throw new InvalidAccessAssignmentError();
@@ -158,6 +167,7 @@ export class AccessControlRepository {
         input.tenantId,
         input.roleIds,
         input.branchIds,
+        input.cashRegisterIds,
       );
       await this.replaceAssignment(
         manager,
@@ -165,6 +175,7 @@ export class AccessControlRepository {
         input.userId,
         input.roleIds,
         input.branchIds,
+        input.cashRegisterIds,
       );
       await manager.query(
         `UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP(6)
@@ -185,8 +196,9 @@ export class AccessControlRepository {
     tenantId: string,
     roleIds: string[],
     branchIds: string[],
+    cashRegisterIds: string[],
   ): Promise<void> {
-    const [[roles], [branches]] = await Promise.all([
+    const [[roles], [branches], [cashRegisters]] = await Promise.all([
       manager.query<Array<{ total: number | string }>>(
         `SELECT COUNT(*) AS total FROM roles
          WHERE tenant_id = ? AND code <> 'ADMIN' AND id IN (?)`,
@@ -197,10 +209,16 @@ export class AccessControlRepository {
          WHERE tenant_id = ? AND active = TRUE AND id IN (?)`,
         [tenantId, branchIds],
       ),
+      manager.query<Array<{ total: number | string }>>(
+        `SELECT COUNT(*) AS total FROM cash_registers
+         WHERE tenant_id = ? AND branch_id IN (?) AND id IN (?)`,
+        [tenantId, branchIds, cashRegisterIds.length ? cashRegisterIds : ['']],
+      ),
     ]);
     if (
       Number(roles.total) !== roleIds.length ||
-      Number(branches.total) !== branchIds.length
+      Number(branches.total) !== branchIds.length ||
+      Number(cashRegisters.total) !== cashRegisterIds.length
     ) {
       throw new InvalidAccessAssignmentError();
     }
@@ -212,6 +230,7 @@ export class AccessControlRepository {
     userId: string,
     roleIds: string[],
     branchIds: string[],
+    cashRegisterIds: string[],
   ): Promise<void> {
     await manager.query(
       'DELETE FROM user_roles WHERE user_id = ? AND tenant_id = ?',
@@ -219,6 +238,10 @@ export class AccessControlRepository {
     );
     await manager.query(
       'DELETE FROM user_branch_access WHERE user_id = ? AND tenant_id = ?',
+      [userId, tenantId],
+    );
+    await manager.query(
+      'DELETE FROM user_cash_register_access WHERE user_id = ? AND tenant_id = ?',
       [userId, tenantId],
     );
     for (const roleId of roleIds) {
@@ -232,6 +255,15 @@ export class AccessControlRepository {
         `INSERT INTO user_branch_access (user_id, tenant_id, branch_id)
          VALUES (?, ?, ?)`,
         [userId, tenantId, branchId],
+      );
+    }
+    for (const cashRegisterId of cashRegisterIds) {
+      await manager.query(
+        `INSERT INTO user_cash_register_access
+           (user_id, tenant_id, branch_id, cash_register_id)
+         SELECT ?, ?, branch_id, id FROM cash_registers
+         WHERE id = ? AND tenant_id = ?`,
+        [userId, tenantId, cashRegisterId, tenantId],
       );
     }
   }
@@ -252,6 +284,7 @@ export class AccessControlRepository {
       email: user.email,
       roles: await this.userRoles(manager, tenantId, userId),
       branches: await this.userBranches(manager, tenantId, userId),
+      cashRegisters: await this.userCashRegisters(manager, tenantId, userId),
       manageable: user.id !== actorUserId,
     };
   }
@@ -294,6 +327,24 @@ export class AccessControlRepository {
        INNER JOIN branches b ON b.id = uba.branch_id AND b.tenant_id = uba.tenant_id
        WHERE uba.user_id = ? AND uba.tenant_id = ? AND b.active = TRUE
        ORDER BY b.name, b.id`,
+      [userId, tenantId],
+    );
+  }
+
+  private userCashRegisters(
+    manager: EntityManager,
+    tenantId: string,
+    userId: string,
+  ) {
+    return manager.query<
+      Array<{ id: string; name: string; code: string; branchId: string }>
+    >(
+      `SELECT cr.id, cr.name, cr.code, cr.branch_id AS branchId
+       FROM user_cash_register_access ucra
+       INNER JOIN cash_registers cr ON cr.id = ucra.cash_register_id
+         AND cr.tenant_id = ucra.tenant_id AND cr.branch_id = ucra.branch_id
+       WHERE ucra.user_id = ? AND ucra.tenant_id = ?
+       ORDER BY cr.name, cr.id`,
       [userId, tenantId],
     );
   }

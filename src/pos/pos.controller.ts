@@ -64,6 +64,8 @@ export class PosController {
   }
 
   @Post('register-shifts/current/closure')
+  @UseGuards(PermissionGuard)
+  @RequirePermissions('CASH_REGISTER_CLOSE')
   async closeShift(
     @Req() request: AuthenticatedRequest,
     @Headers('idempotency-key') idempotencyKey: string | undefined,
@@ -84,6 +86,8 @@ export class PosController {
   }
 
   @Post('register-shifts/current/movements')
+  @UseGuards(PermissionGuard)
+  @RequirePermissions('CASH_REGISTER_MOVE')
   async createCashMovement(
     @Req() request: AuthenticatedRequest,
     @Headers('idempotency-key') idempotencyKey: string | undefined,
@@ -104,6 +108,8 @@ export class PosController {
   }
 
   @Post('register-shifts/current/movements/:movementId/reversals')
+  @UseGuards(PermissionGuard)
+  @RequirePermissions('CASH_REGISTER_MOVE')
   async reverseCashMovement(
     @Req() request: AuthenticatedRequest,
     @Param('movementId', ParseUUIDPipe) movementId: string,
@@ -126,6 +132,8 @@ export class PosController {
   }
 
   @Post('register-shifts')
+  @UseGuards(PermissionGuard)
+  @RequirePermissions('CASH_REGISTER_OPEN')
   async openShift(
     @Req() request: AuthenticatedRequest,
     @Headers('idempotency-key') idempotencyKey: string | undefined,

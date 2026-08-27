@@ -1,4 +1,4 @@
-import { IsUUID } from 'class-validator';
+import { IsOptional, IsUUID } from 'class-validator';
 
 export class UpdateSessionContextDto {
   @IsUUID()
@@ -6,4 +6,8 @@ export class UpdateSessionContextDto {
 
   @IsUUID()
   warehouseId!: string;
+
+  @IsUUID()
+  @IsOptional()
+  cashRegisterId?: string;
 }

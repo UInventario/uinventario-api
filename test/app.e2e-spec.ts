@@ -55,6 +55,7 @@ describe('UInventario API (e2e)', () => {
       'branches',
       'sessions',
       'registration_requests',
+      'user_cash_register_access',
       'user_branch_access',
       'user_roles',
       'users',
@@ -877,12 +878,17 @@ describe('UInventario API (e2e)', () => {
                 roles: ['ADMIN'],
                 permissions: [
                   'ACCESS_MANAGE',
+                  'CASH_REGISTER_CLOSE',
+                  'CASH_REGISTER_MOVE',
+                  'CASH_REGISTER_OPEN',
                   'INVENTORY_ADJUST',
                   'INVENTORY_APPROVE',
                   'INVENTORY_COUNT',
                   'INVENTORY_TRANSFER',
                   'INVENTORY_VIEW',
                   'PRODUCTS_MANAGE',
+                  'SALE_REPRINT',
+                  'SALES_DISCOUNT',
                   'SALES_MANAGE',
                   'SALES_VOID',
                   'TENANT_MANAGE',
@@ -5079,6 +5085,281 @@ describe('UInventario API (e2e)', () => {
           ],
         })
         .expect(404);
+    });
+  });
+
+  describe('Cashier branch and register delegation', () => {
+    beforeEach(resetIdentityData);
+
+    it('enforces exact register scope and granular POS permissions', async () => {
+      await registerAccount('cashier-scope-registration');
+      const adminCookie = await createPersistedSession(
+        registrationPayload.email,
+      );
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', adminCookie)
+        .send({
+          legalName: 'Cajas Seguras, S.A.',
+          tradeName: 'Cajas Seguras',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      const initialLocation = await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', adminCookie)
+        .send({
+          branchName: 'Sucursal Centro',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Centro',
+          locationName: 'General Centro',
+        })
+        .expect(200);
+      const initialRegister = await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', adminCookie)
+        .send({ name: 'Caja Centro 1' })
+        .expect(200);
+      const initial = initialLocation.body as {
+        data: { branch: { id: string }; warehouse: { id: string } };
+      };
+      const initialRegisterId = (
+        initialRegister.body as { data: { cashRegister: { id: string } } }
+      ).data.cashRegister.id;
+      const unassignedRegister = await request(app.getHttpServer())
+        .post(
+          `/api/v1/organization/branches/${initial.data.branch.id}/cash-registers`,
+        )
+        .set('Cookie', adminCookie)
+        .send({ name: 'Caja Centro 2', code: 'CENTER-2' })
+        .expect(201);
+      const unassignedRegisterId = (
+        unassignedRegister.body as { data: { id: string } }
+      ).data.id;
+
+      const northBranch = await request(app.getHttpServer())
+        .post('/api/v1/organization/branches')
+        .set('Cookie', adminCookie)
+        .send({
+          name: 'Sucursal Norte',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Norte',
+          locationName: 'General Norte',
+          locationCode: 'NORTH',
+        })
+        .expect(201);
+      const north = northBranch.body as {
+        data: { id: string; warehouses: Array<{ id: string }> };
+      };
+      const northRegister = await request(app.getHttpServer())
+        .post(`/api/v1/organization/branches/${north.data.id}/cash-registers`)
+        .set('Cookie', adminCookie)
+        .send({ name: 'Caja Norte', code: 'NORTH-1' })
+        .expect(201);
+      const northRegisterId = (northRegister.body as { data: { id: string } })
+        .data.id;
+
+      const cashierRole = await request(app.getHttpServer())
+        .post('/api/v1/access/roles')
+        .set('Cookie', adminCookie)
+        .send({
+          name: 'Cajero de apertura',
+          permissions: [
+            'SALES_MANAGE',
+            'SALES_DISCOUNT',
+            'SALE_REPRINT',
+            'CASH_REGISTER_OPEN',
+          ],
+        })
+        .expect(201);
+      const cashierRoleId = (cashierRole.body as { data: { id: string } }).data
+        .id;
+      const cashier = await request(app.getHttpServer())
+        .post('/api/v1/access/users')
+        .set('Cookie', adminCookie)
+        .send({
+          email: 'cashier@example.com',
+          password: 'Cashier-2026!',
+          roleIds: [cashierRoleId],
+          branchIds: [initial.data.branch.id, north.data.id],
+          cashRegisterIds: [initialRegisterId, northRegisterId],
+        })
+        .expect(201);
+      const cashierData = (
+        cashier.body as {
+          data: {
+            id: string;
+            cashRegisters: Array<{
+              id: string;
+              name: string;
+              code: string;
+              branchId: string;
+            }>;
+          };
+        }
+      ).data;
+      const cashierId = cashierData.id;
+      expect(cashierData.cashRegisters).toEqual([
+        {
+          id: initialRegisterId,
+          name: 'Caja Centro 1',
+          code: 'MAIN',
+          branchId: initial.data.branch.id,
+        },
+        {
+          id: northRegisterId,
+          name: 'Caja Norte',
+          code: 'NORTH-1',
+          branchId: north.data.id,
+        },
+      ]);
+
+      const cashierLogin = await request(app.getHttpServer())
+        .post('/api/v1/auth/sessions')
+        .send({ email: 'cashier@example.com', password: 'Cashier-2026!' })
+        .expect(200);
+      const cashierCookie = (
+        cashierLogin.headers['set-cookie'] as unknown as string[]
+      )[0].split(';')[0];
+      expect(cashierLogin.body).toMatchObject({
+        data: {
+          context: {
+            branch: { id: initial.data.branch.id },
+            cashRegister: { id: initialRegisterId },
+          },
+        },
+      });
+      await request(app.getHttpServer())
+        .get('/api/v1/organization/branches')
+        .set('Cookie', cashierCookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: Array<{
+                id: string;
+                cashRegisters: Array<{ id: string }>;
+              }>;
+            };
+          }) => {
+            expect(
+              body.data.find(({ id }) => id === initial.data.branch.id)
+                ?.cashRegisters,
+            ).toEqual([
+              { id: initialRegisterId, name: 'Caja Centro 1', code: 'MAIN' },
+            ]);
+            expect(
+              body.data.find(({ id }) => id === north.data.id)?.cashRegisters,
+            ).toEqual([
+              { id: northRegisterId, name: 'Caja Norte', code: 'NORTH-1' },
+            ]);
+          },
+        );
+
+      await request(app.getHttpServer())
+        .patch('/api/v1/auth/sessions/current/context')
+        .set('Cookie', cashierCookie)
+        .send({
+          branchId: initial.data.branch.id,
+          warehouseId: initial.data.warehouse.id,
+          cashRegisterId: unassignedRegisterId,
+        })
+        .expect(404);
+      await request(app.getHttpServer())
+        .patch('/api/v1/auth/sessions/current/context')
+        .set('Cookie', cashierCookie)
+        .send({
+          branchId: north.data.id,
+          warehouseId: north.data.warehouses[0].id,
+          cashRegisterId: northRegisterId,
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              context: {
+                branch: { id: north.data.id },
+                cashRegister: { id: northRegisterId },
+              },
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts')
+        .set('Cookie', cashierCookie)
+        .set('Idempotency-Key', 'cashier-open-north')
+        .send({ openingAmount: '100.00' })
+        .expect(201);
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cashierCookie)
+        .set('Idempotency-Key', 'cashier-movement-denied')
+        .send({ type: 'INCOME', amount: '10.00', reason: 'Cambio' })
+        .expect(403);
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/closure')
+        .set('Cookie', cashierCookie)
+        .set('Idempotency-Key', 'cashier-close-denied')
+        .send({ countedAmount: '100.00' })
+        .expect(403);
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${randomUUID()}/void`)
+        .set('Cookie', cashierCookie)
+        .set('Idempotency-Key', 'cashier-void-denied')
+        .send({ reason: 'Sin permiso' })
+        .expect(403);
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/access/users/${cashierId}`)
+        .set('Cookie', adminCookie)
+        .send({
+          roleIds: [cashierRoleId],
+          branchIds: [initial.data.branch.id],
+          cashRegisterIds: [initialRegisterId],
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Cookie', cashierCookie)
+        .expect(401);
+      const reassignedLogin = await request(app.getHttpServer())
+        .post('/api/v1/auth/sessions')
+        .send({ email: 'cashier@example.com', password: 'Cashier-2026!' })
+        .expect(200);
+      expect(reassignedLogin.body).toMatchObject({
+        data: {
+          context: {
+            branch: { id: initial.data.branch.id },
+            cashRegister: { id: initialRegisterId },
+          },
+        },
+      });
+
+      await request(app.getHttpServer())
+        .get('/api/v1/audit-events')
+        .query({ pageSize: 50 })
+        .set('Cookie', adminCookie)
+        .expect(200)
+        .expect(
+          ({ body }: { body: { data: Array<Record<string, unknown>> } }) => {
+            expect(body.data).toEqual(
+              expect.arrayContaining([
+                expect.objectContaining({
+                  action: 'ACCESS_USER_UPDATED',
+                  entityId: cashierId,
+                  after: {
+                    roleIds: [cashierRoleId],
+                    branchIds: [initial.data.branch.id],
+                    cashRegisterIds: [initialRegisterId],
+                  },
+                }),
+              ]),
+            );
+          },
+        );
     });
   });
 
