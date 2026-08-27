@@ -10,7 +10,7 @@ import {
   OfflineSyncScopeV1,
 } from './offline-sync-v1.contract';
 
-interface BootstrapCursor {
+export interface OfflineServerCursorV1 {
   kind: 'bootstrap';
   protocolVersion: '1.0';
   sessionBinding: string;
@@ -19,6 +19,9 @@ interface BootstrapCursor {
   deviceId: string;
   offset: number;
   snapshotAt: string;
+  authorizedBranchIds: string[];
+  authorizedCashRegisterIds: string[];
+  administrator: boolean;
 }
 
 @Injectable()
@@ -69,7 +72,19 @@ export class OfflineBootstrapService {
       },
       page: {
         initialSyncCursor: this.encode(
-          { ...cursor, kind: 'bootstrap', offset: entities.length },
+          {
+            ...cursor,
+            kind: 'bootstrap',
+            offset: 0,
+            authorizedBranchIds: entities
+              .filter(({ kind }) => kind === 'BRANCH')
+              .map(({ id }) => id)
+              .sort(),
+            authorizedCashRegisterIds: entities
+              .filter(({ kind }) => kind === 'CASH_REGISTER')
+              .map(({ id }) => id)
+              .sort(),
+          },
           principal.sessionId,
         ),
         cursor: this.encode(cursor, principal.sessionId),
@@ -85,7 +100,7 @@ export class OfflineBootstrapService {
   private initialCursor(
     principal: SessionIdentity,
     deviceId: string,
-  ): BootstrapCursor {
+  ): OfflineServerCursorV1 {
     return {
       kind: 'bootstrap',
       protocolVersion: OFFLINE_SYNC_PROTOCOL_VERSION,
@@ -95,6 +110,9 @@ export class OfflineBootstrapService {
       deviceId,
       offset: 0,
       snapshotAt: new Date().toISOString(),
+      authorizedBranchIds: [],
+      authorizedCashRegisterIds: [],
+      administrator: principal.user.roles.includes('ADMIN'),
     };
   }
 
@@ -102,7 +120,7 @@ export class OfflineBootstrapService {
     value: string,
     principal: SessionIdentity,
     deviceId: string,
-  ): BootstrapCursor {
+  ): OfflineServerCursorV1 {
     try {
       const [encoded, signature] = value.split('.');
       if (!encoded || !signature) throw new Error('INVALID_CURSOR');
@@ -116,7 +134,7 @@ export class OfflineBootstrapService {
         throw new Error('INVALID_CURSOR');
       const cursor = JSON.parse(
         Buffer.from(encoded, 'base64url').toString('utf8'),
-      ) as BootstrapCursor;
+      ) as OfflineServerCursorV1;
       if (
         cursor.kind !== 'bootstrap' ||
         cursor.protocolVersion !== OFFLINE_SYNC_PROTOCOL_VERSION ||
@@ -139,7 +157,7 @@ export class OfflineBootstrapService {
     }
   }
 
-  private encode(cursor: BootstrapCursor, sessionId: string): string {
+  private encode(cursor: OfflineServerCursorV1, sessionId: string): string {
     const encoded = Buffer.from(JSON.stringify(cursor)).toString('base64url');
     return `${encoded}.${this.signature(encoded, sessionId)}`;
   }

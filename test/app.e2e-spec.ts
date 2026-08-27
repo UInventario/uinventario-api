@@ -16,6 +16,7 @@ import * as ExcelJS from 'exceljs';
 import { AuditService } from '../src/audit/audit.service';
 import { SupplierProductData } from '../src/suppliers/supplier-product.types';
 import type { OfflineBootstrapResponseV1 } from '../src/offline-sync/offline-sync-v1.contract';
+import type { OfflineChangesResponseV1 } from '../src/offline-sync/offline-sync-v1.contract';
 
 jest.setTimeout(15_000);
 
@@ -9043,6 +9044,108 @@ describe('UInventario API (e2e)', () => {
           }),
         ]),
       );
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${productId}`)
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto Offline actualizado',
+          sku: 'OFFLINE-1',
+          cost: '5.00',
+          price: '13.50',
+          version: 1,
+        })
+        .expect(200);
+      const firstChanges = await request(app.getHttpServer())
+        .get('/api/v1/offline/changes')
+        .set('Cookie', cookie)
+        .query({
+          deviceId,
+          cursor: firstData.page.initialSyncCursor,
+          pageSize: 1,
+        })
+        .expect(200);
+      const firstChangeData = (
+        firstChanges.body as { data: OfflineChangesResponseV1 }
+      ).data;
+      expect(firstChangeData.changes).toHaveLength(1);
+      expect(firstChangeData.changes[0]?.operation).toBe('UPSERT');
+      expect(firstChangeData.changes[0]?.entity).toMatchObject({
+        kind: 'PRODUCT',
+        id: productId,
+        price: '13.50',
+      });
+      const retryChanges = await request(app.getHttpServer())
+        .get('/api/v1/offline/changes')
+        .set('Cookie', cookie)
+        .query({
+          deviceId,
+          cursor: firstData.page.initialSyncCursor,
+          pageSize: 1,
+        })
+        .expect(200);
+      expect(
+        (retryChanges.body as { data: OfflineChangesResponseV1 }).data.changes,
+      ).toEqual(firstChangeData.changes);
+
+      await request(app.getHttpServer())
+        .delete(`/api/v1/products/${productId}`)
+        .set('Cookie', cookie)
+        .expect(200);
+      const tombstone = await request(app.getHttpServer())
+        .get('/api/v1/offline/changes')
+        .set('Cookie', cookie)
+        .query({ deviceId, cursor: firstChangeData.nextCursor, pageSize: 10 })
+        .expect(200);
+      const deletedProduct = (
+        tombstone.body as { data: OfflineChangesResponseV1 }
+      ).data.changes.find(
+        ({ operation, entity }) =>
+          operation === 'DELETE' && entity.id === productId,
+      );
+      expect(deletedProduct?.entity).toMatchObject({
+        kind: 'PRODUCT',
+        id: productId,
+        active: false,
+      });
+
+      const disposable = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto temporal offline',
+          sku: 'OFFLINE-TEMP',
+          cost: '1.00',
+          price: '2.00',
+        })
+        .expect(201);
+      const disposableId = (disposable.body as { data: { id: string } }).data
+        .id;
+      await request(app.getHttpServer())
+        .delete(`/api/v1/products/${disposableId}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({ data: { outcome: 'DELETED' } }),
+        );
+      const hardTombstone = await request(app.getHttpServer())
+        .get('/api/v1/offline/changes')
+        .set('Cookie', cookie)
+        .query({
+          deviceId,
+          cursor: (tombstone.body as { data: OfflineChangesResponseV1 }).data
+            .nextCursor,
+          pageSize: 10,
+        })
+        .expect(200);
+      expect(
+        (
+          hardTombstone.body as { data: OfflineChangesResponseV1 }
+        ).data.changes.some(
+          ({ operation, entity }) =>
+            operation === 'DELETE' && entity.id === disposableId,
+        ),
+      ).toBe(true);
 
       await request(app.getHttpServer())
         .get('/api/v1/offline/bootstrap')
