@@ -24,6 +24,12 @@ el usuario, sus roles y el tenant de esa sesión.
 
 - `POST /api/v1/auth/sessions`: valida credenciales e inicia la sesión.
 - `GET /api/v1/auth/sessions/current`: devuelve la identidad de la sesión vigente.
+- `POST /api/v1/auth/sessions/refresh`: rota el token opaco y renueva su expiración.
+- `DELETE /api/v1/auth/sessions/current`: revoca la sesión actual y elimina la cookie.
+
+Cada login crea una sesión independiente por dispositivo. Las pestañas de un mismo
+navegador comparten la cookie; una rotación invalida el token anterior y logout no
+revoca las sesiones de otros dispositivos.
 
 MySQL 8.4 local corre en Docker con volumen persistente. Dev y Prod reciben una `DATABASE_URL` independiente mediante secretos; el repositorio no contiene credenciales productivas.
 

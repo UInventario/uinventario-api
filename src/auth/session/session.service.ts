@@ -54,7 +54,7 @@ export class SessionService {
     return {
       token,
       expiresAt,
-      response: this.toResponse(identity),
+      response: this.toResponse(identity, expiresAt),
     };
   }
 
@@ -73,14 +73,49 @@ export class SessionService {
     return identity;
   }
 
-  toResponse(identity: Omit<SessionIdentity, 'sessionId'>): SessionResponse {
+  async refresh(
+    principal: SessionIdentity,
+    currentToken: string,
+  ): Promise<{ token: string; expiresAt: Date; response: SessionResponse }> {
+    const token = randomBytes(32).toString('base64url');
+    const expiresAt = new Date(Date.now() + this.config.ttlMilliseconds);
+    const rotated = await this.sessions.rotateSession(
+      principal.sessionId,
+      this.hashToken(currentToken),
+      this.hashToken(token),
+      expiresAt,
+      new Date(),
+    );
+
+    if (!rotated) {
+      throw this.invalidSession();
+    }
+
+    return {
+      token,
+      expiresAt,
+      response: this.toResponse(principal, expiresAt),
+    };
+  }
+
+  async logout(sessionId: string): Promise<void> {
+    await this.sessions.revokeSession(sessionId, new Date());
+  }
+
+  toResponse(
+    identity: Omit<SessionIdentity, 'sessionId' | 'expiresAt'>,
+    expiresAt: Date,
+  ): SessionResponse {
     return {
       data: {
         user: identity.user,
         tenant: identity.tenant,
         nextStep: identity.nextStep,
       },
-      meta: { apiVersion: '1' },
+      meta: {
+        apiVersion: '1',
+        sessionExpiresAt: expiresAt.toISOString(),
+      },
     };
   }
 
