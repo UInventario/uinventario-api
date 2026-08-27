@@ -25,6 +25,7 @@ import { AccessControlModule } from './identity/access-control/access-control.mo
 import { SupplierModule } from './suppliers/supplier.module';
 import { ProcurementModule } from './procurement/procurement.module';
 import { CustomerModule } from './customers/customer.module';
+import { ProductReservationModule } from './reservations/product-reservation.module';
 
 @Module({
   imports: [
@@ -67,6 +68,7 @@ import { CustomerModule } from './customers/customer.module';
     SupplierModule,
     ProcurementModule,
     CustomerModule,
+    ProductReservationModule,
     InventoryModule,
     PosModule,
   ],

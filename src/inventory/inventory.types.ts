@@ -118,7 +118,8 @@ export interface InventoryMovementHistoryItem {
       | 'TRANSFER'
       | 'RECEIPT'
       | 'PURCHASE_RECEIPT'
-      | 'SUPPLIER_RETURN';
+      | 'SUPPLIER_RETURN'
+      | 'RESERVATION';
     id: string;
     reference: string | null;
   };
