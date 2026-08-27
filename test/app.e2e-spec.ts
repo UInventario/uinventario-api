@@ -15,6 +15,7 @@ import { ThrottlerStorage, ThrottlerStorageService } from '@nestjs/throttler';
 import * as ExcelJS from 'exceljs';
 import { AuditService } from '../src/audit/audit.service';
 import { SupplierProductData } from '../src/suppliers/supplier-product.types';
+import type { OfflineBootstrapResponseV1 } from '../src/offline-sync/offline-sync-v1.contract';
 
 jest.setTimeout(15_000);
 
@@ -8868,6 +8869,202 @@ describe('UInventario API (e2e)', () => {
             meta: { pagination: { total: 1 } },
           });
         });
+    });
+  });
+
+  describe('authenticated offline bootstrap', () => {
+    beforeEach(resetIdentityData);
+
+    it('pages a resumable tenant-scoped compact snapshot without sensitive fields', async () => {
+      await registerAccount('offline-bootstrap-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Tienda Offline, S.A. de C.V.',
+          tradeName: 'Tienda Offline',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      const location = await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Sucursal Offline',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Offline',
+          locationName: 'General Offline',
+        })
+        .expect(200);
+      const cashRegister = await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Offline' })
+        .expect(200);
+      const product = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto Offline',
+          sku: 'OFFLINE-1',
+          cost: '5.00',
+          price: '12.50',
+        })
+        .expect(201);
+      const productId = (product.body as { data: { id: string } }).data.id;
+      const locationId = (
+        location.body as { data: { location: { id: string } } }
+      ).data.location.id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'offline-bootstrap-stock')
+        .send({
+          productId,
+          locationId,
+          type: 'INITIAL',
+          quantity: '4',
+          reason: 'Bootstrap offline',
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .post('/api/v1/organization/branches')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Sucursal no autorizada',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega no autorizada',
+          locationName: 'General no autorizada',
+          locationCode: 'HIDDEN',
+        })
+        .expect(201);
+
+      const deviceId = randomUUID();
+      const first = await request(app.getHttpServer())
+        .get('/api/v1/offline/bootstrap')
+        .set('Cookie', cookie)
+        .query({ deviceId, pageSize: 2 })
+        .expect(200);
+      const firstData = (first.body as { data: OfflineBootstrapResponseV1 })
+        .data;
+      expect(firstData.page.complete).toBe(false);
+      expect(firstData.page.entities).toHaveLength(2);
+      expect(firstData.page.initialSyncCursor).toEqual(expect.any(String));
+
+      const collected = [...firstData.page.entities];
+      let nextCursor: string | null = firstData.page.nextCursor;
+      while (nextCursor) {
+        const page = await request(app.getHttpServer())
+          .get('/api/v1/offline/bootstrap')
+          .set('Cookie', cookie)
+          .query({ deviceId, pageSize: 2, cursor: nextCursor })
+          .expect(200);
+        const data = (page.body as { data: OfflineBootstrapResponseV1 }).data;
+        expect(data.page.initialSyncCursor).toBe(
+          firstData.page.initialSyncCursor,
+        );
+        collected.push(...data.page.entities);
+        nextCursor = data.page.nextCursor;
+      }
+
+      expect(collected).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: 'BRANCH', name: 'Sucursal Offline' }),
+          expect.objectContaining({
+            kind: 'PRODUCT',
+            sku: 'OFFLINE-1',
+            price: '12.50',
+          }),
+          expect.objectContaining({
+            kind: 'INVENTORY_AVAILABILITY',
+            productId,
+            availableQuantity: '4.000',
+          }),
+        ]),
+      );
+      expect(JSON.stringify(first.body)).not.toMatch(
+        /admin@example\.com|Correcta-2026|"cost"|password|token/i,
+      );
+
+      const viewerRole = await request(app.getHttpServer())
+        .post('/api/v1/access/roles')
+        .set('Cookie', cookie)
+        .send({ name: 'Offline autorizado', permissions: ['INVENTORY_VIEW'] })
+        .expect(201);
+      const branchId = (location.body as { data: { branch: { id: string } } })
+        .data.branch.id;
+      const cashRegisterId = (
+        cashRegister.body as { data: { cashRegister: { id: string } } }
+      ).data.cashRegister.id;
+      const viewerPassword = 'Offline-2026!';
+      await request(app.getHttpServer())
+        .post('/api/v1/access/users')
+        .set('Cookie', cookie)
+        .send({
+          email: 'offline-viewer@example.com',
+          password: viewerPassword,
+          roleIds: [(viewerRole.body as { data: { id: string } }).data.id],
+          branchIds: [branchId],
+          cashRegisterIds: [cashRegisterId],
+        })
+        .expect(201);
+      const viewerLogin = await request(app.getHttpServer())
+        .post('/api/v1/auth/sessions')
+        .send({ email: 'offline-viewer@example.com', password: viewerPassword })
+        .expect(200);
+      const viewerCookie = (
+        viewerLogin.headers['set-cookie'] as unknown as string[]
+      )[0].split(';')[0];
+      const viewerBootstrap = await request(app.getHttpServer())
+        .get('/api/v1/offline/bootstrap')
+        .set('Cookie', viewerCookie)
+        .query({ deviceId: randomUUID(), pageSize: 500 })
+        .expect(200);
+      const viewerEntities = (
+        viewerBootstrap.body as { data: OfflineBootstrapResponseV1 }
+      ).data.page.entities;
+      expect(
+        viewerEntities
+          .filter(({ kind }) => kind === 'BRANCH')
+          .map(({ id }) => id),
+      ).toEqual([branchId]);
+      expect(
+        viewerEntities
+          .filter(({ kind }) => kind === 'CASH_REGISTER')
+          .map(({ id }) => id),
+      ).toEqual([cashRegisterId]);
+      expect(viewerEntities).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ kind: 'PRODUCT', id: productId }),
+          expect.objectContaining({
+            kind: 'INVENTORY_AVAILABILITY',
+            productId,
+          }),
+        ]),
+      );
+
+      await request(app.getHttpServer())
+        .get('/api/v1/offline/bootstrap')
+        .set('Cookie', cookie)
+        .query({
+          deviceId: randomUUID(),
+          pageSize: 2,
+          cursor: firstData.page.nextCursor,
+        })
+        .expect(400);
+      const replacementSession = await createPersistedSession(
+        registrationPayload.email,
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/offline/bootstrap')
+        .set('Cookie', replacementSession)
+        .query({ deviceId, pageSize: 2, cursor: firstData.page.nextCursor })
+        .expect(400);
+      await request(app.getHttpServer())
+        .get('/api/v1/offline/bootstrap')
+        .query({ deviceId })
+        .expect(401);
     });
   });
 

@@ -110,6 +110,7 @@ export interface OfflineBootstrapResponseV1 {
     user: { id: string; roles: string[]; permissions: AppPermission[] };
   };
   page: {
+    initialSyncCursor: string;
     cursor: string;
     nextCursor: string | null;
     complete: boolean;

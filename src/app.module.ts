@@ -26,6 +26,7 @@ import { SupplierModule } from './suppliers/supplier.module';
 import { ProcurementModule } from './procurement/procurement.module';
 import { CustomerModule } from './customers/customer.module';
 import { ProductReservationModule } from './reservations/product-reservation.module';
+import { OfflineSyncModule } from './offline-sync/offline-sync.module';
 
 @Module({
   imports: [
@@ -69,6 +70,7 @@ import { ProductReservationModule } from './reservations/product-reservation.mod
     ProcurementModule,
     CustomerModule,
     ProductReservationModule,
+    OfflineSyncModule,
     InventoryModule,
     PosModule,
   ],
