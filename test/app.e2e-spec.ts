@@ -1112,6 +1112,10 @@ describe('UInventario API (e2e)', () => {
     it('updates balance atomically and makes retries idempotent', async () => {
       await registerAccount('inventory-primary-registration');
       const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .expect(403);
       await completeInventoryOnboarding(registrationPayload.email, cookie);
       const productResponse = await request(app.getHttpServer())
         .post('/api/v1/products')
@@ -1238,6 +1242,18 @@ describe('UInventario API (e2e)', () => {
         .expect(({ body }: { body: { code?: string } }) => {
           expect(body.code).toBe('INVALID_STOCK_QUANTITY');
         });
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'inventory-adjustment-002')
+        .send({
+          ...initial,
+          type: 'ADJUSTMENT',
+          quantity: '-0.5',
+          reason: 'Conteo físico',
+          reference: 'CONTEO-002',
+        })
+        .expect(201);
 
       await request(app.getHttpServer())
         .get(`/api/v1/inventory/products/${productId}/balance`)
@@ -1249,7 +1265,7 @@ describe('UInventario API (e2e)', () => {
             data: {
               product: { id: productId, sku: 'CAFE-STOCK' },
               location: { id: location.id },
-              quantity: '14.500',
+              quantity: '14.000',
             },
           });
         });
@@ -1270,9 +1286,9 @@ describe('UInventario API (e2e)', () => {
             data: [
               {
                 product: { id: productId, sku: 'CAFE-STOCK', active: true },
-                availableQuantity: '14.500',
-                totalQuantity: '14.500',
-                states: [{ code: 'AVAILABLE', quantity: '14.500' }],
+                availableQuantity: '14.000',
+                totalQuantity: '14.000',
+                states: [{ code: 'AVAILABLE', quantity: '14.000' }],
               },
             ],
             meta: {
@@ -1292,10 +1308,67 @@ describe('UInventario API (e2e)', () => {
         .expect(({ body }: { body: { data: unknown[] } }) => {
           expect(body.data).toEqual([]);
         });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .query({ q: ' cafe-stock ', type: 'ENTRY', page: 1, pageSize: 2 })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              {
+                type: 'ENTRY',
+                direction: 'IN',
+                product: { id: productId, sku: 'CAFE-STOCK' },
+                location: {
+                  id: location.id,
+                  warehouse: { id: location.warehouse_id },
+                },
+                responsible: { email: registrationPayload.email },
+              },
+              { type: 'ENTRY', direction: 'IN' },
+            ],
+            meta: {
+              scope: { branch: { id: location.branch_id } },
+              pagination: { page: 1, pageSize: 2, total: 3, totalPages: 2 },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .query({ productId, type: 'ADJUSTMENT' })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              {
+                direction: 'OUT',
+                quantityChange: '-0.500',
+                resultingQuantity: '14.000',
+                reason: 'Conteo físico',
+                reference: 'CONTEO-002',
+              },
+            ],
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .query({ dateFrom: '2099-01-01' })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toEqual([]);
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .query({ dateFrom: '2026-02-01', dateTo: '2026-01-01' })
+        .set('Cookie', cookie)
+        .expect(400);
       const [counts] = await dataSource.query<
         Array<{ movements: number | string }>
       >('SELECT COUNT(*) AS movements FROM inventory_movements');
-      expect(Number(counts.movements)).toBe(4);
+      expect(Number(counts.movements)).toBe(5);
     });
 
     it('rejects products and locations outside the active tenant', async () => {
@@ -1357,6 +1430,13 @@ describe('UInventario API (e2e)', () => {
         })
         .set('Cookie', primaryCookie)
         .expect(404);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .set('Cookie', primaryCookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toEqual([]);
+        });
     });
   });
 
@@ -1592,6 +1672,26 @@ describe('UInventario API (e2e)', () => {
         resulting_quantity: '2.500',
       });
       expect(trace.sale_line_id).toBeTruthy();
+
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .query({ productId, type: 'SALE' })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              {
+                type: 'SALE',
+                direction: 'OUT',
+                quantityChange: '-2.500',
+                resultingQuantity: '2.500',
+                reference: saleBodies[0].data.receiptNumber,
+                responsible: { email: registrationPayload.email },
+              },
+            ],
+          });
+        });
 
       const history = await request(app.getHttpServer())
         .get('/api/v1/pos/sales')

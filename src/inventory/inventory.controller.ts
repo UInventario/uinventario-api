@@ -15,6 +15,7 @@ import type { AuthenticatedRequest } from '../auth/session/session.types';
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
 import { GetInventoryBalanceDto } from './dto/get-inventory-balance.dto';
 import { ListInventoryStockDto } from './dto/list-inventory-stock.dto';
+import { ListInventoryMovementsDto } from './dto/list-inventory-movements.dto';
 import { InventoryAccessGuard } from './inventory-access.guard';
 import { InventoryService } from './inventory.service';
 
@@ -32,6 +33,18 @@ export class InventoryController {
       request.principal.tenant.id,
       query.branchId ?? request.principal.context.branch!.id,
       query.warehouseId ?? request.principal.context.warehouse!.id,
+      query,
+    );
+  }
+
+  @Get('movements')
+  listMovements(
+    @Req() request: AuthenticatedRequest,
+    @Query() query: ListInventoryMovementsDto,
+  ) {
+    return this.inventory.listMovements(
+      request.principal.tenant.id,
+      request.principal.context.branch!.id,
       query,
     );
   }
