@@ -11,11 +11,13 @@ export class ProductAccessGuard implements CanActivate {
   canActivate(context: ExecutionContext): boolean {
     const request = context.switchToHttp().getRequest<AuthenticatedRequest>();
     const permissions = request.principal.user.permissions;
-    const canReadForInventory =
-      request.method === 'GET' && permissions.includes('INVENTORY_VIEW');
+    const canReadForOperations =
+      request.method === 'GET' &&
+      (permissions.includes('INVENTORY_VIEW') ||
+        permissions.includes('SUPPLIERS_MANAGE'));
     if (
       request.principal.nextStep !== 'APPLICATION' ||
-      (!permissions.includes('PRODUCTS_MANAGE') && !canReadForInventory)
+      (!permissions.includes('PRODUCTS_MANAGE') && !canReadForOperations)
     ) {
       throw new ForbiddenException({
         code: 'PRODUCT_ACCESS_DENIED',
