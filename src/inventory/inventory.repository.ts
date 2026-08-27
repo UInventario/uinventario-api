@@ -82,12 +82,37 @@ export class InventoryRepository {
       filters.push('im.product_id = ?');
       parameters.push(query.productId);
     }
+    if (query.locationId) {
+      filters.push('im.location_id = ?');
+      parameters.push(query.locationId);
+    }
+    if (query.userId) {
+      filters.push('im.created_by_user_id = ?');
+      parameters.push(query.userId);
+    }
     if (query.q) {
       const search = `%${query.q}%`;
       filters.push(
         '(p.name LIKE ? OR p.normalized_sku LIKE ? OR p.barcode LIKE ?)',
       );
       parameters.push(search, search.toUpperCase(), search);
+    }
+    if (query.location) {
+      const search = `%${query.location}%`;
+      filters.push('(l.name LIKE ? OR l.code LIKE ? OR w.name LIKE ?)');
+      parameters.push(search, search, search);
+    }
+    if (query.responsible) {
+      filters.push('u.email LIKE ?');
+      parameters.push(`%${query.responsible}%`);
+    }
+    if (query.document) {
+      const search = `%${query.document}%`;
+      filters.push(`(
+        im.reference LIKE ? OR im.idempotency_key LIKE ? OR im.id LIKE ?
+        OR im.sale_id LIKE ? OR im.transfer_id LIKE ? OR im.receipt_id LIKE ?
+      )`);
+      parameters.push(search, search, search, search, search, search);
     }
     if (query.type) {
       filters.push('im.type = ?');
@@ -116,6 +141,10 @@ export class InventoryRepository {
           type: InventoryMovementHistoryItem['type'];
           quantity_change: string;
           resulting_quantity: string;
+          idempotency_key: string;
+          sale_id: string | null;
+          transfer_id: string | null;
+          receipt_id: string | null;
           reason: string;
           reference: string | null;
           created_at: Date | string;
@@ -135,6 +164,7 @@ export class InventoryRepository {
         }>
       >(
         `SELECT im.id, im.type, im.quantity_change, im.resulting_quantity,
+                im.idempotency_key, im.sale_id, im.transfer_id, im.receipt_id,
                 im.from_state, im.to_state, im.state_quantity,
                 im.reason, im.reference, im.created_at,
                 p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
@@ -155,12 +185,16 @@ export class InventoryRepository {
         id: row.id,
         type: row.type,
         direction:
-          row.type === 'STATE_TRANSITION'
+          row.from_state && row.to_state
             ? 'TRANSFER'
             : row.quantity_change.startsWith('-')
               ? 'OUT'
               : 'IN',
         quantityChange: this.normalizeDecimal(row.quantity_change),
+        previousQuantity: this.fromUnits(
+          this.toUnits(row.resulting_quantity) -
+            this.toUnits(row.quantity_change),
+        ),
         resultingQuantity: this.normalizeDecimal(row.resulting_quantity),
         reason: row.reason,
         reference: row.reference,
@@ -177,6 +211,19 @@ export class InventoryRepository {
           warehouse: { id: row.warehouse_id, name: row.warehouse_name },
         },
         responsible: { id: row.user_id, email: row.user_email },
+        correlationId: row.sale_id ?? row.transfer_id ?? row.id,
+        idempotencyKey: row.idempotency_key,
+        document: row.receipt_id
+          ? { type: 'RECEIPT', id: row.receipt_id, reference: row.reference }
+          : row.transfer_id
+            ? {
+                type: 'TRANSFER',
+                id: row.transfer_id,
+                reference: row.reference,
+              }
+            : row.sale_id
+              ? { type: 'SALE', id: row.sale_id, reference: row.reference }
+              : { type: 'MOVEMENT', id: row.id, reference: row.reference },
         stateTransition:
           row.from_state && row.to_state && row.state_quantity
             ? {

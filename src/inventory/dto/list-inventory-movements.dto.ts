@@ -26,11 +26,37 @@ export class ListInventoryMovementsDto {
   @IsUUID()
   productId?: string;
 
+  @IsOptional()
+  @IsUUID()
+  locationId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  userId?: string;
+
   @Transform(optionalTrim)
   @IsOptional()
   @IsString()
   @MaxLength(80)
   q?: string;
+
+  @Transform(optionalTrim)
+  @IsOptional()
+  @IsString()
+  @MaxLength(120)
+  location?: string;
+
+  @Transform(optionalTrim)
+  @IsOptional()
+  @IsString()
+  @MaxLength(254)
+  responsible?: string;
+
+  @Transform(optionalTrim)
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  document?: string;
 
   @IsOptional()
   @IsIn(INVENTORY_MOVEMENT_TYPES)

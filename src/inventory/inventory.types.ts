@@ -87,6 +87,7 @@ export interface InventoryMovementHistoryItem {
   type: InventoryMovementType;
   direction: 'IN' | 'OUT' | 'TRANSFER';
   quantityChange: string;
+  previousQuantity: string;
   resultingQuantity: string;
   reason: string;
   reference: string | null;
@@ -99,6 +100,13 @@ export interface InventoryMovementHistoryItem {
     warehouse: { id: string; name: string };
   };
   responsible: { id: string; email: string };
+  correlationId: string;
+  idempotencyKey: string;
+  document: {
+    type: 'MOVEMENT' | 'SALE' | 'TRANSFER' | 'RECEIPT';
+    id: string;
+    reference: string | null;
+  };
   stateTransition: {
     from: InventoryStockState;
     to: InventoryStockState;
