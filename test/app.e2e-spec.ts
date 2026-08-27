@@ -3394,6 +3394,195 @@ describe('UInventario API (e2e)', () => {
       }).toEqual({ sales: 1, movements: 5, auditEvents: 5 });
     });
 
+    it('closes and audits cash shifts with exact, surplus and shortage counts', async () => {
+      const { cookie, productId } = await preparePos();
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'closure-sale')
+        .send({ lines: [{ productId, quantity: '1' }], cashReceived: '120.00' })
+        .expect(201);
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'closure-income')
+        .send({ type: 'INCOME', amount: '50.00', reason: 'Cambio adicional' })
+        .expect(201);
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'closure-withdrawal')
+        .send({ type: 'WITHDRAWAL', amount: '20.00', reason: 'Retiro parcial' })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/closure')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'closure-invalid-denominations')
+        .send({
+          countedAmount: '399.90',
+          denominations: [{ denomination: '200.00', quantity: 2 }],
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('DENOMINATION_TOTAL_MISMATCH');
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/closure')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'closure-reason-required')
+        .send({
+          countedAmount: '400.00',
+          denominations: [{ denomination: '200.00', quantity: 2 }],
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('CASH_DIFFERENCE_REASON_REQUIRED');
+        });
+
+      const keys = ['closure-concurrent-a', 'closure-concurrent-b'];
+      const closures = await Promise.all(
+        keys.map((key) =>
+          request(app.getHttpServer())
+            .post('/api/v1/pos/register-shifts/current/closure')
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', key)
+            .send({
+              countedAmount: '400.00',
+              differenceReason: 'Sobrante de diez centavos',
+              denominations: [{ denomination: '200.00', quantity: 2 }],
+            }),
+        ),
+      );
+      expect(closures.map(({ status }) => status).sort()).toEqual([201, 409]);
+      expect(closures.find(({ status }) => status === 409)?.body).toMatchObject(
+        {
+          code: 'CASH_REGISTER_ALREADY_CLOSED',
+        },
+      );
+      const successfulIndex = closures.findIndex(
+        ({ status }) => status === 201,
+      );
+      const closureBody = closures[successfulIndex].body as {
+        data: { id: string; openedAt: string; closedAt: string };
+      };
+      expect(closureBody).toMatchObject({
+        data: {
+          status: 'CLOSED',
+          currency: 'MXN',
+          openingAmount: '250.00',
+          salesCount: 1,
+          cashSales: '119.90',
+          movementsCount: 2,
+          movementsNet: '30.00',
+          expectedCash: '399.90',
+          countedCash: '400.00',
+          difference: '0.10',
+          differenceReason: 'Sobrante de diez centavos',
+          denominations: [{ denomination: '200.00', quantity: 2 }],
+          openedBy: { email: registrationPayload.email },
+          closedBy: { email: registrationPayload.email },
+        },
+      });
+      expect(Date.parse(closureBody.data.closedAt)).toBeGreaterThanOrEqual(
+        Date.parse(closureBody.data.openedAt),
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/closure')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', keys[successfulIndex])
+        .send({
+          countedAmount: '400.0',
+          differenceReason: 'Sobrante de diez centavos',
+          denominations: [{ denomination: '200', quantity: 2 }],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { id: closureBody.data.id },
+            meta: { idempotentReplay: true },
+          });
+        });
+
+      await openCurrentCashRegister(cookie, 'closure-exact-opening', '0.00');
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/closure')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'closure-exact')
+        .send({ countedAmount: '0.00' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              expectedCash: '0.00',
+              countedCash: '0.00',
+              difference: '0.00',
+              differenceReason: null,
+            },
+          });
+        });
+
+      await openCurrentCashRegister(
+        cookie,
+        'closure-shortage-opening',
+        '10.00',
+      );
+      const shortage = await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/closure')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'closure-shortage')
+        .send({
+          countedAmount: '5.00',
+          differenceReason: 'Faltante verificado',
+        })
+        .expect(201);
+      const shortageId = (shortage.body as { data: { id: string } }).data.id;
+      expect(shortage.body).toMatchObject({
+        data: {
+          expectedCash: '10.00',
+          countedCash: '5.00',
+          difference: '-5.00',
+          differenceReason: 'Faltante verificado',
+        },
+      });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/current')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown } }) => {
+          expect(body.data).toBeNull();
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/latest-closed')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { id: shortageId } });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [{ productId, quantity: '1' }] })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('CASH_REGISTER_SHIFT_REQUIRED');
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'closure-blocked-movement')
+        .send({ type: 'INCOME', amount: '1.00', reason: 'No permitido' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('CASH_REGISTER_SHIFT_REQUIRED');
+        });
+      const [audit] = await dataSource.query<Array<{ total: number | string }>>(
+        `SELECT COUNT(*) AS total FROM audit_events
+         WHERE action = 'CASH_REGISTER_SHIFT_CLOSED'`,
+      );
+      expect(Number(audit.total)).toBe(3);
+    });
+
     it('recalculates prices, included tax and totals from server data', async () => {
       const { cookie, productId, locationId } = await preparePos();
       await request(app.getHttpServer())
@@ -4682,6 +4871,7 @@ describe('UInventario API (e2e)', () => {
         '/api/v1/inventory/transfers',
         '/api/v1/pos/register-shifts/current',
         '/api/v1/pos/register-shifts/current/movements',
+        '/api/v1/pos/register-shifts/latest-closed',
         '/api/v1/pos/sales',
       ]) {
         await request(app.getHttpServer()).get(path).expect(401);
@@ -4714,6 +4904,7 @@ describe('UInventario API (e2e)', () => {
         ['/api/v1/inventory/transfers', 'INVENTORY_ACCESS_DENIED'],
         ['/api/v1/pos/register-shifts/current', 'POS_ACCESS_DENIED'],
         ['/api/v1/pos/register-shifts/current/movements', 'POS_ACCESS_DENIED'],
+        ['/api/v1/pos/register-shifts/latest-closed', 'POS_ACCESS_DENIED'],
         ['/api/v1/pos/sales', 'POS_ACCESS_DENIED'],
         ['/api/v1/audit-events', 'AUDIT_ACCESS_DENIED'],
       ]) {
@@ -4732,6 +4923,16 @@ describe('UInventario API (e2e)', () => {
         .expect(403)
         .expect(({ body }: { body: { code?: string } }) => {
           expect(body.code).toBe('PRODUCT_ACCESS_DENIED');
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/closure')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'staff-closure-denied')
+        .send({ countedAmount: '0.00' })
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('POS_ACCESS_DENIED');
         });
 
       await request(app.getHttpServer())

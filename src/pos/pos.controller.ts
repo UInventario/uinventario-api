@@ -24,6 +24,8 @@ import { CashRegisterShiftService } from './cash-register-shift.service';
 import { CashRegisterMovementService } from './cash-register-movement.service';
 import { CreateCashRegisterMovementDto } from './dto/create-cash-register-movement.dto';
 import { ReverseCashRegisterMovementDto } from './dto/reverse-cash-register-movement.dto';
+import { CashRegisterClosureService } from './cash-register-closure.service';
+import { CloseCashRegisterShiftDto } from './dto/close-cash-register-shift.dto';
 
 @Controller('pos')
 @UseGuards(SessionGuard, PosAccessGuard)
@@ -32,6 +34,7 @@ export class PosController {
     private readonly pos: PosService,
     private readonly shifts: CashRegisterShiftService,
     private readonly cashMovements: CashRegisterMovementService,
+    private readonly closures: CashRegisterClosureService,
     private readonly audit: AuditService,
   ) {}
 
@@ -50,6 +53,31 @@ export class PosController {
   listCashMovements(@Req() request: AuthenticatedRequest) {
     const { principal } = request;
     return this.cashMovements.list(this.cashContext(principal));
+  }
+
+  @Get('register-shifts/latest-closed')
+  latestClosedShift(@Req() request: AuthenticatedRequest) {
+    return this.closures.latest(this.cashContext(request.principal));
+  }
+
+  @Post('register-shifts/current/closure')
+  async closeShift(
+    @Req() request: AuthenticatedRequest,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: CloseCashRegisterShiftDto,
+  ) {
+    const result = await this.closures.close(
+      this.cashContext(request.principal),
+      dto,
+      idempotencyKey,
+    );
+    await this.auditCashMovement(
+      request,
+      result.data.id,
+      'CASH_REGISTER_SHIFT_CLOSED',
+      'CASH_REGISTER_SHIFT',
+    );
+    return result;
   }
 
   @Post('register-shifts/current/movements')
@@ -204,12 +232,13 @@ export class PosController {
     request: AuthenticatedRequest,
     entityId: string,
     action: string,
+    entityType = 'CASH_REGISTER_MOVEMENT',
   ): Promise<void> {
     await this.audit.record({
       tenantId: request.principal.tenant.id,
       actorUserId: request.principal.user.id,
       action,
-      entityType: 'CASH_REGISTER_MOVEMENT',
+      entityType,
       entityId,
       correlationId: request.requestId!,
       deduplicate: true,
