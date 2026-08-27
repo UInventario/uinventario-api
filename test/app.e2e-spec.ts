@@ -6,6 +6,7 @@ import { AppModule } from './../src/app.module';
 import { DataSource } from 'typeorm';
 import { createHash, randomUUID } from 'node:crypto';
 import { SalesRepository } from '../src/pos/sales.repository';
+import { InventoryTransferRepository } from '../src/inventory/inventory-transfer.repository';
 import { PosCartQuoteResponse } from '../src/pos/pos.types';
 import { verify } from 'argon2';
 import { configureApp } from '../src/security/configure-app';
@@ -1396,6 +1397,10 @@ describe('UInventario API (e2e)', () => {
             meta: { idempotentReplay: false },
           });
         });
+      await dataSource.query(
+        'UPDATE products SET active = FALSE WHERE id = ?',
+        [productId],
+      );
       await request(app.getHttpServer())
         .post('/api/v1/inventory/movements')
         .set('Cookie', cookie)
@@ -1417,6 +1422,9 @@ describe('UInventario API (e2e)', () => {
         .expect(({ body }: { body: { code?: string } }) => {
           expect(body.code).toBe('IDEMPOTENCY_KEY_REUSED');
         });
+      await dataSource.query('UPDATE products SET active = TRUE WHERE id = ?', [
+        productId,
+      ]);
       await request(app.getHttpServer())
         .post('/api/v1/inventory/movements')
         .set('Cookie', cookie)
@@ -1492,6 +1500,7 @@ describe('UInventario API (e2e)', () => {
               location: { id: location.id },
               quantity: '14.000',
             },
+            meta: { policy: { negativeStock: 'DENY' } },
           });
         });
       await request(app.getHttpServer())
@@ -1522,6 +1531,7 @@ describe('UInventario API (e2e)', () => {
               },
             ],
             meta: {
+              policy: { negativeStock: 'DENY' },
               scope: {
                 branch: { id: location.branch_id },
                 warehouse: { id: location.warehouse_id },
@@ -2381,6 +2391,37 @@ describe('UInventario API (e2e)', () => {
       expect(
         competingDispatches.find(({ status }) => status === 409)?.body,
       ).toMatchObject({ code: 'INSUFFICIENT_AVAILABLE_STOCK' });
+
+      const rollbackTransferResponse = await request(app.getHttpServer())
+        .post('/api/v1/inventory/transfers')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'transfer-create-rollback')
+        .send(transferInput('1', 'TR-ROLLBACK'))
+        .expect(201);
+      const rollbackTransferId = (
+        rollbackTransferResponse.body as { data: { id: string } }
+      ).data.id;
+      const [principal] = await dataSource.query<Array<{ tenant_id: string }>>(
+        'SELECT tenant_id FROM users WHERE normalized_email = ? LIMIT 1',
+        [registrationPayload.email],
+      );
+      await expect(
+        app.get(InventoryTransferRepository).dispatch({
+          tenantId: principal.tenant_id,
+          transferId: rollbackTransferId,
+          userId: randomUUID(),
+          idempotencyKey: 'transfer-dispatch-rollback',
+        }),
+      ).rejects.toThrow();
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/transfers/${rollbackTransferId}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { id: rollbackTransferId, status: 'DRAFT' },
+          });
+        });
 
       const balances = await dataSource.query<
         Array<{

@@ -25,6 +25,7 @@ import {
   InventoryMovementListResponse,
   InventoryStockListResponse,
   InventoryStateTransitionResponse,
+  INVENTORY_STOCK_POLICY,
 } from './inventory.types';
 
 @Injectable()
@@ -95,6 +96,7 @@ export class InventoryService {
         data: result.items,
         meta: {
           apiVersion: '1',
+          policy: INVENTORY_STOCK_POLICY,
           scope: result.scope,
           pagination: {
             page: query.page,
@@ -125,7 +127,7 @@ export class InventoryService {
           productId,
           locationId,
         ),
-        meta: { apiVersion: '1' },
+        meta: { apiVersion: '1', policy: INVENTORY_STOCK_POLICY },
       };
     } catch (error) {
       if (error instanceof InventoryTargetNotFoundError)

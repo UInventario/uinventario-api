@@ -399,6 +399,19 @@ export class InventoryRepository {
       return await this.dataSource.transaction(
         'READ COMMITTED',
         async (manager) => {
+          const existingReplay = await this.findMovement(
+            manager,
+            input.tenantId,
+            input.idempotencyKey,
+          );
+          if (existingReplay) {
+            if (existingReplay.request_fingerprint !== fingerprint)
+              throw new IdempotencyConflictError();
+            return {
+              movement: this.toMovement(existingReplay),
+              replay: true,
+            };
+          }
           await this.assertTarget(
             manager,
             input.tenantId,
@@ -541,6 +554,19 @@ export class InventoryRepository {
       return await this.dataSource.transaction(
         'READ COMMITTED',
         async (manager) => {
+          const existingReplay = await this.findMovement(
+            manager,
+            input.tenantId,
+            input.idempotencyKey,
+          );
+          if (existingReplay) {
+            if (existingReplay.request_fingerprint !== fingerprint)
+              throw new IdempotencyConflictError();
+            return {
+              movement: this.toMovement(existingReplay),
+              replay: true,
+            };
+          }
           await this.assertTarget(
             manager,
             input.tenantId,
