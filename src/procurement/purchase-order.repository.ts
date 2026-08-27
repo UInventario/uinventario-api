@@ -96,6 +96,34 @@ interface ReceiptLineRow {
   total_cost: string;
   previous_catalog_cost: string;
   resulting_catalog_cost: string;
+  returned_quantity: string;
+}
+
+interface ReturnRow {
+  id: string;
+  purchase_order_id: string;
+  purchase_receipt_id: string;
+  document_reference: string;
+  reason: string;
+  status: 'CREDIT_PENDING' | 'CREDIT_RECEIVED';
+  expected_credit_total: string;
+  credit_document_reference: string | null;
+  location_id: string;
+  location_name: string;
+  location_code: string;
+  responsible_id: string;
+  responsible_email: string;
+  created_at: Date | string;
+}
+
+interface ReturnLineRow {
+  id: string;
+  purchase_return_id: string;
+  purchase_receipt_line_id: string;
+  product_id: string;
+  returned_quantity: string;
+  unit_cost: string;
+  total_cost: string;
 }
 
 interface LineReferenceRow {
@@ -461,7 +489,7 @@ export class PurchaseOrderRepository {
     if (rows.length === 0) return [];
     const placeholders = rows.map(() => '?').join(',');
     const parameters = [tenantId, ...rows.map((row) => row.id)];
-    const [lines, transitions, receipts] = await Promise.all([
+    const [lines, transitions, receipts, returns] = await Promise.all([
       manager.query<LineRow[]>(
         `SELECT id, purchase_order_id, supplier_product_id, product_id,
                 product_name, product_sku, supplier_code, quantity,
@@ -491,20 +519,57 @@ export class PurchaseOrderRepository {
          ORDER BY pr.purchase_order_id, pr.created_at, pr.id`,
         parameters,
       ),
+      manager.query<ReturnRow[]>(
+        `SELECT pr.id, pr.purchase_order_id, pr.purchase_receipt_id,
+                pr.document_reference, pr.reason, pr.status,
+                pr.expected_credit_total, pr.credit_document_reference,
+                pr.location_id, l.name AS location_name, l.code AS location_code,
+                pr.returned_by_user_id AS responsible_id,
+                u.email AS responsible_email, pr.created_at
+         FROM purchase_returns pr
+         INNER JOIN locations l ON l.id = pr.location_id AND l.tenant_id = pr.tenant_id
+         INNER JOIN users u ON u.id = pr.returned_by_user_id AND u.tenant_id = pr.tenant_id
+         WHERE pr.tenant_id = ? AND pr.purchase_order_id IN (${placeholders})
+         ORDER BY pr.purchase_order_id, pr.created_at, pr.id`,
+        parameters,
+      ),
     ]);
     const receiptLines = receipts.length
       ? await manager.query<ReceiptLineRow[]>(
-          `SELECT id, receipt_id, purchase_order_line_id, received_quantity,
-                  overage_quantity, unit_cost, total_cost,
-                  previous_catalog_cost, resulting_catalog_cost
-           FROM purchase_receipt_lines
-           WHERE tenant_id = ? AND receipt_id IN (${receipts.map(() => '?').join(',')})
-           ORDER BY receipt_id, line_number`,
+          `SELECT prl.id, prl.receipt_id, prl.purchase_order_line_id,
+                  prl.received_quantity, prl.overage_quantity, prl.unit_cost,
+                  prl.total_cost, prl.previous_catalog_cost,
+                  prl.resulting_catalog_cost,
+                  COALESCE((SELECT SUM(returned_quantity)
+                    FROM purchase_return_lines
+                    WHERE tenant_id = prl.tenant_id
+                      AND purchase_receipt_line_id = prl.id), 0) AS returned_quantity
+           FROM purchase_receipt_lines prl
+           WHERE prl.tenant_id = ? AND prl.receipt_id IN (${receipts.map(() => '?').join(',')})
+           ORDER BY prl.receipt_id, prl.line_number`,
           [tenantId, ...receipts.map((receipt) => receipt.id)],
         )
       : [];
+    const returnLines = returns.length
+      ? await manager.query<ReturnLineRow[]>(
+          `SELECT id, purchase_return_id, purchase_receipt_line_id, product_id,
+                  returned_quantity, unit_cost, total_cost
+           FROM purchase_return_lines
+           WHERE tenant_id = ? AND purchase_return_id IN (${returns.map(() => '?').join(',')})
+           ORDER BY purchase_return_id, line_number`,
+          [tenantId, ...returns.map((purchaseReturn) => purchaseReturn.id)],
+        )
+      : [];
     return rows.map((row) =>
-      this.toData(row, lines, transitions, receipts, receiptLines),
+      this.toData(
+        row,
+        lines,
+        transitions,
+        receipts,
+        receiptLines,
+        returns,
+        returnLines,
+      ),
     );
   }
 
@@ -514,6 +579,8 @@ export class PurchaseOrderRepository {
     transitions: TransitionRow[],
     receipts: ReceiptRow[],
     receiptLines: ReceiptLineRow[],
+    returns: ReturnRow[],
+    returnLines: ReturnLineRow[],
   ): PurchaseOrderData {
     return {
       id: row.id,
@@ -570,8 +637,44 @@ export class PurchaseOrderRepository {
               totalCost: line.total_cost,
               previousCatalogCost: line.previous_catalog_cost,
               resultingCatalogCost: line.resulting_catalog_cost,
+              returnedQuantity: line.returned_quantity,
+              returnableQuantity: this.quantity(
+                this.decimal(line.received_quantity, 3) -
+                  this.decimal(line.returned_quantity, 3),
+              ),
             })),
           createdAt: new Date(receipt.created_at).toISOString(),
+        })),
+      returns: returns
+        .filter((purchaseReturn) => purchaseReturn.purchase_order_id === row.id)
+        .map((purchaseReturn) => ({
+          id: purchaseReturn.id,
+          purchaseReceiptId: purchaseReturn.purchase_receipt_id,
+          documentReference: purchaseReturn.document_reference,
+          reason: purchaseReturn.reason,
+          status: purchaseReturn.status,
+          expectedCreditTotal: purchaseReturn.expected_credit_total,
+          creditDocumentReference: purchaseReturn.credit_document_reference,
+          location: {
+            id: purchaseReturn.location_id,
+            name: purchaseReturn.location_name,
+            code: purchaseReturn.location_code,
+          },
+          responsible: {
+            id: purchaseReturn.responsible_id,
+            email: purchaseReturn.responsible_email,
+          },
+          lines: returnLines
+            .filter((line) => line.purchase_return_id === purchaseReturn.id)
+            .map((line) => ({
+              id: line.id,
+              purchaseReceiptLineId: line.purchase_receipt_line_id,
+              productId: line.product_id,
+              returnedQuantity: line.returned_quantity,
+              unitCost: line.unit_cost,
+              totalCost: line.total_cost,
+            })),
+          createdAt: new Date(purchaseReturn.created_at).toISOString(),
         })),
       lines: lines
         .filter((line) => line.purchase_order_id === row.id)

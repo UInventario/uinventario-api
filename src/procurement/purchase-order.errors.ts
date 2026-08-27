@@ -59,3 +59,21 @@ export class PurchaseReceiptOverageReasonError extends Error {
     super('PURCHASE_RECEIPT_OVERAGE_REASON_REQUIRED');
   }
 }
+
+export class InvalidPurchaseReturnError extends Error {
+  constructor() {
+    super('INVALID_PURCHASE_RETURN');
+  }
+}
+
+export class PurchaseReturnQuantityError extends Error {
+  constructor() {
+    super('PURCHASE_RETURN_QUANTITY_EXCEEDED');
+  }
+}
+
+export class PurchaseReturnStockError extends Error {
+  constructor() {
+    super('INSUFFICIENT_PURCHASE_RETURN_STOCK');
+  }
+}

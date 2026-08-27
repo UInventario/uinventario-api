@@ -22,6 +22,7 @@ import { ListPurchaseOrdersDto } from './dto/list-purchase-orders.dto';
 import { SavePurchaseOrderDto } from './dto/save-purchase-order.dto';
 import { UpdatePurchaseOrderDto } from './dto/update-purchase-order.dto';
 import { ReceivePurchaseOrderDto } from './dto/receive-purchase-order.dto';
+import { ReturnPurchaseReceiptDto } from './dto/return-purchase-receipt.dto';
 import {
   ApprovePurchaseOrderDto,
   CancelPurchaseOrderDto,
@@ -215,6 +216,45 @@ export class PurchaseOrderController {
           overage: receipt.lines.some(
             (line) => Number(line.overageQuantity) > 0,
           ),
+        },
+      });
+    }
+    return result;
+  }
+
+  @Post(':id/returns')
+  @RequirePermissions('PURCHASE_ORDERS_MANAGE')
+  async returnToSupplier(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: ReturnPurchaseReceiptDto,
+  ) {
+    const result = await this.orders.returnToSupplier({
+      tenantId: request.principal.tenant.id,
+      orderId: id,
+      actorUserId: request.principal.user.id,
+      warehouseId: request.principal.context.warehouse!.id,
+      idempotencyKey,
+      dto,
+    });
+    if (!result.meta.idempotentReplay) {
+      const purchaseReturn = result.data.returns.find(
+        ({ id: returnId }) => returnId === result.meta.returnId,
+      )!;
+      await this.audit.record({
+        tenantId: request.principal.tenant.id,
+        actorUserId: request.principal.user.id,
+        action: 'PURCHASE_RETURN_CREATED',
+        entityType: 'PURCHASE_RETURN',
+        entityId: purchaseReturn.id,
+        correlationId: request.requestId!,
+        after: {
+          purchaseOrderId: id,
+          purchaseReceiptId: purchaseReturn.purchaseReceiptId,
+          documentReference: purchaseReturn.documentReference,
+          expectedCreditTotal: purchaseReturn.expectedCreditTotal,
+          status: purchaseReturn.status,
         },
       });
     }

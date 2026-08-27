@@ -52,6 +52,8 @@ describe('UInventario API (e2e)', () => {
       'inventory_transfer_lines',
       'inventory_transfers',
       'inventory_balances',
+      'purchase_return_lines',
+      'purchase_returns',
       'purchase_receipt_lines',
       'purchase_receipts',
       'purchase_order_transitions',
@@ -1457,6 +1459,7 @@ describe('UInventario API (e2e)', () => {
     ): Promise<{
       supplierId: string;
       supplierProductId: string;
+      productId: string;
       locationId: string;
     }> {
       await request(app.getHttpServer())
@@ -1532,7 +1535,12 @@ describe('UInventario API (e2e)', () => {
          WHERE u.normalized_email = ? LIMIT 1`,
         [email],
       );
-      return { supplierId, supplierProductId, locationId: location.id };
+      return {
+        supplierId,
+        supplierProductId,
+        productId,
+        locationId: location.id,
+      };
     }
 
     it('calculates, edits and isolates tenant-scoped draft orders with sequential folios', async () => {
@@ -2459,6 +2467,397 @@ describe('UInventario API (e2e)', () => {
         movements: 0,
         balances: 0,
         productCost: '85.40',
+      });
+    });
+
+    it('returns received products atomically with accumulated limits, permissions and traceability', async () => {
+      await registerAccount('purchase-return-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      const setup = await setupProcurement(
+        registrationPayload.email,
+        cookie,
+        'SupplierReturn',
+      );
+      let order!: {
+        id: string;
+        lines: Array<{ id: string; productId: string }>;
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/purchase-orders')
+        .set('Cookie', cookie)
+        .send({
+          supplierId: setup.supplierId,
+          currency: 'MXN',
+          lines: [
+            {
+              supplierProductId: setup.supplierProductId,
+              quantity: '5.000',
+              unitCost: '80.00',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: { data: typeof order } }) => {
+          order = body.data;
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/approve`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'supplier-return-approve')
+        .send({ version: 1 })
+        .expect(200);
+
+      let receipt!: { id: string; lines: Array<{ id: string }> };
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'supplier-return-receipt')
+        .send({
+          version: 2,
+          locationId: setup.locationId,
+          documentReference: 'REM-DEV-100',
+          lines: [
+            {
+              purchaseOrderLineId: order.lines[0].id,
+              receivedQuantity: '5.000',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: { receipts: Array<typeof receipt> } };
+          }) => {
+            receipt = body.data.receipts[0];
+          },
+        );
+
+      const [admin] = await dataSource.query<
+        Array<{ role_id: string; tenant_id: string }>
+      >(
+        `SELECT ur.role_id, u.tenant_id FROM users u
+         INNER JOIN user_roles ur ON ur.user_id = u.id AND ur.tenant_id = u.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'PURCHASE_ORDERS_MANAGE'`,
+        [admin.role_id, admin.tenant_id],
+      );
+      const partialReturn = {
+        purchaseReceiptId: receipt.id,
+        documentReference: 'DEV-PROV-100',
+        reason: 'Empaque dañado por proveedor',
+        lines: [
+          {
+            purchaseReceiptLineId: receipt.lines[0].id,
+            returnedQuantity: '2.000',
+          },
+        ],
+      };
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'supplier-return-forbidden')
+        .send(partialReturn)
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'PURCHASE_ORDERS_MANAGE')`,
+        [admin.role_id, admin.tenant_id],
+      );
+
+      const partialKey = 'supplier-return-partial';
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', partialKey)
+        .send(partialReturn)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              returns: [
+                {
+                  purchaseReceiptId: receipt.id,
+                  documentReference: partialReturn.documentReference,
+                  reason: partialReturn.reason,
+                  status: 'CREDIT_PENDING',
+                  expectedCreditTotal: '160.00',
+                  creditDocumentReference: null,
+                  location: { id: setup.locationId },
+                  lines: [
+                    {
+                      purchaseReceiptLineId: receipt.lines[0].id,
+                      productId: setup.productId,
+                      returnedQuantity: '2.000',
+                      unitCost: '80.00',
+                      totalCost: '160.00',
+                    },
+                  ],
+                },
+              ],
+              receipts: [
+                {
+                  lines: [
+                    { returnedQuantity: '2.000', returnableQuantity: '3.000' },
+                  ],
+                },
+              ],
+            },
+            meta: { idempotentReplay: false },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', partialKey)
+        .send(partialReturn)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { idempotentReplay: true } });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', partialKey)
+        .send({ ...partialReturn, reason: 'Otra causa' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('IDEMPOTENCY_KEY_REUSED');
+        });
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'supplier-return-complete')
+        .send({
+          ...partialReturn,
+          documentReference: 'DEV-PROV-101',
+          lines: [
+            {
+              purchaseReceiptLineId: receipt.lines[0].id,
+              returnedQuantity: '3.000',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              receipts: [
+                {
+                  lines: [
+                    { returnedQuantity: '5.000', returnableQuantity: '0.000' },
+                  ],
+                },
+              ],
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'supplier-return-over-limit')
+        .send({
+          ...partialReturn,
+          documentReference: 'DEV-PROV-102',
+          lines: [
+            {
+              purchaseReceiptLineId: receipt.lines[0].id,
+              returnedQuantity: '1.000',
+            },
+          ],
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PURCHASE_RETURN_QUANTITY_EXCEEDED');
+        });
+
+      const [counts] = await dataSource.query<
+        Array<{
+          returns: number | string;
+          returnLines: number | string;
+          movements: number | string;
+          balance: string;
+          expectedCredit: string;
+          audits: number | string;
+        }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM purchase_returns WHERE purchase_order_id = ?) AS returns,
+           (SELECT COUNT(*) FROM purchase_return_lines prl
+            INNER JOIN purchase_returns pr ON pr.id = prl.purchase_return_id
+            WHERE pr.purchase_order_id = ?) AS returnLines,
+           (SELECT COUNT(*) FROM inventory_movements
+            WHERE purchase_return_id IS NOT NULL) AS movements,
+           (SELECT quantity FROM inventory_balances
+            WHERE product_id = ? AND location_id = ?) AS balance,
+           (SELECT SUM(expected_credit_total) FROM purchase_returns
+            WHERE purchase_order_id = ?) AS expectedCredit,
+           (SELECT COUNT(*) FROM audit_events
+            WHERE action = 'PURCHASE_RETURN_CREATED' AND after_data LIKE ?) AS audits`,
+        [
+          order.id,
+          order.id,
+          setup.productId,
+          setup.locationId,
+          order.id,
+          `%${order.id}%`,
+        ],
+      );
+      expect({
+        returns: Number(counts.returns),
+        returnLines: Number(counts.returnLines),
+        movements: Number(counts.movements),
+        balance: counts.balance,
+        expectedCredit: counts.expectedCredit,
+        audits: Number(counts.audits),
+      }).toEqual({
+        returns: 2,
+        returnLines: 2,
+        movements: 2,
+        balance: '0.000',
+        expectedCredit: '400.00',
+        audits: 2,
+      });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .query({ type: 'SUPPLIER_RETURN', document: 'DEV-PROV', pageSize: 10 })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[]; meta: unknown } }) => {
+          expect(body.data).toHaveLength(2);
+          expect(body.data[0]).toMatchObject({
+            type: 'SUPPLIER_RETURN',
+            direction: 'OUT',
+            product: { id: setup.productId },
+            location: { id: setup.locationId },
+            document: { type: 'SUPPLIER_RETURN' },
+          });
+          expect(body.meta).toMatchObject({ pagination: { total: 2 } });
+        });
+    });
+
+    it('rolls back supplier return, stock and credit state when movement persistence fails', async () => {
+      await registerAccount('supplier-return-rollback-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      const setup = await setupProcurement(
+        registrationPayload.email,
+        cookie,
+        'ReturnRollback',
+      );
+      let order!: { id: string; lines: Array<{ id: string }> };
+      await request(app.getHttpServer())
+        .post('/api/v1/purchase-orders')
+        .set('Cookie', cookie)
+        .send({
+          supplierId: setup.supplierId,
+          currency: 'MXN',
+          lines: [
+            {
+              supplierProductId: setup.supplierProductId,
+              quantity: '1.000',
+              unitCost: '80.00',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: { data: typeof order } }) => {
+          order = body.data;
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/approve`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'return-rollback-approve')
+        .send({ version: 1 })
+        .expect(200);
+      let receipt!: { id: string; lines: Array<{ id: string }> };
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'return-rollback-receipt')
+        .send({
+          version: 2,
+          locationId: setup.locationId,
+          documentReference: 'REM-RETURN-ROLLBACK',
+          lines: [
+            {
+              purchaseOrderLineId: order.lines[0].id,
+              receivedQuantity: '1.000',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: { receipts: Array<typeof receipt> } };
+          }) => {
+            receipt = body.data.receipts[0];
+          },
+        );
+
+      await dataSource.query(`
+        ALTER TABLE inventory_movements
+        ADD CONSTRAINT ck_test_reject_supplier_return
+        CHECK (type <> 'SUPPLIER_RETURN')
+      `);
+      try {
+        await request(app.getHttpServer())
+          .post(`/api/v1/purchase-orders/${order.id}/returns`)
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', 'supplier-return-forced-rollback')
+          .send({
+            purchaseReceiptId: receipt.id,
+            documentReference: 'DEV-ROLLBACK',
+            reason: 'Prueba de rollback',
+            lines: [
+              {
+                purchaseReceiptLineId: receipt.lines[0].id,
+                returnedQuantity: '1.000',
+              },
+            ],
+          })
+          .expect(500);
+      } finally {
+        await dataSource.query(`
+          ALTER TABLE inventory_movements
+          DROP CHECK ck_test_reject_supplier_return
+        `);
+      }
+      const [state] = await dataSource.query<
+        Array<{
+          returns: number | string;
+          movements: number | string;
+          balance: string;
+          returned: string;
+        }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM purchase_returns WHERE purchase_order_id = ?) AS returns,
+           (SELECT COUNT(*) FROM inventory_movements
+            WHERE purchase_return_id IS NOT NULL) AS movements,
+           (SELECT quantity FROM inventory_balances
+            WHERE product_id = ? AND location_id = ?) AS balance,
+           (SELECT COALESCE(SUM(returned_quantity), 0) FROM purchase_return_lines
+            WHERE purchase_receipt_line_id = ?) AS returned`,
+        [order.id, setup.productId, setup.locationId, receipt.lines[0].id],
+      );
+      expect({
+        returns: Number(state.returns),
+        movements: Number(state.movements),
+        balance: state.balance,
+        returned: state.returned,
+      }).toEqual({
+        returns: 0,
+        movements: 0,
+        balance: '1.000',
+        returned: '0.000',
       });
     });
   });
