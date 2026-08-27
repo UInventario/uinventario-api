@@ -21,6 +21,7 @@ import type { AuthenticatedRequest } from '../auth/session/session.types';
 import { ListPurchaseOrdersDto } from './dto/list-purchase-orders.dto';
 import { SavePurchaseOrderDto } from './dto/save-purchase-order.dto';
 import { UpdatePurchaseOrderDto } from './dto/update-purchase-order.dto';
+import { ReceivePurchaseOrderDto } from './dto/receive-purchase-order.dto';
 import {
   ApprovePurchaseOrderDto,
   CancelPurchaseOrderDto,
@@ -173,6 +174,50 @@ export class PurchaseOrderController {
       idempotencyKey,
     });
     await this.recordTransition(request, result, 'PURCHASE_ORDER_CANCELLED');
+    return result;
+  }
+
+  @Post(':id/receipts')
+  @RequirePermissions('PURCHASE_ORDERS_MANAGE')
+  async receive(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: ReceivePurchaseOrderDto,
+  ) {
+    const result = await this.orders.receive({
+      tenantId: request.principal.tenant.id,
+      orderId: id,
+      warehouseId: request.principal.context.warehouse!.id,
+      actorUserId: request.principal.user.id,
+      allowOverage: request.principal.user.permissions.includes(
+        'PURCHASE_RECEIPTS_OVERAGE',
+      ),
+      idempotencyKey,
+      dto,
+    });
+    if (!result.meta.idempotentReplay) {
+      const receipt = result.data.receipts.find(
+        ({ id: receiptId }) => receiptId === result.meta.receiptId,
+      )!;
+      await this.audit.record({
+        tenantId: request.principal.tenant.id,
+        actorUserId: request.principal.user.id,
+        action: 'PURCHASE_ORDER_RECEIVED',
+        entityType: 'PURCHASE_ORDER',
+        entityId: id,
+        correlationId: request.requestId!,
+        after: {
+          receiptId: receipt.id,
+          documentReference: receipt.documentReference,
+          locationId: receipt.location.id,
+          status: result.data.status,
+          overage: receipt.lines.some(
+            (line) => Number(line.overageQuantity) > 0,
+          ),
+        },
+      });
+    }
     return result;
   }
 

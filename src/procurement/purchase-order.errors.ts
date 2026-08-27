@@ -35,3 +35,27 @@ export class PurchaseOrderNotFoundError extends Error {
     super('PURCHASE_ORDER_NOT_FOUND');
   }
 }
+
+export class InvalidPurchaseReceiptError extends Error {
+  constructor() {
+    super('INVALID_PURCHASE_RECEIPT');
+  }
+}
+
+export class PurchaseReceiptLocationError extends Error {
+  constructor() {
+    super('INVALID_PURCHASE_RECEIPT_LOCATION');
+  }
+}
+
+export class PurchaseReceiptOveragePermissionError extends Error {
+  constructor() {
+    super('PURCHASE_RECEIPT_OVERAGE_PERMISSION_REQUIRED');
+  }
+}
+
+export class PurchaseReceiptOverageReasonError extends Error {
+  constructor() {
+    super('PURCHASE_RECEIPT_OVERAGE_REASON_REQUIRED');
+  }
+}

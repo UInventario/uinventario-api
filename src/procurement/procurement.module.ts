@@ -4,6 +4,7 @@ import { SessionModule } from '../auth/session/session.module';
 import { PurchaseOrderController } from './purchase-order.controller';
 import { PurchaseOrderRepository } from './purchase-order.repository';
 import { PurchaseOrderService } from './purchase-order.service';
+import { PurchaseReceiptRepository } from './purchase-receipt.repository';
 import {
   PurchaseOrderDelivery,
   SimulatedPurchaseOrderDelivery,
@@ -14,6 +15,7 @@ import {
   controllers: [PurchaseOrderController],
   providers: [
     PurchaseOrderRepository,
+    PurchaseReceiptRepository,
     PurchaseOrderService,
     PermissionGuard,
     {

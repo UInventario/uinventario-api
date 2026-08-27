@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -8,16 +9,22 @@ import { createHash } from 'node:crypto';
 import { ListPurchaseOrdersDto } from './dto/list-purchase-orders.dto';
 import { SavePurchaseOrderDto } from './dto/save-purchase-order.dto';
 import { UpdatePurchaseOrderDto } from './dto/update-purchase-order.dto';
+import { ReceivePurchaseOrderDto } from './dto/receive-purchase-order.dto';
 import {
+  InvalidPurchaseReceiptError,
   PurchaseOrderDuplicateLineError,
   PurchaseOrderIdempotencyConflictError,
   PurchaseOrderNotFoundError,
   PurchaseOrderReferenceError,
   PurchaseOrderStateError,
   PurchaseOrderVersionConflictError,
+  PurchaseReceiptLocationError,
+  PurchaseReceiptOveragePermissionError,
+  PurchaseReceiptOverageReasonError,
 } from './purchase-order.errors';
 import { PurchaseOrderRepository } from './purchase-order.repository';
 import { PurchaseOrderDelivery } from './purchase-order.delivery';
+import { PurchaseReceiptRepository } from './purchase-receipt.repository';
 import {
   PurchaseOrderListResponse,
   PurchaseOrderResponse,
@@ -28,6 +35,7 @@ export class PurchaseOrderService {
   constructor(
     private readonly orders: PurchaseOrderRepository,
     private readonly delivery: PurchaseOrderDelivery,
+    private readonly receipts: PurchaseReceiptRepository,
   ) {}
 
   async create(
@@ -137,6 +145,33 @@ export class PurchaseOrderService {
     });
   }
 
+  async receive(input: {
+    tenantId: string;
+    orderId: string;
+    warehouseId: string;
+    actorUserId: string;
+    allowOverage: boolean;
+    idempotencyKey: string | undefined;
+    dto: ReceivePurchaseOrderDto;
+  }): Promise<PurchaseOrderResponse> {
+    const idempotencyKey = this.idempotencyKey(input.idempotencyKey);
+    try {
+      const receipt = await this.receipts.receive({ ...input, idempotencyKey });
+      const order = await this.orders.findById(input.tenantId, input.orderId);
+      if (!order) throw new PurchaseOrderNotFoundError();
+      return {
+        data: order,
+        meta: {
+          apiVersion: '1',
+          idempotentReplay: receipt.replay,
+          receiptId: receipt.receiptId,
+        },
+      };
+    } catch (error) {
+      this.rethrow(error);
+    }
+  }
+
   private async changeStatus(input: {
     tenantId: string;
     orderId: string;
@@ -228,6 +263,32 @@ export class PurchaseOrderService {
         message: 'Cada producto del proveedor sólo puede aparecer una vez.',
       });
     }
+    if (error instanceof InvalidPurchaseReceiptError) {
+      throw new BadRequestException({
+        code: 'INVALID_PURCHASE_RECEIPT',
+        message: 'La recepción contiene líneas o cantidades no válidas.',
+      });
+    }
+    if (error instanceof PurchaseReceiptLocationError) {
+      throw new BadRequestException({
+        code: 'INVALID_PURCHASE_RECEIPT_LOCATION',
+        message:
+          'La ubicación no pertenece a la bodega activa o está inactiva.',
+      });
+    }
+    if (error instanceof PurchaseReceiptOveragePermissionError) {
+      throw new ForbiddenException({
+        code: 'PURCHASE_RECEIPT_OVERAGE_PERMISSION_REQUIRED',
+        message:
+          'La cantidad excede la orden y requiere permiso para sobrantes.',
+      });
+    }
+    if (error instanceof PurchaseReceiptOverageReasonError) {
+      throw new BadRequestException({
+        code: 'PURCHASE_RECEIPT_OVERAGE_REASON_REQUIRED',
+        message: 'Indica el motivo para recibir cantidades sobrantes.',
+      });
+    }
     if (error instanceof PurchaseOrderVersionConflictError) {
       throw new ConflictException({
         code: 'PURCHASE_ORDER_VERSION_CONFLICT',
@@ -240,7 +301,7 @@ export class PurchaseOrderService {
       throw new ConflictException({
         code: 'PURCHASE_ORDER_STATE_CONFLICT',
         currentStatus: error.status,
-        message: 'Sólo las órdenes en borrador pueden editarse.',
+        message: 'El estado actual de la orden no permite esta operación.',
       });
     }
     throw error;

@@ -67,9 +67,31 @@ interface LineRow {
   product_sku: string;
   supplier_code: string;
   quantity: string;
+  received_quantity: string;
   unit_cost: string;
   subtotal: string;
   notes: string | null;
+}
+
+interface ReceiptRow {
+  id: string;
+  purchase_order_id: string;
+  document_reference: string;
+  overage_reason: string | null;
+  location_id: string;
+  location_name: string;
+  location_code: string;
+  responsible_id: string;
+  responsible_email: string;
+  created_at: Date | string;
+}
+
+interface ReceiptLineRow {
+  id: string;
+  receipt_id: string;
+  purchase_order_line_id: string;
+  received_quantity: string;
+  overage_quantity: string;
 }
 
 interface LineReferenceRow {
@@ -435,11 +457,11 @@ export class PurchaseOrderRepository {
     if (rows.length === 0) return [];
     const placeholders = rows.map(() => '?').join(',');
     const parameters = [tenantId, ...rows.map((row) => row.id)];
-    const [lines, transitions] = await Promise.all([
+    const [lines, transitions, receipts] = await Promise.all([
       manager.query<LineRow[]>(
         `SELECT id, purchase_order_id, supplier_product_id, product_id,
-                product_name, product_sku, supplier_code, quantity, unit_cost,
-                subtotal, notes
+                product_name, product_sku, supplier_code, quantity,
+                received_quantity, unit_cost, subtotal, notes
          FROM purchase_order_lines
          WHERE tenant_id = ? AND purchase_order_id IN (${placeholders})
          ORDER BY purchase_order_id, position`,
@@ -453,14 +475,40 @@ export class PurchaseOrderRepository {
          ORDER BY purchase_order_id, created_at, id`,
         parameters,
       ),
+      manager.query<ReceiptRow[]>(
+        `SELECT pr.id, pr.purchase_order_id, pr.document_reference,
+                pr.overage_reason, pr.location_id, l.name AS location_name,
+                l.code AS location_code, pr.received_by_user_id AS responsible_id,
+                u.email AS responsible_email, pr.created_at
+         FROM purchase_receipts pr
+         INNER JOIN locations l ON l.id = pr.location_id AND l.tenant_id = pr.tenant_id
+         INNER JOIN users u ON u.id = pr.received_by_user_id AND u.tenant_id = pr.tenant_id
+         WHERE pr.tenant_id = ? AND pr.purchase_order_id IN (${placeholders})
+         ORDER BY pr.purchase_order_id, pr.created_at, pr.id`,
+        parameters,
+      ),
     ]);
-    return rows.map((row) => this.toData(row, lines, transitions));
+    const receiptLines = receipts.length
+      ? await manager.query<ReceiptLineRow[]>(
+          `SELECT id, receipt_id, purchase_order_line_id, received_quantity,
+                  overage_quantity
+           FROM purchase_receipt_lines
+           WHERE tenant_id = ? AND receipt_id IN (${receipts.map(() => '?').join(',')})
+           ORDER BY receipt_id, line_number`,
+          [tenantId, ...receipts.map((receipt) => receipt.id)],
+        )
+      : [];
+    return rows.map((row) =>
+      this.toData(row, lines, transitions, receipts, receiptLines),
+    );
   }
 
   private toData(
     row: OrderRow,
     lines: LineRow[],
     transitions: TransitionRow[],
+    receipts: ReceiptRow[],
+    receiptLines: ReceiptLineRow[],
   ): PurchaseOrderData {
     return {
       id: row.id,
@@ -491,20 +539,56 @@ export class PurchaseOrderRepository {
             : null,
           createdAt: new Date(transition.created_at).toISOString(),
         })),
+      receipts: receipts
+        .filter((receipt) => receipt.purchase_order_id === row.id)
+        .map((receipt) => ({
+          id: receipt.id,
+          documentReference: receipt.document_reference,
+          location: {
+            id: receipt.location_id,
+            name: receipt.location_name,
+            code: receipt.location_code,
+          },
+          responsible: {
+            id: receipt.responsible_id,
+            email: receipt.responsible_email,
+          },
+          overageReason: receipt.overage_reason,
+          lines: receiptLines
+            .filter((line) => line.receipt_id === receipt.id)
+            .map((line) => ({
+              id: line.id,
+              purchaseOrderLineId: line.purchase_order_line_id,
+              receivedQuantity: line.received_quantity,
+              overageQuantity: line.overage_quantity,
+            })),
+          createdAt: new Date(receipt.created_at).toISOString(),
+        })),
       lines: lines
         .filter((line) => line.purchase_order_id === row.id)
-        .map((line): PurchaseOrderLineData => ({
-          id: line.id,
-          supplierProductId: line.supplier_product_id,
-          productId: line.product_id,
-          productName: line.product_name,
-          productSku: line.product_sku,
-          supplierCode: line.supplier_code,
-          quantity: line.quantity,
-          unitCost: line.unit_cost,
-          subtotal: line.subtotal,
-          notes: line.notes,
-        })),
+        .map((line): PurchaseOrderLineData => {
+          const ordered = this.decimal(line.quantity, 3);
+          const received = this.decimal(line.received_quantity, 3);
+          return {
+            id: line.id,
+            supplierProductId: line.supplier_product_id,
+            productId: line.product_id,
+            productName: line.product_name,
+            productSku: line.product_sku,
+            supplierCode: line.supplier_code,
+            quantity: line.quantity,
+            receivedQuantity: line.received_quantity,
+            remainingQuantity: this.quantity(
+              ordered > received ? ordered - received : 0n,
+            ),
+            overageQuantity: this.quantity(
+              received > ordered ? received - ordered : 0n,
+            ),
+            unitCost: line.unit_cost,
+            subtotal: line.subtotal,
+            notes: line.notes,
+          };
+        }),
       createdAt: new Date(row.created_at).toISOString(),
       updatedAt: new Date(row.updated_at).toISOString(),
     };
@@ -540,6 +624,10 @@ export class PurchaseOrderRepository {
 
   private money(cents: bigint): string {
     return `${cents / 100n}.${(cents % 100n).toString().padStart(2, '0')}`;
+  }
+
+  private quantity(milliunits: bigint): string {
+    return `${milliunits / 1000n}.${(milliunits % 1000n).toString().padStart(3, '0')}`;
   }
 
   private transitionMetadata(input: {

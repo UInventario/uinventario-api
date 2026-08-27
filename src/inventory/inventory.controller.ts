@@ -18,6 +18,7 @@ import { SessionGuard } from '../auth/session/session.guard';
 import type { AuthenticatedRequest } from '../auth/session/session.types';
 import { PermissionGuard } from '../auth/authorization/permission.guard';
 import { RequirePermissions } from '../auth/authorization/require-permissions.decorator';
+import { RequireAnyPermission } from '../auth/authorization/require-any-permission.decorator';
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
 import { CreateInventoryStateTransitionDto } from './dto/create-inventory-state-transition.dto';
 import { GetInventoryBalanceDto } from './dto/get-inventory-balance.dto';
@@ -124,7 +125,7 @@ export class InventoryController {
   }
 
   @Get('locations')
-  @RequirePermissions('INVENTORY_VIEW')
+  @RequireAnyPermission('INVENTORY_VIEW', 'PURCHASE_ORDERS_MANAGE')
   listLocations(@Req() request: AuthenticatedRequest) {
     return this.inventory.listLocations(
       request.principal.tenant.id,
