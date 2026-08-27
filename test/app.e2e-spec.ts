@@ -1594,6 +1594,172 @@ describe('UInventario API (e2e)', () => {
       expect(Number(counts.movements)).toBe(5);
     });
 
+    it('applies operational movement directions and rolls back invalid exits', async () => {
+      await registerAccount('inventory-operational-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeInventoryOnboarding(registrationPayload.email, cookie);
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto operativo',
+          sku: 'OPS-1',
+          cost: '5.00',
+          price: '9.00',
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      const base = { productId, locationId: location.id };
+      const operations = [
+        {
+          type: 'INITIAL',
+          quantity: '10',
+          reason: 'Conteo inicial',
+          expectedChange: '10.000',
+          expectedBalance: '10.000',
+        },
+        {
+          type: 'ENTRY',
+          quantity: '2',
+          reason: 'Entrada manual',
+          reference: 'ENT-001',
+          expectedChange: '2.000',
+          expectedBalance: '12.000',
+        },
+        {
+          type: 'RETURN',
+          quantity: '1',
+          reason: 'Devolución de cliente',
+          reference: 'DEV-001',
+          expectedChange: '1.000',
+          expectedBalance: '13.000',
+        },
+        {
+          type: 'EXIT',
+          quantity: '3',
+          reason: 'Salida operativa',
+          reference: 'SAL-001',
+          expectedChange: '-3.000',
+          expectedBalance: '10.000',
+        },
+        {
+          type: 'LOSS',
+          quantity: '1',
+          reason: 'Pérdida documentada',
+          reference: 'INC-LOSS-001',
+          expectedChange: '-1.000',
+          expectedBalance: '9.000',
+        },
+        {
+          type: 'DAMAGE',
+          quantity: '1',
+          reason: 'Daño documentado',
+          reference: 'INC-DAMAGE-001',
+          expectedChange: '-1.000',
+          expectedBalance: '8.000',
+        },
+        {
+          type: 'ADJUSTMENT',
+          quantity: '-2',
+          reason: 'Ajuste autorizado',
+          reference: 'ADJ-001',
+          expectedChange: '-2.000',
+          expectedBalance: '6.000',
+        },
+      ];
+
+      for (const [index, operation] of operations.entries()) {
+        const { expectedChange, expectedBalance, ...payload } = operation;
+        await request(app.getHttpServer())
+          .post('/api/v1/inventory/movements')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', `operational-movement-${index}`)
+          .send({ ...base, ...payload })
+          .expect(201)
+          .expect(({ body }: { body: unknown }) => {
+            expect(body).toMatchObject({
+              data: {
+                type: operation.type,
+                quantityChange: expectedChange,
+                quantity: expectedBalance,
+                reason: operation.reason,
+                reference: operation.reference ?? null,
+              },
+            });
+          });
+      }
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'operational-missing-reference')
+        .send({ ...base, type: 'LOSS', quantity: '1', reason: 'Sin evidencia' })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('MOVEMENT_REFERENCE_REQUIRED');
+        });
+      for (const [key, quantity] of [
+        ['operational-negative-exit', '-1'],
+        ['operational-insufficient-exit', '99'],
+      ]) {
+        await request(app.getHttpServer())
+          .post('/api/v1/inventory/movements')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', key)
+          .send({
+            ...base,
+            type: 'EXIT',
+            quantity,
+            reason: 'Salida inválida',
+            reference: 'SAL-INVALID',
+          })
+          .expect(409)
+          .expect(({ body }: { body: { code?: string } }) => {
+            expect(body.code).toBe('INVALID_STOCK_QUANTITY');
+          });
+      }
+
+      const balance = await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/balance`)
+        .query({ locationId: location.id })
+        .set('Cookie', cookie)
+        .expect(200);
+      expect(balance.body).toMatchObject({ data: { quantity: '6.000' } });
+      const history = await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .query({ productId, pageSize: 20 })
+        .set('Cookie', cookie)
+        .expect(200);
+      const historyData = history.body as {
+        data: Array<{
+          type: string;
+          direction: string;
+          responsible: { email: string };
+        }>;
+      };
+      expect(historyData.data).toHaveLength(7);
+      expect(historyData.data).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: 'RETURN', direction: 'IN' }),
+          expect.objectContaining({ type: 'EXIT', direction: 'OUT' }),
+          expect.objectContaining({ type: 'LOSS', direction: 'OUT' }),
+          expect.objectContaining({ type: 'DAMAGE', direction: 'OUT' }),
+        ]),
+      );
+      expect(
+        historyData.data.every(
+          ({ responsible }) => responsible.email === registrationPayload.email,
+        ),
+      ).toBe(true);
+    });
+
     it('rejects products and locations outside the active tenant', async () => {
       await registerAccount('inventory-isolation-primary');
       const primaryCookie = await createPersistedSession(
@@ -2421,6 +2587,7 @@ describe('UInventario API (e2e)', () => {
             type: 'ENTRY',
             quantity: '1',
             reason: 'Intento ajeno',
+            reference: 'TENANT-ATTEMPT',
           })
           .expect(404);
         const missingMovement = await request(app.getHttpServer())
@@ -2433,6 +2600,7 @@ describe('UInventario API (e2e)', () => {
             type: 'ENTRY',
             quantity: '1',
             reason: 'Intento inexistente',
+            reference: 'TENANT-MISSING',
           })
           .expect(404);
         expect(foreignMovement.body).toEqual(missingMovement.body);
@@ -2611,6 +2779,23 @@ describe('UInventario API (e2e)', () => {
         .expect(403)
         .expect(({ body }: { body: { code?: string } }) => {
           expect(body.code).toBe('PRODUCT_ACCESS_DENIED');
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'staff-inventory-denied')
+        .send({
+          productId: randomUUID(),
+          locationId: randomUUID(),
+          type: 'EXIT',
+          quantity: '1',
+          reason: 'Intento sin permiso',
+          reference: 'DENIED-001',
+        })
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVENTORY_ACCESS_DENIED');
         });
 
       await request(app.getHttpServer())

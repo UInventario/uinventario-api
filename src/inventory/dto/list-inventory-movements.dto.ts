@@ -10,7 +10,10 @@ import {
   MaxLength,
   Min,
 } from 'class-validator';
-import type { InventoryMovementType } from '../inventory.types';
+import {
+  INVENTORY_MOVEMENT_TYPES,
+  type InventoryMovementType,
+} from '../inventory.types';
 
 const optionalTrim = ({ value }: { value: unknown }) => {
   if (typeof value !== 'string') return value;
@@ -30,7 +33,7 @@ export class ListInventoryMovementsDto {
   q?: string;
 
   @IsOptional()
-  @IsIn(['INITIAL', 'ENTRY', 'ADJUSTMENT', 'SALE'])
+  @IsIn(INVENTORY_MOVEMENT_TYPES)
   type?: InventoryMovementType;
 
   @IsOptional()
