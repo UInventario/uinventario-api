@@ -21,3 +21,15 @@ export class PosIdempotencyConflictError extends Error {
     super('POS_IDEMPOTENCY_KEY_REUSED');
   }
 }
+
+export class SaleAlreadyVoidedError extends Error {
+  constructor() {
+    super('SALE_ALREADY_VOIDED');
+  }
+}
+
+export class SaleVoidNotAllowedError extends Error {
+  constructor() {
+    super('SALE_VOID_NOT_ALLOWED');
+  }
+}

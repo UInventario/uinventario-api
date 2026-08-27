@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { DataSource } from 'typeorm';
+import { DataSource, EntityManager } from 'typeorm';
 import { createHash, randomUUID } from 'node:crypto';
 import { ListAuditEventsDto } from './dto/list-audit-events.dto';
 
@@ -11,6 +11,8 @@ export interface RecordAuditEvent {
   entityId: string;
   correlationId: string;
   deduplicate?: boolean;
+  before?: Record<string, unknown>;
+  after?: Record<string, unknown>;
 }
 
 @Injectable()
@@ -20,29 +22,8 @@ export class AuditService {
   constructor(private readonly dataSource: DataSource) {}
 
   async record(input: RecordAuditEvent): Promise<void> {
-    const eventKey = createHash('sha256')
-      .update(
-        input.deduplicate
-          ? `${input.tenantId}:${input.action}:${input.entityType}:${input.entityId}`
-          : `${input.tenantId}:${input.action}:${input.entityType}:${input.entityId}:${input.correlationId}`,
-      )
-      .digest('hex');
     try {
-      await this.dataSource.query(
-        `INSERT INTO audit_events
-          (id, tenant_id, actor_user_id, action, entity_type, entity_id, correlation_id, event_key)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          randomUUID(),
-          input.tenantId,
-          input.actorUserId,
-          input.action,
-          input.entityType,
-          input.entityId,
-          input.correlationId,
-          eventKey,
-        ],
-      );
+      await this.insert(this.dataSource.manager, input);
     } catch (error) {
       if ((error as { code?: string } | null)?.code === 'ER_DUP_ENTRY') return;
       this.logger.error(
@@ -58,6 +39,44 @@ export class AuditService {
     }
   }
 
+  async recordInTransaction(
+    manager: EntityManager,
+    input: RecordAuditEvent,
+  ): Promise<void> {
+    await this.insert(manager, input);
+  }
+
+  private async insert(
+    manager: EntityManager,
+    input: RecordAuditEvent,
+  ): Promise<void> {
+    const eventKey = createHash('sha256')
+      .update(
+        input.deduplicate
+          ? `${input.tenantId}:${input.action}:${input.entityType}:${input.entityId}`
+          : `${input.tenantId}:${input.action}:${input.entityType}:${input.entityId}:${input.correlationId}`,
+      )
+      .digest('hex');
+    await manager.query(
+      `INSERT INTO audit_events
+          (id, tenant_id, actor_user_id, action, entity_type, entity_id, correlation_id,
+           event_key, before_data, after_data)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        randomUUID(),
+        input.tenantId,
+        input.actorUserId,
+        input.action,
+        input.entityType,
+        input.entityId,
+        input.correlationId,
+        eventKey,
+        input.before ? JSON.stringify(input.before) : null,
+        input.after ? JSON.stringify(input.after) : null,
+      ],
+    );
+  }
+
   async list(tenantId: string, query: ListAuditEventsDto) {
     const offset = (query.page - 1) * query.pageSize;
     const [rows, [count]] = await Promise.all([
@@ -71,10 +90,13 @@ export class AuditService {
           created_at: Date | string;
           actor_id: string;
           actor_email: string;
+          before_data: string | Record<string, unknown> | null;
+          after_data: string | Record<string, unknown> | null;
         }>
       >(
         `SELECT ae.id, ae.action, ae.entity_type, ae.entity_id, ae.correlation_id,
-                ae.created_at, u.id AS actor_id, u.email AS actor_email
+                ae.created_at, ae.before_data, ae.after_data,
+                u.id AS actor_id, u.email AS actor_email
          FROM audit_events ae
          INNER JOIN users u ON u.id = ae.actor_user_id AND u.tenant_id = ae.tenant_id
          WHERE ae.tenant_id = ?
@@ -97,6 +119,8 @@ export class AuditService {
         correlationId: row.correlation_id,
         createdAt: new Date(row.created_at).toISOString(),
         actor: { id: row.actor_id, email: row.actor_email },
+        before: this.parseJson(row.before_data),
+        after: this.parseJson(row.after_data),
       })),
       meta: {
         apiVersion: '1' as const,
@@ -108,5 +132,14 @@ export class AuditService {
         },
       },
     };
+  }
+
+  private parseJson(
+    value: string | Record<string, unknown> | null,
+  ): Record<string, unknown> | null {
+    if (!value) return null;
+    return typeof value === 'string'
+      ? (JSON.parse(value) as Record<string, unknown>)
+      : value;
   }
 }

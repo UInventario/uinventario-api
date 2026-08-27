@@ -12,6 +12,7 @@ export const INVENTORY_MOVEMENT_TYPES = [
   'TRANSFER_RECEIPT',
   'TRANSFER_DISCREPANCY',
   'SALE',
+  'SALE_VOID',
 ] as const;
 
 export type InventoryMovementType = (typeof INVENTORY_MOVEMENT_TYPES)[number];
@@ -23,6 +24,7 @@ export type UserInventoryMovementType = Exclude<
   | 'TRANSFER_RECEIPT'
   | 'TRANSFER_DISCREPANCY'
   | 'SALE'
+  | 'SALE_VOID'
 >;
 export type InventoryStockState =
   'AVAILABLE' | 'RESERVED' | 'DAMAGED' | 'IN_TRANSIT';
