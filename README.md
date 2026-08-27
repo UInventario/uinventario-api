@@ -65,6 +65,8 @@ El contrato validado de variables y nombres de Secret Manager está en
 [`docs/operations/environment-contract.md`](docs/operations/environment-contract.md).
 Las imágenes, recursos mínimos, migración previa y rollback de Cloud Run están en
 [`docs/operations/cloud-run.md`](docs/operations/cloud-run.md).
+El mapeo automático `develop` → Dev y `master` → Prod, sus identidades y triggers
+están en [`docs/operations/cloud-build.md`](docs/operations/cloud-build.md).
 
 ## Aislamiento multiempresa
 
