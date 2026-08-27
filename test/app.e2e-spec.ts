@@ -5711,6 +5711,235 @@ describe('UInventario API (e2e)', () => {
         .expect(403);
     });
 
+    it('releases, expires and consumes reservations without decrementing stock twice', async () => {
+      const { cookie, productId, locationId } = await preparePos();
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({ name: 'Cliente ciclo reserva', dataProcessingConsent: false })
+        .expect(201);
+      const customerId = (customerResponse.body as { data: { id: string } })
+        .data.id;
+      const createReservation = async (key: string, quantity: string) => {
+        const response = await request(app.getHttpServer())
+          .post('/api/v1/reservations')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', key)
+          .send({
+            customerId,
+            locationId,
+            expiresInHours: 24,
+            lines: [{ productId, quantity }],
+          })
+          .expect(201);
+        return (response.body as { data: { id: string } }).data.id;
+      };
+
+      const releasedId = await createReservation(
+        'reservation-release-create',
+        '1',
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/reservations/${releasedId}/release`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reservation-release-action')
+        .send({ reason: 'Cliente canceló la reserva' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { status: 'RELEASED' },
+            meta: { idempotentReplay: false },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/reservations/${releasedId}/release`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reservation-release-action')
+        .send({ reason: 'Cliente canceló la reserva' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { idempotentReplay: true } });
+        });
+
+      const expiredId = await createReservation(
+        'reservation-expire-create',
+        '1',
+      );
+      await dataSource.query(
+        `UPDATE product_reservations
+         SET created_at = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 2 HOUR),
+             expires_at = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 1 MINUTE)
+         WHERE id = ?`,
+        [expiredId],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/reservations/expire-due')
+        .set('Cookie', cookie)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [{ id: expiredId, status: 'EXPIRED' }],
+            meta: { expiredCount: 1 },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/reservations/expire-due')
+        .set('Cookie', cookie)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: [], meta: { expiredCount: 0 } });
+        });
+
+      const consumedId = await createReservation(
+        'reservation-consume-create',
+        '2',
+      );
+      const sale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reservation-consume-sale')
+        .send({
+          reservationId: consumedId,
+          customerId,
+          lines: [{ productId, quantity: '2' }],
+          cashReceived: '300.00',
+        });
+      expect(sale.status).toBe(201);
+      const saleId = (sale.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reservation-consume-sale')
+        .send({
+          reservationId: consumedId,
+          customerId,
+          lines: [{ productId, quantity: '2' }],
+          cashReceived: '300.00',
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { id: saleId },
+            meta: { idempotentReplay: true },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/reservations')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: Array<{
+                id: string;
+                status: string;
+                sale: { id: string } | null;
+              }>;
+            };
+          }) => {
+            expect(body.data.find(({ id }) => id === consumedId)).toMatchObject(
+              {
+                status: 'CONSUMED',
+                sale: { id: saleId },
+              },
+            );
+          },
+        );
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/balance`)
+        .query({ locationId })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: {
+                totalQuantity: string;
+                availableQuantity: string;
+                states: Array<{ code: string; quantity: string }>;
+              };
+            };
+          }) => {
+            expect(body.data.totalQuantity).toBe('3.000');
+            expect(body.data.availableQuantity).toBe('3.000');
+            expect(
+              body.data.states.find(({ code }) => code === 'AVAILABLE'),
+            ).toEqual({
+              code: 'AVAILABLE',
+              quantity: '3.000',
+            });
+            expect(
+              body.data.states.find(({ code }) => code === 'RESERVED'),
+            ).toEqual({
+              code: 'RESERVED',
+              quantity: '0.000',
+            });
+          },
+        );
+      const [movementCount] = await dataSource.query<
+        Array<{ total: number | string }>
+      >(
+        `SELECT COUNT(*) AS total FROM inventory_movements
+         WHERE reservation_id = ? AND type = 'SALE'`,
+        [consumedId],
+      );
+      expect(Number(movementCount.total)).toBe(1);
+
+      const racedId = await createReservation('reservation-race-create', '1');
+      const race = await Promise.all([
+        request(app.getHttpServer())
+          .post(`/api/v1/reservations/${racedId}/release`)
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', 'reservation-race-release')
+          .send({ reason: 'Liberación simultánea' }),
+        request(app.getHttpServer())
+          .post('/api/v1/pos/sales/cash')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', 'reservation-race-sale')
+          .send({
+            reservationId: racedId,
+            customerId,
+            lines: [{ productId, quantity: '1' }],
+            cashReceived: '150.00',
+          }),
+      ]);
+      expect(race.map(({ status }) => status).sort()).toEqual([201, 409]);
+      const [raceReservation] = await dataSource.query<
+        Array<{ status: 'RELEASED' | 'CONSUMED' }>
+      >(`SELECT status FROM product_reservations WHERE id = ?`, [racedId]);
+      const [raceBalance] = await dataSource.query<
+        Array<{
+          quantity: string;
+          available_quantity: string;
+          reserved_quantity: string;
+        }>
+      >(
+        `SELECT quantity, available_quantity, reserved_quantity
+         FROM inventory_balances WHERE product_id = ? AND location_id = ?`,
+        [productId, locationId],
+      );
+      expect(raceBalance.reserved_quantity).toBe('0.000');
+      expect(raceBalance.available_quantity).toBe(raceBalance.quantity);
+      expect(['RELEASED', 'CONSUMED']).toContain(raceReservation.status);
+
+      const auditActions = await dataSource.query<Array<{ action: string }>>(
+        `SELECT action FROM audit_events
+         WHERE entity_type = 'PRODUCT_RESERVATION' AND entity_id IN (?, ?, ?)`,
+        [releasedId, expiredId, consumedId],
+      );
+      expect(auditActions.map(({ action }) => action)).toEqual(
+        expect.arrayContaining([
+          'PRODUCT_RESERVATION_RELEASED',
+          'PRODUCT_RESERVATION_EXPIRED',
+          'PRODUCT_RESERVATION_CONSUMED',
+        ]),
+      );
+    });
+
     it('opens one auditable register shift idempotently and requires it for POS operations', async () => {
       const { cookie, productId } = await preparePos(false);
       await request(app.getHttpServer())

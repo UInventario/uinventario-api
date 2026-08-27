@@ -5,6 +5,7 @@ import { CreateProductReservationDto } from './dto/create-product-reservation.dt
 import {
   ProductReservationIdempotencyConflictError,
   ProductReservationInsufficientStockError,
+  ProductReservationNotActiveError,
   ProductReservationTargetNotFoundError,
 } from './product-reservation.errors';
 import { ProductReservationData } from './product-reservation.types';
@@ -13,10 +14,14 @@ interface ReservationRow {
   id: string;
   tenant_id: string;
   reservation_number: string;
-  status: 'ACTIVE';
+  status: 'ACTIVE' | 'RELEASED' | 'EXPIRED' | 'CONSUMED';
   request_fingerprint: string;
   expires_at: Date | string;
   created_at: Date | string;
+  closed_at: Date | string | null;
+  closure_reason: string | null;
+  sale_id: string | null;
+  receipt_number: string | null;
   customer_id: string;
   customer_name: string;
   customer_identifier: string | null;
@@ -231,6 +236,62 @@ export class ProductReservationRepository {
     );
   }
 
+  async release(input: {
+    tenantId: string;
+    branchId: string;
+    userId: string;
+    reservationId: string;
+    idempotencyKey: string;
+    reason: string;
+  }): Promise<{ reservation: ProductReservationData; replay: boolean }> {
+    const fingerprint = this.closeFingerprint('RELEASED', input.reason);
+    try {
+      return await this.dataSource.transaction('READ COMMITTED', (manager) =>
+        this.close(manager, { ...input, status: 'RELEASED', fingerprint }),
+      );
+    } catch (error) {
+      if (this.isDuplicate(error))
+        throw new ProductReservationIdempotencyConflictError();
+      throw error;
+    }
+  }
+
+  async expireDue(input: {
+    tenantId: string;
+    branchId: string;
+    userId: string;
+  }): Promise<ProductReservationData[]> {
+    const due = await this.dataSource.query<Array<{ id: string }>>(
+      `SELECT id FROM product_reservations
+       WHERE tenant_id = ? AND branch_id = ? AND status = 'ACTIVE'
+         AND expires_at <= CURRENT_TIMESTAMP(6)
+       ORDER BY expires_at, id`,
+      [input.tenantId, input.branchId],
+    );
+    const expired: ProductReservationData[] = [];
+    for (const reservation of due) {
+      const reason = 'Vencimiento automático';
+      try {
+        const result = await this.dataSource.transaction(
+          'READ COMMITTED',
+          (manager) =>
+            this.close(manager, {
+              ...input,
+              reservationId: reservation.id,
+              idempotencyKey: `expire:${reservation.id}`,
+              reason,
+              status: 'EXPIRED',
+              fingerprint: this.closeFingerprint('EXPIRED', reason),
+            }),
+        );
+        if (!result.replay) expired.push(result.reservation);
+      } catch (error) {
+        if (!(error instanceof ProductReservationNotActiveError)) throw error;
+      }
+    }
+    return expired;
+  }
+
   private async findByKey(
     manager: EntityManager,
     tenantId: string,
@@ -261,7 +322,8 @@ export class ProductReservationRepository {
   private rows(manager: EntityManager, where: string, parameters: unknown[]) {
     return manager.query<ReservationRow[]>(
       `SELECT r.id, r.tenant_id, r.reservation_number, r.status, r.request_fingerprint,
-              r.expires_at, r.created_at,
+              r.expires_at, r.created_at, r.closed_at, r.closure_reason,
+              s.id AS sale_id, s.receipt_number,
               c.id AS customer_id, c.name AS customer_name, c.identifier AS customer_identifier,
               b.id AS branch_id, b.name AS branch_name,
               w.id AS warehouse_id, w.name AS warehouse_name,
@@ -273,6 +335,7 @@ export class ProductReservationRepository {
        INNER JOIN warehouses w ON w.id = r.warehouse_id AND w.tenant_id = r.tenant_id
        INNER JOIN locations l ON l.id = r.location_id AND l.tenant_id = r.tenant_id
        INNER JOIN users u ON u.id = r.created_by_user_id AND u.tenant_id = r.tenant_id
+       LEFT JOIN sales s ON s.id = r.sale_id AND s.tenant_id = r.tenant_id
        ${where} ORDER BY r.created_at DESC, r.id DESC`,
       parameters,
     );
@@ -318,6 +381,11 @@ export class ProductReservationRepository {
       responsible: { id: row.user_id, email: row.user_email },
       expiresAt: new Date(row.expires_at).toISOString(),
       createdAt: new Date(row.created_at).toISOString(),
+      closedAt: row.closed_at ? new Date(row.closed_at).toISOString() : null,
+      closureReason: row.closure_reason,
+      sale: row.sale_id
+        ? { id: row.sale_id, receiptNumber: row.receipt_number! }
+        : null,
       lines: lines.map((line) => ({
         id: line.id,
         product: {
@@ -337,6 +405,138 @@ export class ProductReservationRepository {
     if (stored.fingerprint !== fingerprint)
       throw new ProductReservationIdempotencyConflictError();
     return { reservation: stored.reservation, replay: true };
+  }
+
+  private async close(
+    manager: EntityManager,
+    input: {
+      tenantId: string;
+      branchId: string;
+      userId: string;
+      reservationId: string;
+      idempotencyKey: string;
+      reason: string;
+      status: 'RELEASED' | 'EXPIRED';
+      fingerprint: string;
+    },
+  ): Promise<{ reservation: ProductReservationData; replay: boolean }> {
+    const [reservation] = await manager.query<
+      Array<{
+        id: string;
+        location_id: string;
+        status: ReservationRow['status'];
+        closed_idempotency_key: string | null;
+        closed_request_fingerprint: string | null;
+      }>
+    >(
+      `SELECT id, location_id, status, closed_idempotency_key,
+              closed_request_fingerprint
+       FROM product_reservations
+       WHERE id = ? AND tenant_id = ? AND branch_id = ? LIMIT 1 FOR UPDATE`,
+      [input.reservationId, input.tenantId, input.branchId],
+    );
+    if (!reservation) throw new ProductReservationTargetNotFoundError();
+    if (reservation.status !== 'ACTIVE') {
+      if (
+        reservation.status === input.status &&
+        reservation.closed_idempotency_key === input.idempotencyKey &&
+        reservation.closed_request_fingerprint === input.fingerprint
+      ) {
+        const replay = await this.findById(
+          manager,
+          input.tenantId,
+          reservation.id,
+        );
+        if (!replay) throw new Error('CLOSED_RESERVATION_NOT_FOUND');
+        return { reservation: replay, replay: true };
+      }
+      throw new ProductReservationNotActiveError(reservation.status);
+    }
+    const lines = await manager.query<
+      Array<{ id: string; product_id: string; quantity: string }>
+    >(
+      `SELECT id, product_id, quantity FROM product_reservation_lines
+       WHERE reservation_id = ? AND tenant_id = ? ORDER BY product_id FOR UPDATE`,
+      [reservation.id, input.tenantId],
+    );
+    for (const [index, line] of lines.entries()) {
+      const [balance] = await manager.query<
+        Array<{
+          quantity: string;
+          available_quantity: string;
+          reserved_quantity: string;
+        }>
+      >(
+        `SELECT quantity, available_quantity, reserved_quantity
+         FROM inventory_balances
+         WHERE tenant_id = ? AND product_id = ? AND location_id = ? FOR UPDATE`,
+        [input.tenantId, line.product_id, reservation.location_id],
+      );
+      const quantity = this.units(line.quantity);
+      if (!balance || this.units(balance.reserved_quantity) < quantity)
+        throw new ProductReservationInsufficientStockError(line.product_id);
+      const available = this.units(balance.available_quantity) + quantity;
+      const reserved = this.units(balance.reserved_quantity) - quantity;
+      await manager.query(
+        `UPDATE inventory_balances SET available_quantity = ?, reserved_quantity = ?
+         WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
+        [
+          this.decimal(available),
+          this.decimal(reserved),
+          input.tenantId,
+          line.product_id,
+          reservation.location_id,
+        ],
+      );
+      await manager.query(
+        `INSERT INTO inventory_movements
+          (id, tenant_id, product_id, location_id, type, from_state, to_state,
+           state_quantity, quantity_change, resulting_quantity, reason, reference,
+           idempotency_key, request_fingerprint, created_by_user_id,
+           reservation_id, reservation_line_id)
+         VALUES (?, ?, ?, ?, 'STATE_TRANSITION', 'RESERVED', 'AVAILABLE', ?, 0, ?,
+                 ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          randomUUID(),
+          input.tenantId,
+          line.product_id,
+          reservation.location_id,
+          line.quantity,
+          balance.quantity,
+          input.reason,
+          input.reservationId,
+          `reservation-close:${input.reservationId}:${index + 1}`,
+          input.fingerprint,
+          input.userId,
+          reservation.id,
+          line.id,
+        ],
+      );
+    }
+    await manager.query(
+      `UPDATE product_reservations
+       SET status = ?, closed_by_user_id = ?, closed_at = CURRENT_TIMESTAMP(6),
+           closure_reason = ?, closed_idempotency_key = ?, closed_request_fingerprint = ?
+       WHERE id = ? AND tenant_id = ? AND status = 'ACTIVE'`,
+      [
+        input.status,
+        input.userId,
+        input.reason,
+        input.idempotencyKey,
+        input.fingerprint,
+        reservation.id,
+        input.tenantId,
+      ],
+    );
+    const result = await this.findById(manager, input.tenantId, reservation.id);
+    if (!result) throw new Error('CLOSED_RESERVATION_NOT_FOUND');
+    return { reservation: result, replay: false };
+  }
+
+  private closeFingerprint(status: string, reason: string): string {
+    return createHash('sha256')
+      .update(JSON.stringify({ status, reason }))
+      .digest('hex');
   }
 
   private isDuplicate(error: unknown): boolean {

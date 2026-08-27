@@ -5,6 +5,7 @@ import {
   PosIdempotencyConflictError,
   PosCustomerNotAvailableError,
   PosInsufficientStockError,
+  PosReservationNotAvailableError,
   SaleAlreadyVoidedError,
   SaleVoidNotAllowedError,
 } from './pos.errors';
@@ -55,6 +56,8 @@ interface StockAllocation {
   quantityChange: string;
   resultingQuantity: string;
   resultingAvailableQuantity: string;
+  resultingReservedQuantity: string;
+  reservationLineId?: string;
 }
 
 @Injectable()
@@ -466,6 +469,7 @@ export class SalesRepository {
     fingerprint: string;
     cashRegisterShiftId: string;
     customerId?: string | null;
+    reservationId?: string | null;
     quote: PosCartQuoteResponse['data'];
     amountReceived: string;
     change: string;
@@ -484,11 +488,75 @@ export class SalesRepository {
               throw new PosIdempotencyConflictError();
             return { sale: replay.sale, replay: true };
           }
-          if (input.customerId) {
+          let effectiveCustomerId = input.customerId ?? null;
+          let reservedLocationId: string | null = null;
+          const reservationLines = new Map<
+            string,
+            { id: string; quantity: string }
+          >();
+          if (input.reservationId) {
+            const [reservation] = await manager.query<
+              Array<{
+                customer_id: string;
+                location_id: string;
+                status: string;
+                expired: number | boolean;
+              }>
+            >(
+              `SELECT customer_id, location_id, status,
+                      expires_at <= CURRENT_TIMESTAMP(6) AS expired
+               FROM product_reservations
+               WHERE id = ? AND tenant_id = ? AND branch_id = ? AND warehouse_id = ?
+               LIMIT 1 FOR UPDATE`,
+              [
+                input.reservationId,
+                input.tenantId,
+                input.quote.context.branch.id,
+                input.quote.context.warehouse.id,
+              ],
+            );
+            if (!reservation) throw new PosReservationNotAvailableError();
+            if (reservation.status !== 'ACTIVE')
+              throw new PosReservationNotAvailableError(reservation.status);
+            if (Number(reservation.expired) === 1)
+              throw new PosReservationNotAvailableError('EXPIRED');
+            if (
+              effectiveCustomerId &&
+              effectiveCustomerId !== reservation.customer_id
+            )
+              throw new PosReservationNotAvailableError('CUSTOMER_MISMATCH');
+            effectiveCustomerId = reservation.customer_id;
+            reservedLocationId = reservation.location_id;
+            const lines = await manager.query<
+              Array<{ id: string; product_id: string; quantity: string }>
+            >(
+              `SELECT id, product_id, quantity FROM product_reservation_lines
+               WHERE reservation_id = ? AND tenant_id = ? ORDER BY product_id FOR UPDATE`,
+              [input.reservationId, input.tenantId],
+            );
+            for (const line of lines)
+              reservationLines.set(line.product_id, {
+                id: line.id,
+                quantity: line.quantity,
+              });
+            const quoteLines = new Map(
+              input.quote.lines.map((line) => [line.product.id, line.quantity]),
+            );
+            if (
+              quoteLines.size !== reservationLines.size ||
+              [...reservationLines].some(
+                ([productId, line]) =>
+                  this.toQuantityUnits(quoteLines.get(productId) ?? '0') !==
+                  this.toQuantityUnits(line.quantity),
+              )
+            )
+              throw new PosReservationNotAvailableError('LINES_MISMATCH');
+          }
+          if (effectiveCustomerId && !input.reservationId) {
             const [customer] = await manager.query<Array<{ id: string }>>(
               `SELECT id FROM customers
                WHERE id = ? AND tenant_id = ? AND active = TRUE FOR UPDATE`,
-              [input.customerId, input.tenantId],
+              [effectiveCustomerId, input.tenantId],
             );
             if (!customer) throw new PosCustomerNotAvailableError();
           }
@@ -516,17 +584,21 @@ export class SalesRepository {
                 location_id: string;
                 quantity: string;
                 available_quantity: string;
+                reserved_quantity: string;
               }>
             >(
-              `SELECT ib.location_id, ib.quantity, ib.available_quantity
+              `SELECT ib.location_id, ib.quantity, ib.available_quantity, ib.reserved_quantity
              FROM inventory_balances ib
              INNER JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
              WHERE ib.tenant_id = ? AND ib.product_id = ? AND l.warehouse_id = ?
+               AND (? IS NULL OR ib.location_id = ?)
              ORDER BY l.created_at, l.id FOR UPDATE`,
               [
                 input.tenantId,
                 line.product.id,
                 input.quote.context.warehouse.id,
+                reservedLocationId,
+                reservedLocationId,
               ],
             );
             let remaining = this.toQuantityUnits(line.quantity);
@@ -534,9 +606,17 @@ export class SalesRepository {
             for (const balance of balances) {
               if (remaining === 0n) break;
               const available = this.toQuantityUnits(
-                balance.available_quantity,
+                input.reservationId
+                  ? balance.reserved_quantity
+                  : balance.available_quantity,
               );
               const total = this.toQuantityUnits(balance.quantity);
+              const currentAvailable = this.toQuantityUnits(
+                balance.available_quantity,
+              );
+              const currentReserved = this.toQuantityUnits(
+                balance.reserved_quantity,
+              );
               const taken = available < remaining ? available : remaining;
               if (taken === 0n) continue;
               lineAllocations.push({
@@ -544,8 +624,16 @@ export class SalesRepository {
                 quantityChange: this.fromQuantityUnits(-taken),
                 resultingQuantity: this.fromQuantityUnits(total - taken),
                 resultingAvailableQuantity: this.fromQuantityUnits(
-                  available - taken,
+                  input.reservationId
+                    ? currentAvailable
+                    : currentAvailable - taken,
                 ),
+                resultingReservedQuantity: this.fromQuantityUnits(
+                  input.reservationId
+                    ? currentReserved - taken
+                    : currentReserved,
+                ),
+                reservationLineId: reservationLines.get(line.product.id)?.id,
               });
               remaining -= taken;
             }
@@ -570,9 +658,9 @@ export class SalesRepository {
           await manager.query(
             `INSERT INTO sales
             (id, tenant_id, branch_id, warehouse_id, cash_register_id,
-             cash_register_shift_id, created_by_user_id, customer_id, receipt_number, currency, tax_rate, subtotal,
+             cash_register_shift_id, created_by_user_id, customer_id, reservation_id, receipt_number, currency, tax_rate, subtotal,
              tax_total, total, status, idempotency_key, request_fingerprint)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
             [
               saleId,
               input.tenantId,
@@ -581,7 +669,8 @@ export class SalesRepository {
               input.quote.context.cashRegister.id,
               input.cashRegisterShiftId,
               input.userId,
-              input.customerId ?? null,
+              effectiveCustomerId,
+              input.reservationId ?? null,
               receiptNumber,
               input.quote.currency,
               input.quote.taxRate,
@@ -625,11 +714,12 @@ export class SalesRepository {
             ).entries()) {
               await manager.query(
                 `UPDATE inventory_balances
-                 SET quantity = ?, available_quantity = ?
+                 SET quantity = ?, available_quantity = ?, reserved_quantity = ?
                WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
                 [
                   allocation.resultingQuantity,
                   allocation.resultingAvailableQuantity,
+                  allocation.resultingReservedQuantity,
                   input.tenantId,
                   line.product.id,
                   allocation.locationId,
@@ -651,8 +741,9 @@ export class SalesRepository {
                 `INSERT INTO inventory_movements
                 (id, tenant_id, product_id, location_id, type, quantity_change,
                  resulting_quantity, reason, reference, idempotency_key,
-                 request_fingerprint, created_by_user_id, sale_id, sale_line_id)
-               VALUES (?, ?, ?, ?, 'SALE', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 request_fingerprint, created_by_user_id, sale_id, sale_line_id,
+                 reservation_id, reservation_line_id)
+               VALUES (?, ?, ?, ?, 'SALE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
                   randomUUID(),
                   input.tenantId,
@@ -667,6 +758,8 @@ export class SalesRepository {
                   input.userId,
                   saleId,
                   saleLineId,
+                  input.reservationId ?? null,
+                  allocation.reservationLineId ?? null,
                 ],
               );
             }
@@ -686,6 +779,26 @@ export class SalesRepository {
               input.change,
             ],
           );
+          if (input.reservationId) {
+            const closed = await manager.query<{ affectedRows?: number }>(
+              `UPDATE product_reservations
+               SET status = 'CONSUMED', closed_by_user_id = ?,
+                   closed_at = CURRENT_TIMESTAMP(6), closure_reason = ?,
+                   closed_idempotency_key = ?, closed_request_fingerprint = ?, sale_id = ?
+               WHERE id = ? AND tenant_id = ? AND status = 'ACTIVE'`,
+              [
+                input.userId,
+                `Consumida en venta ${receiptNumber}`,
+                input.idempotencyKey,
+                input.fingerprint,
+                saleId,
+                input.reservationId,
+                input.tenantId,
+              ],
+            );
+            if (Number(closed.affectedRows ?? 0) !== 1)
+              throw new PosReservationNotAvailableError();
+          }
           const created = await this.findWithManager(
             manager,
             input.tenantId,

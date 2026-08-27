@@ -16,6 +16,12 @@ export class PosCustomerNotAvailableError extends Error {
   }
 }
 
+export class PosReservationNotAvailableError extends Error {
+  constructor(readonly status?: string) {
+    super('POS_RESERVATION_NOT_AVAILABLE');
+  }
+}
+
 export class PosInsufficientStockError extends Error {
   constructor(readonly productId: string) {
     super('POS_INSUFFICIENT_STOCK');

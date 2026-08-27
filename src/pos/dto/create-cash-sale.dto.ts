@@ -16,6 +16,10 @@ export class CreateCashSaleDto {
   @IsUUID()
   customerId?: string;
 
+  @IsOptional()
+  @IsUUID()
+  reservationId?: string;
+
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(100)
