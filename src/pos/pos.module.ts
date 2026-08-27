@@ -9,6 +9,8 @@ import { CashRegisterShiftRepository } from './cash-register-shift.repository';
 import { CashRegisterShiftService } from './cash-register-shift.service';
 import { CashRegisterMovementRepository } from './cash-register-movement.repository';
 import { CashRegisterMovementService } from './cash-register-movement.service';
+import { CashRegisterClosureRepository } from './cash-register-closure.repository';
+import { CashRegisterClosureService } from './cash-register-closure.service';
 
 @Module({
   imports: [SessionModule],
@@ -20,6 +22,8 @@ import { CashRegisterMovementService } from './cash-register-movement.service';
     CashRegisterShiftService,
     CashRegisterMovementRepository,
     CashRegisterMovementService,
+    CashRegisterClosureRepository,
+    CashRegisterClosureService,
     PosService,
     PosAccessGuard,
   ],
