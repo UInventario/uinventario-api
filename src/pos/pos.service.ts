@@ -9,6 +9,7 @@ import type { ConfigType } from '@nestjs/config';
 import { createHash } from 'node:crypto';
 import { posConfig } from '../config/pos.config';
 import { CreateCashSaleDto } from './dto/create-cash-sale.dto';
+import { ListSalesDto } from './dto/list-sales.dto';
 import { QuoteCartDto } from './dto/quote-cart.dto';
 import {
   PosContextNotFoundError,
@@ -28,6 +29,34 @@ export class PosService {
     @Inject(posConfig.KEY)
     private readonly config: ConfigType<typeof posConfig>,
   ) {}
+
+  async listSales(tenantId: string, branchId: string, query: ListSalesDto) {
+    if (query.dateFrom && query.dateTo && query.dateFrom > query.dateTo) {
+      throw new BadRequestException({
+        code: 'INVALID_SALES_DATE_RANGE',
+        message: 'La fecha inicial no puede ser posterior a la fecha final.',
+      });
+    }
+    const result = await this.sales.listSales(tenantId, branchId, query);
+    return {
+      data: result.items,
+      meta: {
+        apiVersion: '1' as const,
+        pagination: {
+          page: query.page,
+          pageSize: query.pageSize,
+          total: result.total,
+          totalPages: Math.ceil(result.total / query.pageSize),
+        },
+      },
+    };
+  }
+
+  async getSale(tenantId: string, branchId: string, saleId: string) {
+    const sale = await this.sales.getSaleDetail(tenantId, branchId, saleId);
+    if (!sale) throw new NotFoundException();
+    return { data: sale, meta: { apiVersion: '1' as const } };
+  }
 
   async createCashSale(input: {
     tenantId: string;

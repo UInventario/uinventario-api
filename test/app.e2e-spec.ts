@@ -1442,6 +1442,132 @@ describe('UInventario API (e2e)', () => {
         resulting_quantity: '2.500',
       });
       expect(trace.sale_line_id).toBeTruthy();
+
+      const history = await request(app.getHttpServer())
+        .get('/api/v1/pos/sales')
+        .query({
+          dateFrom: '2000-01-01',
+          dateTo: '2099-12-31',
+          page: 1,
+          pageSize: 1,
+        })
+        .set('Cookie', cookie)
+        .expect(200);
+      const historyBody = history.body as {
+        data: Array<{
+          id: string;
+          receiptNumber: string;
+          status: string;
+          user: { id: string; email: string };
+          cashRegister: { id: string; name: string };
+          total: string;
+        }>;
+        meta: { pagination: { total: number; totalPages: number } };
+      };
+      expect(historyBody.data).toHaveLength(1);
+      expect(historyBody.data[0]).toMatchObject({
+        id: saleBodies[0].data.id,
+        receiptNumber: saleBodies[0].data.receiptNumber,
+        status: 'COMPLETED',
+        total: '299.75',
+        user: { email: registrationPayload.email },
+        cashRegister: { name: 'Caja POS' },
+      });
+      expect(historyBody.meta.pagination).toMatchObject({
+        total: 1,
+        totalPages: 1,
+      });
+      for (const filter of [
+        { dateFrom: '2099-01-01' },
+        { cashRegisterId: randomUUID() },
+        { userId: randomUUID() },
+      ]) {
+        await request(app.getHttpServer())
+          .get('/api/v1/pos/sales')
+          .query(filter)
+          .set('Cookie', cookie)
+          .expect(200)
+          .expect(({ body }: { body: { data: unknown[] } }) => {
+            expect(body.data).toEqual([]);
+          });
+      }
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${saleBodies[0].data.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              id: saleBodies[0].data.id,
+              lines: [{ product: { id: productId }, quantity: '2.500' }],
+              payment: { method: 'CASH', change: '0.25' },
+              user: { email: registrationPayload.email },
+              context: { cashRegister: { name: 'Caja POS' } },
+              movements: [
+                {
+                  product: { id: productId },
+                  location: { id: locationId },
+                  quantityChange: '-2.500',
+                  resultingQuantity: '2.500',
+                  reference: saleBodies[0].data.receiptNumber,
+                },
+              ],
+            },
+          });
+        });
+    });
+
+    it('does not expose a sale outside the active branch', async () => {
+      const { cookie, productId } = await preparePos();
+      const sale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'pos-history-branch-scope')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: '120.00',
+        })
+        .expect(201);
+      const saleId = (sale.body as { data: { id: string } }).data.id;
+      const [principal] = await dataSource.query<Array<{ tenant_id: string }>>(
+        'SELECT tenant_id FROM users WHERE normalized_email = ? LIMIT 1',
+        [registrationPayload.email],
+      );
+      const branchId = randomUUID();
+      const warehouseId = randomUUID();
+      const cashRegisterId = randomUUID();
+      await dataSource.query(
+        `INSERT INTO branches (id, tenant_id, name, timezone)
+         VALUES (?, ?, 'Sucursal Alterna', 'America/Mexico_City')`,
+        [branchId, principal.tenant_id],
+      );
+      await dataSource.query(
+        `INSERT INTO warehouses (id, tenant_id, branch_id, name)
+         VALUES (?, ?, ?, 'Bodega Alterna')`,
+        [warehouseId, principal.tenant_id, branchId],
+      );
+      await dataSource.query(
+        `INSERT INTO cash_registers (id, tenant_id, branch_id, name, code)
+         VALUES (?, ?, ?, 'Caja Alterna', 'ALT')`,
+        [cashRegisterId, principal.tenant_id, branchId],
+      );
+      await dataSource.query(
+        `UPDATE sessions SET active_branch_id = ?, active_warehouse_id = ?,
+          active_cash_register_id = ? WHERE tenant_id = ?`,
+        [branchId, warehouseId, cashRegisterId, principal.tenant_id],
+      );
+
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toEqual([]);
+        });
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${saleId}`)
+        .set('Cookie', cookie)
+        .expect(404);
     });
 
     it('prevents concurrent sales from overselling stock', async () => {

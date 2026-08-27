@@ -60,3 +60,29 @@ export interface CashSaleResponse {
   data: CashSaleData;
   meta: { apiVersion: '1'; idempotentReplay: boolean };
 }
+
+export interface SaleSummaryData {
+  id: string;
+  receiptNumber: string;
+  status: 'COMPLETED';
+  user: { id: string; email: string };
+  cashRegister: { id: string; name: string; code: string };
+  currency: string;
+  total: string;
+  paymentMethod: 'CASH';
+  createdAt: string;
+}
+
+export interface SaleDetailData extends Omit<CashSaleData, 'userId'> {
+  user: { id: string; email: string };
+  movements: Array<{
+    id: string;
+    saleLineId: string;
+    product: { id: string; name: string; sku: string };
+    location: { id: string; name: string; code: string };
+    quantityChange: string;
+    resultingQuantity: string;
+    reference: string;
+    createdAt: string;
+  }>;
+}

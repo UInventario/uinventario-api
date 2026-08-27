@@ -5,7 +5,13 @@ import {
   PosIdempotencyConflictError,
   PosInsufficientStockError,
 } from './pos.errors';
-import { CashSaleData, PosCartQuoteResponse } from './pos.types';
+import { ListSalesDto } from './dto/list-sales.dto';
+import {
+  CashSaleData,
+  PosCartQuoteResponse,
+  SaleDetailData,
+  SaleSummaryData,
+} from './pos.types';
 
 interface SaleRow {
   id: string;
@@ -40,6 +46,156 @@ interface StockAllocation {
 @Injectable()
 export class SalesRepository {
   constructor(private readonly dataSource: DataSource) {}
+
+  async listSales(
+    tenantId: string,
+    branchId: string,
+    query: ListSalesDto,
+  ): Promise<{ items: SaleSummaryData[]; total: number }> {
+    const filters = ['s.tenant_id = ?', 's.branch_id = ?'];
+    const parameters: unknown[] = [tenantId, branchId];
+    if (query.dateFrom) {
+      filters.push('s.created_at >= ?');
+      parameters.push(`${query.dateFrom} 00:00:00`);
+    }
+    if (query.dateTo) {
+      filters.push('s.created_at < DATE_ADD(?, INTERVAL 1 DAY)');
+      parameters.push(`${query.dateTo} 00:00:00`);
+    }
+    if (query.cashRegisterId) {
+      filters.push('s.cash_register_id = ?');
+      parameters.push(query.cashRegisterId);
+    }
+    if (query.userId) {
+      filters.push('s.created_by_user_id = ?');
+      parameters.push(query.userId);
+    }
+    const where = filters.join(' AND ');
+    const offset = (query.page - 1) * query.pageSize;
+    const [rows, countRows] = await Promise.all([
+      this.dataSource.query<
+        Array<{
+          id: string;
+          receipt_number: string;
+          status: 'COMPLETED';
+          user_id: string;
+          user_email: string;
+          cash_register_id: string;
+          cash_register_name: string;
+          cash_register_code: string;
+          currency: string;
+          total: string;
+          created_at: Date | string;
+        }>
+      >(
+        `SELECT s.id, s.receipt_number, s.status,
+                u.id AS user_id, u.email AS user_email,
+                cr.id AS cash_register_id, cr.name AS cash_register_name,
+                cr.code AS cash_register_code, s.currency, s.total, s.created_at
+         FROM sales s
+         INNER JOIN users u ON u.id = s.created_by_user_id AND u.tenant_id = s.tenant_id
+         INNER JOIN cash_registers cr ON cr.id = s.cash_register_id AND cr.tenant_id = s.tenant_id
+         WHERE ${where}
+         ORDER BY s.created_at DESC, s.id DESC LIMIT ? OFFSET ?`,
+        [...parameters, query.pageSize, offset],
+      ),
+      this.dataSource.query<Array<{ total: number | string }>>(
+        `SELECT COUNT(*) AS total FROM sales s WHERE ${where}`,
+        parameters,
+      ),
+    ]);
+    return {
+      items: rows.map((row) => ({
+        id: row.id,
+        receiptNumber: row.receipt_number,
+        status: row.status,
+        user: { id: row.user_id, email: row.user_email },
+        cashRegister: {
+          id: row.cash_register_id,
+          name: row.cash_register_name,
+          code: row.cash_register_code,
+        },
+        currency: row.currency,
+        total: this.decimal(row.total, 2),
+        paymentMethod: 'CASH',
+        createdAt: new Date(row.created_at).toISOString(),
+      })),
+      total: Number(countRows[0]?.total ?? 0),
+    };
+  }
+
+  async getSaleDetail(
+    tenantId: string,
+    branchId: string,
+    saleId: string,
+  ): Promise<SaleDetailData | null> {
+    const keys = await this.dataSource.query<
+      Array<{ idempotency_key: string; user_email: string }>
+    >(
+      `SELECT s.idempotency_key, u.email AS user_email
+       FROM sales s
+       INNER JOIN users u ON u.id = s.created_by_user_id AND u.tenant_id = s.tenant_id
+       WHERE s.id = ? AND s.tenant_id = ? AND s.branch_id = ? LIMIT 1`,
+      [saleId, tenantId, branchId],
+    );
+    if (!keys[0]) return null;
+    const found = await this.findWithManager(
+      this.dataSource.manager,
+      tenantId,
+      keys[0].idempotency_key,
+    );
+    if (!found) return null;
+    const movements = await this.dataSource.query<
+      Array<{
+        id: string;
+        sale_line_id: string;
+        product_id: string;
+        product_name: string;
+        product_sku: string;
+        location_id: string;
+        location_name: string;
+        location_code: string;
+        quantity_change: string;
+        resulting_quantity: string;
+        reference: string;
+        created_at: Date | string;
+      }>
+    >(
+      `SELECT im.id, im.sale_line_id, p.id AS product_id,
+              p.name AS product_name, p.sku AS product_sku,
+              l.id AS location_id, l.name AS location_name, l.code AS location_code,
+              im.quantity_change, im.resulting_quantity, im.reference, im.created_at
+       FROM inventory_movements im
+       INNER JOIN products p ON p.id = im.product_id AND p.tenant_id = im.tenant_id
+       INNER JOIN locations l ON l.id = im.location_id AND l.tenant_id = im.tenant_id
+       WHERE im.tenant_id = ? AND im.sale_id = ? AND im.type = 'SALE'
+       ORDER BY im.created_at, im.id`,
+      [tenantId, saleId],
+    );
+    const { userId, ...sale } = found.sale;
+    return {
+      ...sale,
+      user: { id: userId, email: keys[0].user_email },
+      movements: movements.map((movement) => ({
+        id: movement.id,
+        saleLineId: movement.sale_line_id,
+        product: {
+          id: movement.product_id,
+          name: movement.product_name,
+          sku: movement.product_sku,
+        },
+        location: {
+          id: movement.location_id,
+          name: movement.location_name,
+          code: movement.location_code,
+        },
+        quantityChange: this.decimal(movement.quantity_change, 3),
+        resultingQuantity: this.decimal(movement.resulting_quantity, 3),
+        reference: movement.reference,
+        createdAt: new Date(movement.created_at).toISOString(),
+      })),
+    };
+  }
 
   async findByIdempotency(
     tenantId: string,
