@@ -30,6 +30,7 @@ import {
   OfflineCommandExecution,
   OfflineCommandResult,
 } from './offline-command.types';
+import { OFFLINE_FRESHNESS_POLICY_V1 } from './offline-sync-v1.contract';
 
 @Injectable()
 export class OfflineCommandService {
@@ -86,6 +87,7 @@ export class OfflineCommandService {
     correlationId: string,
   ): Promise<OfflineCommandExecution> {
     try {
+      this.assertFresh(command);
       if (command.kind === 'INVENTORY_MOVEMENT') {
         this.requirePermission(principal, 'INVENTORY_ADJUST');
         if (!principal.context.warehouse) throw new ForbiddenException();
@@ -234,6 +236,20 @@ export class OfflineCommandService {
       throw new ForbiddenException({
         code: 'OFFLINE_COMMAND_PERMISSION_DENIED',
         message: 'No tienes permiso para aplicar este comando.',
+      });
+    }
+  }
+
+  private assertFresh(command: OfflineCommandDto): void {
+    const ageSeconds =
+      (Date.now() - new Date(command.createdAt).getTime()) / 1000;
+    const ttl = OFFLINE_FRESHNESS_POLICY_V1.actionTtlSeconds[command.kind];
+    if (ageSeconds > ttl) {
+      throw new ConflictException({
+        code: 'OFFLINE_COMMAND_STALE',
+        maxAgeSeconds: ttl,
+        message:
+          'La operación excedió su vigencia offline y debe capturarse de nuevo.',
       });
     }
   }

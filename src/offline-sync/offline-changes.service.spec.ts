@@ -8,6 +8,7 @@ describe('OfflineChangesService', () => {
   const sessionId = 'server-session-id';
   const principal = {
     sessionId,
+    expiresAt: new Date(Date.now() + 60 * 60_000),
     user: {
       id: 'user-1',
       email: 'user@example.com',

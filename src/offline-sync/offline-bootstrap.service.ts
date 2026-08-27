@@ -7,6 +7,7 @@ import { OfflineBootstrapRepository } from './offline-bootstrap.repository';
 import {
   assertOfflineSyncPageSize,
   OFFLINE_SYNC_PROTOCOL_VERSION,
+  OFFLINE_FRESHNESS_POLICY_V1,
   OfflineBootstrapResponseV1,
   OfflineSyncScopeV1,
 } from './offline-sync-v1.contract';
@@ -99,6 +100,8 @@ export class OfflineBootstrapService {
     return {
       protocolVersion: OFFLINE_SYNC_PROTOCOL_VERSION,
       generatedAt: new Date().toISOString(),
+      sessionExpiresAt: principal.expiresAt.toISOString(),
+      freshnessPolicy: OFFLINE_FRESHNESS_POLICY_V1,
       scope,
       identity: {
         tenant: principal.tenant,

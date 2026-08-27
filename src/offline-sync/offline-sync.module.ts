@@ -9,6 +9,7 @@ import { InventoryModule } from '../inventory/inventory.module';
 import { PosModule } from '../pos/pos.module';
 import { OfflineCommandRepository } from './offline-command.repository';
 import { OfflineCommandService } from './offline-command.service';
+import { OfflineDeviceService } from './offline-device.service';
 
 @Module({
   imports: [SessionModule, InventoryModule, PosModule],
@@ -20,6 +21,7 @@ import { OfflineCommandService } from './offline-command.service';
     OfflineChangesService,
     OfflineCommandRepository,
     OfflineCommandService,
+    OfflineDeviceService,
   ],
 })
 export class OfflineSyncModule {}

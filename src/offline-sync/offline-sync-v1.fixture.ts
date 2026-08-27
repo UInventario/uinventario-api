@@ -13,6 +13,18 @@ export const OFFLINE_BOOTSTRAP_REQUEST_V1_FIXTURE = {
 export const OFFLINE_BOOTSTRAP_RESPONSE_V1_FIXTURE = {
   protocolVersion: OFFLINE_SYNC_PROTOCOL_VERSION,
   generatedAt: '2026-08-27T20:00:00.000Z',
+  sessionExpiresAt: '2026-08-28T20:00:00.000Z',
+  freshnessPolicy: {
+    version: 1,
+    maxClockSkewSeconds: 300,
+    catalogTtlSeconds: 86400,
+    permissionsTtlSeconds: 3600,
+    actionTtlSeconds: {
+      CASH_SALE: 900,
+      INVENTORY_COUNT: 14400,
+      INVENTORY_MOVEMENT: 3600,
+    },
+  },
   scope: {
     tenantId: '20000000-0000-4000-8000-000000000001',
     userId: '30000000-0000-4000-8000-000000000001',
