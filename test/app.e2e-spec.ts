@@ -1511,7 +1511,12 @@ describe('UInventario API (e2e)', () => {
                 product: { id: productId, sku: 'CAFE-STOCK', active: true },
                 availableQuantity: '14.000',
                 totalQuantity: '14.000',
-                states: [{ code: 'AVAILABLE', quantity: '14.000' }],
+                states: [
+                  { code: 'AVAILABLE', quantity: '14.000' },
+                  { code: 'RESERVED', quantity: '0.000' },
+                  { code: 'DAMAGED', quantity: '0.000' },
+                  { code: 'IN_TRANSIT', quantity: '0.000' },
+                ],
               },
             ],
             meta: {
@@ -1758,6 +1763,236 @@ describe('UInventario API (e2e)', () => {
           ({ responsible }) => responsible.email === registrationPayload.email,
         ),
       ).toBe(true);
+    });
+
+    it('reconciles stock states atomically and limits POS to available stock', async () => {
+      await registerAccount('inventory-states-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeInventoryOnboarding(registrationPayload.email, cookie);
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto por estado',
+          sku: 'STATE-1',
+          cost: '5.00',
+          price: '9.00',
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'state-initial-stock')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '10',
+          reason: 'Conteo inicial',
+        })
+        .expect(201);
+
+      const transitions = [
+        ['RESERVED', '3', 'Reserva operativa', 'STATE-RES-1'],
+        ['DAMAGED', '2', 'Cuarentena por daño', 'STATE-DMG-1'],
+        ['IN_TRANSIT', '1', 'Preparación de traslado', 'STATE-TRN-1'],
+      ] as const;
+      for (const [
+        index,
+        [toState, quantity, reason, reference],
+      ] of transitions.entries()) {
+        await request(app.getHttpServer())
+          .post('/api/v1/inventory/state-transitions')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', `state-transition-${index}`)
+          .send({
+            productId,
+            locationId: location.id,
+            fromState: 'AVAILABLE',
+            toState,
+            quantity,
+            reason,
+            reference,
+          })
+          .expect(201)
+          .expect(({ body }: { body: unknown }) => {
+            expect(body).toMatchObject({
+              data: {
+                type: 'STATE_TRANSITION',
+                quantityChange: '0.000',
+                quantity: '10.000',
+                stateTransition: {
+                  from: 'AVAILABLE',
+                  to: toState,
+                  quantity: `${quantity}.000`,
+                },
+              },
+            });
+          });
+      }
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/state-transitions')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'state-transition-0')
+        .send({
+          productId,
+          locationId: location.id,
+          fromState: 'AVAILABLE',
+          toState: 'RESERVED',
+          quantity: '3',
+          reason: 'Reserva operativa',
+          reference: 'STATE-RES-1',
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            meta: { idempotentReplay: true },
+            data: {
+              type: 'STATE_TRANSITION',
+              stateTransition: {
+                from: 'AVAILABLE',
+                to: 'RESERVED',
+                quantity: '3.000',
+              },
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/state-transitions')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'state-invalid-route')
+        .send({
+          productId,
+          locationId: location.id,
+          fromState: 'RESERVED',
+          toState: 'DAMAGED',
+          quantity: '1',
+          reason: 'Ruta inválida',
+          reference: 'STATE-INVALID',
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVALID_STOCK_STATE_TRANSITION');
+        });
+
+      const concurrent = await Promise.all(
+        ['state-concurrent-a', 'state-concurrent-b'].map((key) =>
+          request(app.getHttpServer())
+            .post('/api/v1/inventory/state-transitions')
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', key)
+            .send({
+              productId,
+              locationId: location.id,
+              fromState: 'AVAILABLE',
+              toState: 'RESERVED',
+              quantity: '3',
+              reason: 'Reserva concurrente',
+              reference: key,
+            }),
+        ),
+      );
+      expect(concurrent.map(({ status }) => status).sort()).toEqual([201, 409]);
+
+      const balance = await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/balance`)
+        .query({ locationId: location.id })
+        .set('Cookie', cookie)
+        .expect(200);
+      expect(balance.body).toMatchObject({
+        data: {
+          quantity: '10.000',
+          totalQuantity: '10.000',
+          availableQuantity: '1.000',
+          states: [
+            { code: 'AVAILABLE', quantity: '1.000' },
+            { code: 'RESERVED', quantity: '6.000' },
+            { code: 'DAMAGED', quantity: '2.000' },
+            { code: 'IN_TRANSIT', quantity: '1.000' },
+          ],
+        },
+      });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [{ productId, quantity: '2' }] })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INSUFFICIENT_STOCK');
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'state-sale-over-available')
+        .send({ lines: [{ productId, quantity: '2' }], cashReceived: '18.00' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INSUFFICIENT_STOCK');
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .query({ productId, type: 'STATE_TRANSITION' })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          const history = (
+            body as {
+              data: Array<{
+                reason: string;
+                direction: string;
+                responsible: { email: string };
+                stateTransition: unknown;
+              }>;
+            }
+          ).data;
+          const reservation = history.find(
+            ({ reason }) => reason === 'Reserva concurrente',
+          );
+          expect(reservation).toMatchObject({
+            direction: 'TRANSFER',
+            responsible: { email: registrationPayload.email },
+            stateTransition: {
+              from: 'AVAILABLE',
+              to: 'RESERVED',
+              quantity: '3.000',
+            },
+          });
+        });
+      const [invariant] = await dataSource.query<
+        Array<{
+          total: string;
+          available: string;
+          reserved: string;
+          damaged: string;
+          in_transit: string;
+          movements: number | string;
+        }>
+      >(
+        `SELECT quantity AS total, available_quantity AS available,
+                reserved_quantity AS reserved, damaged_quantity AS damaged,
+                in_transit_quantity AS in_transit,
+                (SELECT COUNT(*) FROM inventory_movements
+                 WHERE product_id = ? AND type = 'STATE_TRANSITION') AS movements
+         FROM inventory_balances WHERE product_id = ? AND location_id = ?`,
+        [productId, productId, location.id],
+      );
+      expect(Number(invariant.total)).toBe(
+        Number(invariant.available) +
+          Number(invariant.reserved) +
+          Number(invariant.damaged) +
+          Number(invariant.in_transit),
+      );
+      expect(Number(invariant.movements)).toBe(4);
     });
 
     it('rejects products and locations outside the active tenant', async () => {
@@ -2604,6 +2839,36 @@ describe('UInventario API (e2e)', () => {
           })
           .expect(404);
         expect(foreignMovement.body).toEqual(missingMovement.body);
+
+        const foreignTransition = await request(app.getHttpServer())
+          .post('/api/v1/inventory/state-transitions')
+          .set('Cookie', primary.cookie)
+          .set('Idempotency-Key', `tenant-state-rejected-${locationId}`)
+          .send({
+            productId,
+            locationId,
+            fromState: 'AVAILABLE',
+            toState: 'RESERVED',
+            quantity: '1',
+            reason: 'Intento ajeno',
+            reference: 'TENANT-STATE-ATTEMPT',
+          })
+          .expect(404);
+        const missingTransition = await request(app.getHttpServer())
+          .post('/api/v1/inventory/state-transitions')
+          .set('Cookie', primary.cookie)
+          .set('Idempotency-Key', `tenant-state-missing-${locationId}`)
+          .send({
+            productId: missingProduct,
+            locationId: missingLocation,
+            fromState: 'AVAILABLE',
+            toState: 'RESERVED',
+            quantity: '1',
+            reason: 'Intento inexistente',
+            reference: 'TENANT-STATE-MISSING',
+          })
+          .expect(404);
+        expect(foreignTransition.body).toEqual(missingTransition.body);
       }
       const foreignBalance = await request(app.getHttpServer())
         .get(`/api/v1/inventory/products/${foreign.productId}/balance`)
@@ -2792,6 +3057,24 @@ describe('UInventario API (e2e)', () => {
           quantity: '1',
           reason: 'Intento sin permiso',
           reference: 'DENIED-001',
+        })
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVENTORY_ACCESS_DENIED');
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/state-transitions')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'staff-state-transition-denied')
+        .send({
+          productId: randomUUID(),
+          locationId: randomUUID(),
+          fromState: 'AVAILABLE',
+          toState: 'RESERVED',
+          quantity: '1',
+          reason: 'Intento sin permiso',
+          reference: 'DENIED-STATE-001',
         })
         .expect(403)
         .expect(({ body }: { body: { code?: string } }) => {

@@ -6,11 +6,22 @@ export const INVENTORY_MOVEMENT_TYPES = [
   'LOSS',
   'DAMAGE',
   'ADJUSTMENT',
+  'STATE_TRANSITION',
   'SALE',
 ] as const;
 
 export type InventoryMovementType = (typeof INVENTORY_MOVEMENT_TYPES)[number];
-export type UserInventoryMovementType = Exclude<InventoryMovementType, 'SALE'>;
+export type UserInventoryMovementType = Exclude<
+  InventoryMovementType,
+  'STATE_TRANSITION' | 'SALE'
+>;
+export type InventoryStockState =
+  'AVAILABLE' | 'RESERVED' | 'DAMAGED' | 'IN_TRANSIT';
+
+export interface InventoryStateQuantity {
+  code: InventoryStockState;
+  quantity: string;
+}
 
 export interface InventoryLocationData {
   id: string;
@@ -22,6 +33,9 @@ export interface InventoryBalanceData {
   product: { id: string; name: string; sku: string };
   location: InventoryLocationData;
   quantity: string;
+  availableQuantity?: string;
+  totalQuantity?: string;
+  states?: InventoryStateQuantity[];
 }
 
 export interface InventoryMovementData extends InventoryBalanceData {
@@ -31,6 +45,11 @@ export interface InventoryMovementData extends InventoryBalanceData {
   reason: string;
   reference: string | null;
   createdAt: string;
+  stateTransition: {
+    from: InventoryStockState;
+    to: InventoryStockState;
+    quantity: string;
+  } | null;
 }
 
 export interface InventoryLocationsResponse {
@@ -51,7 +70,7 @@ export interface InventoryMovementResponse {
 export interface InventoryMovementHistoryItem {
   id: string;
   type: InventoryMovementType;
-  direction: 'IN' | 'OUT';
+  direction: 'IN' | 'OUT' | 'TRANSFER';
   quantityChange: string;
   resultingQuantity: string;
   reason: string;
@@ -65,6 +84,11 @@ export interface InventoryMovementHistoryItem {
     warehouse: { id: string; name: string };
   };
   responsible: { id: string; email: string };
+  stateTransition: {
+    from: InventoryStockState;
+    to: InventoryStockState;
+    quantity: string;
+  } | null;
 }
 
 export interface InventoryMovementListResponse {
@@ -85,7 +109,12 @@ export interface InventoryStockItem {
   product: { id: string; name: string; sku: string; active: boolean };
   availableQuantity: string;
   totalQuantity: string;
-  states: Array<{ code: 'AVAILABLE'; quantity: string }>;
+  states: InventoryStateQuantity[];
+}
+
+export interface InventoryStateTransitionResponse {
+  data: InventoryMovementData;
+  meta: { apiVersion: '1'; idempotentReplay: boolean };
 }
 
 export interface InventoryStockListResponse {

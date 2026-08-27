@@ -72,7 +72,7 @@ export class PosRepository {
       }>
     >(
       `SELECT p.id, p.name, p.sku, p.price, p.active,
-              COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.quantity ELSE 0 END), 0) AS available_quantity
+              COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.available_quantity ELSE 0 END), 0) AS available_quantity
        FROM products p
        LEFT JOIN inventory_balances ib ON ib.product_id = p.id AND ib.tenant_id = p.tenant_id
        LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id

@@ -13,6 +13,7 @@ import {
 import { SessionGuard } from '../auth/session/session.guard';
 import type { AuthenticatedRequest } from '../auth/session/session.types';
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
+import { CreateInventoryStateTransitionDto } from './dto/create-inventory-state-transition.dto';
 import { GetInventoryBalanceDto } from './dto/get-inventory-balance.dto';
 import { ListInventoryStockDto } from './dto/list-inventory-stock.dto';
 import { ListInventoryMovementsDto } from './dto/list-inventory-movements.dto';
@@ -92,6 +93,31 @@ export class InventoryController {
       tenantId: request.principal.tenant.id,
       actorUserId: request.principal.user.id,
       action: 'INVENTORY_MOVEMENT_CREATED',
+      entityType: 'INVENTORY_MOVEMENT',
+      entityId: result.data.id,
+      correlationId: request.requestId!,
+      deduplicate: true,
+    });
+    return result;
+  }
+
+  @Post('state-transitions')
+  async createStateTransition(
+    @Req() request: AuthenticatedRequest,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: CreateInventoryStateTransitionDto,
+  ) {
+    const result = await this.inventory.createStateTransition({
+      tenantId: request.principal.tenant.id,
+      warehouseId: request.principal.context.warehouse!.id,
+      userId: request.principal.user.id,
+      idempotencyKey,
+      dto,
+    });
+    await this.audit.record({
+      tenantId: request.principal.tenant.id,
+      actorUserId: request.principal.user.id,
+      action: 'INVENTORY_STATE_TRANSITION_CREATED',
       entityType: 'INVENTORY_MOVEMENT',
       entityId: result.data.id,
       correlationId: request.requestId!,

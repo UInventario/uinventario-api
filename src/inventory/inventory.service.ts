@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
+import { CreateInventoryStateTransitionDto } from './dto/create-inventory-state-transition.dto';
 import { ListInventoryStockDto } from './dto/list-inventory-stock.dto';
 import { ListInventoryMovementsDto } from './dto/list-inventory-movements.dto';
 import {
@@ -13,6 +14,8 @@ import {
   InsufficientStockError,
   InventoryTargetNotFoundError,
   MovementReferenceRequiredError,
+  InsufficientStockStateError,
+  InvalidStockStateTransitionError,
 } from './inventory.errors';
 import { InventoryRepository } from './inventory.repository';
 import {
@@ -21,6 +24,7 @@ import {
   InventoryMovementResponse,
   InventoryMovementListResponse,
   InventoryStockListResponse,
+  InventoryStateTransitionResponse,
 } from './inventory.types';
 
 @Injectable()
@@ -183,6 +187,57 @@ export class InventoryService {
         throw new ConflictException({
           code: 'INVALID_STOCK_QUANTITY',
           message: 'La cantidad es inválida o dejaría el saldo negativo.',
+        });
+      }
+      throw error;
+    }
+  }
+
+  async createStateTransition(input: {
+    tenantId: string;
+    warehouseId: string;
+    userId: string;
+    idempotencyKey: string | undefined;
+    dto: CreateInventoryStateTransitionDto;
+  }): Promise<InventoryStateTransitionResponse> {
+    if (
+      !input.idempotencyKey ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(input.idempotencyKey)
+    ) {
+      throw new BadRequestException({
+        code: 'INVALID_IDEMPOTENCY_KEY',
+        message:
+          'Idempotency-Key es obligatorio y debe tener entre 8 y 128 caracteres.',
+      });
+    }
+    try {
+      const result = await this.inventory.createStateTransition({
+        ...input,
+        idempotencyKey: input.idempotencyKey,
+      });
+      return {
+        data: result.movement,
+        meta: { apiVersion: '1', idempotentReplay: result.replay },
+      };
+    } catch (error) {
+      if (error instanceof InventoryTargetNotFoundError)
+        throw new NotFoundException();
+      if (error instanceof InvalidStockStateTransitionError) {
+        throw new BadRequestException({
+          code: 'INVALID_STOCK_STATE_TRANSITION',
+          message: 'La transición de estado solicitada no está permitida.',
+        });
+      }
+      if (error instanceof InsufficientStockStateError) {
+        throw new ConflictException({
+          code: 'INSUFFICIENT_STOCK_STATE',
+          message: 'El estado de origen no tiene cantidad suficiente.',
+        });
+      }
+      if (error instanceof IdempotencyConflictError) {
+        throw new ConflictException({
+          code: 'IDEMPOTENCY_KEY_REUSED',
+          message: 'La clave de idempotencia ya fue usada con otros datos.',
         });
       }
       throw error;
