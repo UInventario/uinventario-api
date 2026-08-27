@@ -39,3 +39,9 @@ export class InsufficientStockStateError extends Error {
     super('INSUFFICIENT_STOCK_STATE');
   }
 }
+
+export class InventoryCountConflictError extends Error {
+  constructor(readonly currentQuantity: string) {
+    super('INVENTORY_COUNT_CONFLICT');
+  }
+}

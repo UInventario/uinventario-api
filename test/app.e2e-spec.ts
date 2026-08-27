@@ -54,6 +54,7 @@ describe('UInventario API (e2e)', () => {
       'product_reservation_lines',
       'product_reservations',
       'customers',
+      'inventory_counts',
       'inventory_movements',
       'inventory_import_rows',
       'inventory_imports',
@@ -9284,9 +9285,10 @@ describe('UInventario API (e2e)', () => {
         payload: {
           productId,
           locationId,
-          type: 'INITIAL',
+          type: 'ENTRY',
           quantity: '3',
           reason: 'Comando offline inicial',
+          reference: 'OFFLINE-ENTRY-1',
         },
       };
       const first = await request(app.getHttpServer())
@@ -9578,6 +9580,113 @@ describe('UInventario API (e2e)', () => {
             },
           }),
         );
+
+      const countScopeA = { ...scope, deviceId: randomUUID() };
+      const countScopeB = { ...scope, deviceId: randomUUID() };
+      const countCommand = (
+        countScope: typeof scope,
+        countedQuantity: string,
+        reference: string,
+      ) => ({
+        protocolVersion: '1.0',
+        commandId: randomUUID(),
+        idempotencyKey: `offline-count-${randomUUID()}`,
+        scope: countScope,
+        sequence: 1,
+        createdAt: new Date().toISOString(),
+        kind: 'INVENTORY_COUNT',
+        payload: {
+          productId,
+          locationId,
+          snapshotQuantity: '2.000',
+          countedQuantity,
+          reason: 'Conteo capturado sin conexión',
+          reference,
+          capturedAt: new Date().toISOString(),
+        },
+      });
+      const concurrentCounts = await Promise.all([
+        request(app.getHttpServer())
+          .post('/api/v1/offline/commands/batch')
+          .set('Cookie', cookie)
+          .send({
+            commands: [countCommand(countScopeA, '4', 'COUNT-DEVICE-A')],
+          })
+          .expect(201),
+        request(app.getHttpServer())
+          .post('/api/v1/offline/commands/batch')
+          .set('Cookie', cookie)
+          .send({
+            commands: [countCommand(countScopeB, '3', 'COUNT-DEVICE-B')],
+          })
+          .expect(201),
+      ]);
+      const countResults = concurrentCounts.map(
+        (response) =>
+          (
+            response.body as {
+              data: {
+                results: Array<{
+                  status: string;
+                  error?: { details?: { code?: string } };
+                }>;
+              };
+            }
+          ).data.results[0],
+      );
+      expect(
+        countResults.filter(({ status }) => status === 'CONFIRMED'),
+      ).toHaveLength(1);
+      const countErrors = countResults.filter(
+        ({ status }) => status === 'ERROR',
+      );
+      expect(countErrors).toHaveLength(1);
+      expect(countErrors[0].error?.details?.code).toBe(
+        'INVENTORY_COUNT_CONFLICT',
+      );
+
+      const rejectedAdjustment = {
+        ...firstCommand,
+        commandId: randomUUID(),
+        idempotencyKey: `offline-adjustment-${randomUUID()}`,
+        scope: { ...scope, deviceId: randomUUID() },
+        sequence: 1,
+        payload: {
+          productId,
+          locationId,
+          type: 'ADJUSTMENT',
+          quantity: '-10',
+          reason: 'Ajuste absoluto no autorizado',
+          reference: 'COUNT-ABSOLUTE-DENIED',
+        },
+      };
+      const rejected = await request(app.getHttpServer())
+        .post('/api/v1/offline/commands/batch')
+        .set('Cookie', cookie)
+        .send({ commands: [rejectedAdjustment] })
+        .expect(201);
+      const rejectedReplay = await request(app.getHttpServer())
+        .post('/api/v1/offline/commands/batch')
+        .set('Cookie', cookie)
+        .send({ commands: [rejectedAdjustment] })
+        .expect(201);
+      expect(rejected.body).toMatchObject({
+        data: {
+          results: [
+            {
+              status: 'ERROR',
+              replay: false,
+              error: {
+                status: 400,
+                details: { code: 'INVALID_OFFLINE_COMMAND_PAYLOAD' },
+              },
+            },
+          ],
+        },
+      });
+      expect(rejectedReplay.body).toMatchObject({
+        data: { results: [{ status: 'ERROR', replay: true }] },
+      });
     });
   });
 

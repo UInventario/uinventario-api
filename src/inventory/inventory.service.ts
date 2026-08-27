@@ -13,6 +13,7 @@ import {
   InitialStockAlreadyExistsError,
   InsufficientStockError,
   InventoryTargetNotFoundError,
+  InventoryCountConflictError,
   MovementReferenceRequiredError,
   InsufficientStockStateError,
   InvalidStockStateTransitionError,
@@ -20,6 +21,8 @@ import {
 import { InventoryRepository } from './inventory.repository';
 import {
   InventoryBalanceResponse,
+  InventoryCountInput,
+  InventoryCountResponse,
   InventoryLocationsResponse,
   InventoryMovementResponse,
   InventoryMovementListResponse,
@@ -189,6 +192,59 @@ export class InventoryService {
         throw new ConflictException({
           code: 'INVALID_STOCK_QUANTITY',
           message: 'La cantidad es inválida o dejaría el saldo negativo.',
+        });
+      }
+      throw error;
+    }
+  }
+
+  async createCount(input: {
+    tenantId: string;
+    warehouseId: string;
+    userId: string;
+    idempotencyKey: string | undefined;
+    dto: InventoryCountInput;
+  }): Promise<InventoryCountResponse> {
+    if (
+      !input.idempotencyKey ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(input.idempotencyKey)
+    ) {
+      throw new BadRequestException({
+        code: 'INVALID_IDEMPOTENCY_KEY',
+        message:
+          'Idempotency-Key es obligatorio y debe tener entre 8 y 128 caracteres.',
+      });
+    }
+    try {
+      const result = await this.inventory.createCount({
+        ...input,
+        idempotencyKey: input.idempotencyKey,
+      });
+      return {
+        data: result.count,
+        meta: { apiVersion: '1', idempotentReplay: result.replay },
+      };
+    } catch (error) {
+      if (error instanceof InventoryTargetNotFoundError)
+        throw new NotFoundException();
+      if (error instanceof InventoryCountConflictError) {
+        throw new ConflictException({
+          code: 'INVENTORY_COUNT_CONFLICT',
+          currentQuantity: error.currentQuantity,
+          message:
+            'El saldo cambió desde la captura; revisa el conteo antes de reintentarlo.',
+        });
+      }
+      if (error instanceof IdempotencyConflictError) {
+        throw new ConflictException({
+          code: 'IDEMPOTENCY_KEY_REUSED',
+          message: 'La clave de idempotencia ya fue usada con otros datos.',
+        });
+      }
+      if (error instanceof InsufficientStockError) {
+        throw new ConflictException({
+          code: 'INVALID_STOCK_QUANTITY',
+          message: 'El conteo produciría un saldo total inválido.',
         });
       }
       throw error;
