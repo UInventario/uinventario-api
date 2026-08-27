@@ -12,10 +12,13 @@ import {
   InsufficientStockStateError,
   InvalidStockStateTransitionError,
   InventoryTargetNotFoundError,
+  InventoryCountConflictError,
   MovementReferenceRequiredError,
 } from './inventory.errors';
 import {
   InventoryBalanceData,
+  InventoryCountData,
+  InventoryCountInput,
   InventoryLocationData,
   InventoryMovementType,
   InventoryStockState,
@@ -42,6 +45,25 @@ interface MovementRow {
   from_state: InventoryStockState | null;
   to_state: InventoryStockState | null;
   state_quantity: string | null;
+}
+
+interface CountRow {
+  id: string;
+  snapshot_quantity: string;
+  counted_quantity: string;
+  variance_quantity: string;
+  reason: string;
+  reference: string;
+  device_captured_at: Date | string;
+  created_at: Date | string;
+  movement_id: string | null;
+  request_fingerprint: string;
+  product_id: string;
+  product_name: string;
+  product_sku: string;
+  location_id: string;
+  location_name: string;
+  location_code: string;
 }
 
 @Injectable()
@@ -628,6 +650,171 @@ export class InventoryRepository {
     }
   }
 
+  async createCount(
+    input: {
+      tenantId: string;
+      warehouseId: string;
+      userId: string;
+      idempotencyKey: string;
+      dto: InventoryCountInput;
+    },
+    attempt = 0,
+  ): Promise<{ count: InventoryCountData; replay: boolean }> {
+    const snapshotUnits = this.toUnits(input.dto.snapshotQuantity);
+    const countedUnits = this.toUnits(input.dto.countedQuantity);
+    const fingerprint = createHash('sha256')
+      .update(
+        JSON.stringify({
+          productId: input.dto.productId,
+          locationId: input.dto.locationId,
+          snapshotQuantity: this.fromUnits(snapshotUnits),
+          countedQuantity: this.fromUnits(countedUnits),
+          reason: input.dto.reason,
+          reference: input.dto.reference,
+          capturedAt: input.dto.capturedAt,
+        }),
+      )
+      .digest('hex');
+
+    try {
+      return await this.dataSource.transaction(
+        'READ COMMITTED',
+        async (manager) => {
+          const existing = await this.findCount(
+            manager,
+            input.tenantId,
+            input.idempotencyKey,
+          );
+          if (existing) {
+            if (existing.request_fingerprint !== fingerprint)
+              throw new IdempotencyConflictError();
+            return { count: this.toCount(existing), replay: true };
+          }
+          await this.assertTarget(
+            manager,
+            input.tenantId,
+            input.warehouseId,
+            input.dto.productId,
+            input.dto.locationId,
+          );
+          await manager.query(
+            `INSERT INTO inventory_balances (tenant_id, product_id, location_id, quantity)
+             VALUES (?, ?, ?, 0) ON DUPLICATE KEY UPDATE quantity = quantity`,
+            [input.tenantId, input.dto.productId, input.dto.locationId],
+          );
+          const [balance] = await manager.query<
+            Array<{ quantity: string; available_quantity: string }>
+          >(
+            `SELECT quantity, available_quantity FROM inventory_balances
+             WHERE tenant_id = ? AND product_id = ? AND location_id = ? FOR UPDATE`,
+            [input.tenantId, input.dto.productId, input.dto.locationId],
+          );
+          const replay = await this.findCount(
+            manager,
+            input.tenantId,
+            input.idempotencyKey,
+          );
+          if (replay) {
+            if (replay.request_fingerprint !== fingerprint)
+              throw new IdempotencyConflictError();
+            return { count: this.toCount(replay), replay: true };
+          }
+          const currentUnits = this.toUnits(balance.available_quantity);
+          if (currentUnits !== snapshotUnits) {
+            throw new InventoryCountConflictError(this.fromUnits(currentUnits));
+          }
+          const varianceUnits = countedUnits - currentUnits;
+          const resultingTotalUnits =
+            this.toUnits(balance.quantity) + varianceUnits;
+          if (resultingTotalUnits < 0n) throw new InsufficientStockError();
+
+          let movementId: string | null = null;
+          if (varianceUnits !== 0n) {
+            movementId = randomUUID();
+            const variance = this.fromUnits(varianceUnits);
+            const resultingTotal = this.fromUnits(resultingTotalUnits);
+            await manager.query(
+              `UPDATE inventory_balances
+               SET quantity = ?, available_quantity = ?
+               WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
+              [
+                resultingTotal,
+                this.fromUnits(countedUnits),
+                input.tenantId,
+                input.dto.productId,
+                input.dto.locationId,
+              ],
+            );
+            await manager.query(
+              `INSERT INTO inventory_movements
+                (id, tenant_id, product_id, location_id, type, quantity_change,
+                 resulting_quantity, reason, reference, idempotency_key,
+                 request_fingerprint, created_by_user_id)
+               VALUES (?, ?, ?, ?, 'ADJUSTMENT', ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                movementId,
+                input.tenantId,
+                input.dto.productId,
+                input.dto.locationId,
+                variance,
+                resultingTotal,
+                input.dto.reason,
+                input.dto.reference,
+                input.idempotencyKey,
+                fingerprint,
+                input.userId,
+              ],
+            );
+          }
+          await manager.query(
+            `INSERT INTO inventory_counts
+              (id, tenant_id, product_id, location_id, snapshot_quantity,
+               counted_quantity, variance_quantity, reason, reference,
+               device_captured_at, created_by_user_id, movement_id,
+               idempotency_key, request_fingerprint)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              randomUUID(),
+              input.tenantId,
+              input.dto.productId,
+              input.dto.locationId,
+              this.fromUnits(snapshotUnits),
+              this.fromUnits(countedUnits),
+              this.fromUnits(varianceUnits),
+              input.dto.reason,
+              input.dto.reference,
+              new Date(input.dto.capturedAt),
+              input.userId,
+              movementId,
+              input.idempotencyKey,
+              fingerprint,
+            ],
+          );
+          const count = await this.findCount(
+            manager,
+            input.tenantId,
+            input.idempotencyKey,
+          );
+          if (!count) throw new Error('CREATED_INVENTORY_COUNT_NOT_FOUND');
+          return { count: this.toCount(count), replay: false };
+        },
+      );
+    } catch (error) {
+      if (this.isTransactionConflict(error) && attempt < 2) {
+        return this.createCount(input, attempt + 1);
+      }
+      if (!this.isDuplicate(error)) throw error;
+      const count = await this.findCount(
+        this.dataSource.manager,
+        input.tenantId,
+        input.idempotencyKey,
+      );
+      if (!count || count.request_fingerprint !== fingerprint)
+        throw new IdempotencyConflictError();
+      return { count: this.toCount(count), replay: true };
+    }
+  }
+
   async createStateTransition(input: {
     tenantId: string;
     warehouseId: string;
@@ -813,6 +1000,27 @@ export class InventoryRepository {
     return rows[0] ?? null;
   }
 
+  private async findCount(
+    manager: EntityManager,
+    tenantId: string,
+    idempotencyKey: string,
+  ): Promise<CountRow | null> {
+    const rows = await manager.query<CountRow[]>(
+      `SELECT ic.id, ic.snapshot_quantity, ic.counted_quantity,
+              ic.variance_quantity, ic.reason, ic.reference,
+              ic.device_captured_at, ic.created_at, ic.movement_id,
+              ic.request_fingerprint,
+              p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
+              l.id AS location_id, l.name AS location_name, l.code AS location_code
+       FROM inventory_counts ic
+       INNER JOIN products p ON p.id = ic.product_id AND p.tenant_id = ic.tenant_id
+       INNER JOIN locations l ON l.id = ic.location_id AND l.tenant_id = ic.tenant_id
+       WHERE ic.tenant_id = ? AND ic.idempotency_key = ? LIMIT 1`,
+      [tenantId, idempotencyKey],
+    );
+    return rows[0] ?? null;
+  }
+
   private quantityChange(dto: CreateInventoryMovementDto): string {
     const units = this.toUnits(dto.quantity);
     if (units === 0n) throw new InsufficientStockError();
@@ -887,10 +1095,43 @@ export class InventoryRepository {
     };
   }
 
+  private toCount(row: CountRow): InventoryCountData {
+    return {
+      id: row.id,
+      snapshotQuantity: this.normalizeDecimal(row.snapshot_quantity),
+      countedQuantity: this.normalizeDecimal(row.counted_quantity),
+      varianceQuantity: this.normalizeDecimal(row.variance_quantity),
+      reason: row.reason,
+      reference: row.reference,
+      capturedAt: new Date(row.device_captured_at).toISOString(),
+      createdAt: new Date(row.created_at).toISOString(),
+      movementId: row.movement_id,
+      product: {
+        id: row.product_id,
+        name: row.product_name,
+        sku: row.product_sku,
+      },
+      location: {
+        id: row.location_id,
+        name: row.location_name,
+        code: row.location_code,
+      },
+    };
+  }
+
   private isDuplicate(error: unknown): boolean {
     return (
       error instanceof QueryFailedError &&
       (error.driverError as { errno?: number }).errno === 1062
+    );
+  }
+
+  private isTransactionConflict(error: unknown): boolean {
+    return (
+      error instanceof QueryFailedError &&
+      [1205, 1213].includes(
+        (error.driverError as { errno?: number }).errno ?? 0,
+      )
     );
   }
 }

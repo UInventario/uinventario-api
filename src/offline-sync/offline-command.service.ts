@@ -12,7 +12,6 @@ import { createHash } from 'node:crypto';
 import type { SessionIdentity } from '../auth/session/session.types';
 import type { AppPermission } from '../auth/authorization/authorization.types';
 import { AuditService } from '../audit/audit.service';
-import { CreateInventoryMovementDto } from '../inventory/dto/create-inventory-movement.dto';
 import { InventoryService } from '../inventory/inventory.service';
 import { PosService } from '../pos/pos.service';
 import {
@@ -20,6 +19,8 @@ import {
   OfflineCommandDto,
 } from './dto/offline-command-batch.dto';
 import { OfflineCashSaleCommandDto } from './dto/offline-cash-sale-command.dto';
+import { OfflineInventoryCountCommandDto } from './dto/offline-inventory-count-command.dto';
+import { OfflineInventoryMovementCommandDto } from './dto/offline-inventory-movement-command.dto';
 import {
   OfflineCommandConflictError,
   OfflineCommandSequenceError,
@@ -89,7 +90,7 @@ export class OfflineCommandService {
         this.requirePermission(principal, 'INVENTORY_ADJUST');
         if (!principal.context.warehouse) throw new ForbiddenException();
         const payload = await this.payload(
-          CreateInventoryMovementDto,
+          OfflineInventoryMovementCommandDto,
           command.payload,
         );
         const response = await this.inventory.createMovement({
@@ -110,6 +111,39 @@ export class OfflineCommandService {
           after: {
             commandId: command.commandId,
             deviceId: command.scope.deviceId,
+          },
+        });
+        return { status: 'CONFIRMED', result: response };
+      }
+      if (command.kind === 'INVENTORY_COUNT') {
+        this.requirePermission(principal, 'INVENTORY_COUNT');
+        if (!principal.context.warehouse) throw new ForbiddenException();
+        const payload = await this.payload(
+          OfflineInventoryCountCommandDto,
+          command.payload,
+        );
+        const response = await this.inventory.createCount({
+          tenantId: principal.tenant.id,
+          warehouseId: principal.context.warehouse.id,
+          userId: principal.user.id,
+          idempotencyKey: command.idempotencyKey,
+          dto: payload,
+        });
+        await this.audit.record({
+          tenantId: principal.tenant.id,
+          actorUserId: principal.user.id,
+          action: 'OFFLINE_INVENTORY_COUNT_CONFIRMED',
+          entityType: 'INVENTORY_COUNT',
+          entityId: response.data.id,
+          correlationId,
+          deduplicate: true,
+          after: {
+            commandId: command.commandId,
+            deviceId: command.scope.deviceId,
+            snapshotQuantity: payload.snapshotQuantity,
+            countedQuantity: payload.countedQuantity,
+            reference: payload.reference,
+            capturedAt: payload.capturedAt,
           },
         });
         return { status: 'CONFIRMED', result: response };

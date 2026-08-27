@@ -90,6 +90,35 @@ export interface InventoryMovementResponse {
   meta: { apiVersion: '1'; idempotentReplay: boolean };
 }
 
+export interface InventoryCountData {
+  id: string;
+  product: { id: string; name: string; sku: string };
+  location: InventoryLocationData;
+  snapshotQuantity: string;
+  countedQuantity: string;
+  varianceQuantity: string;
+  reason: string;
+  reference: string;
+  capturedAt: string;
+  createdAt: string;
+  movementId: string | null;
+}
+
+export interface InventoryCountInput {
+  productId: string;
+  locationId: string;
+  snapshotQuantity: string;
+  countedQuantity: string;
+  reason: string;
+  reference: string;
+  capturedAt: string;
+}
+
+export interface InventoryCountResponse {
+  data: InventoryCountData;
+  meta: { apiVersion: '1'; idempotentReplay: boolean };
+}
+
 export interface InventoryMovementHistoryItem {
   id: string;
   type: InventoryMovementType;
