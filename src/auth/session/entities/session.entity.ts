@@ -41,6 +41,14 @@ export class SessionEntity {
   })
   activeWarehouseId!: string | null;
 
+  @Column({
+    name: 'active_cash_register_id',
+    type: 'char',
+    length: 36,
+    nullable: true,
+  })
+  activeCashRegisterId!: string | null;
+
   @CreateDateColumn({ name: 'created_at', type: 'datetime', precision: 6 })
   createdAt!: Date;
 }

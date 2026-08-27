@@ -31,6 +31,7 @@ describe('UInventario API (e2e)', () => {
   async function resetIdentityData(): Promise<void> {
     await dataSource.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const table of [
+      'cash_registers',
       'locations',
       'warehouses',
       'branches',
@@ -594,6 +595,120 @@ describe('UInventario API (e2e)', () => {
                 branch: { name: payload.branchName },
                 warehouse: { name: payload.warehouseName },
               },
+            },
+          });
+        });
+    });
+  });
+
+  describe('initial cash register onboarding', () => {
+    beforeEach(resetIdentityData);
+
+    it('finishes onboarding once with a tenant-scoped operational context', async () => {
+      await registerAccount('initial-register-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      const existingDeviceCookie = await createPersistedSession(
+        registrationPayload.email,
+      );
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Tienda Central, S.A. de C.V.',
+          tradeName: 'Tienda Central',
+          countryCode: 'MX',
+        })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Principal' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INITIAL_LOCATION_NOT_CONFIGURED');
+        });
+
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Sucursal Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Principal',
+          locationName: 'UbicaciÃ³n General',
+        })
+        .expect(200);
+
+      const attempts = await Promise.all([
+        request(app.getHttpServer())
+          .put('/api/v1/onboarding/initial-cash-register')
+          .set('Cookie', cookie)
+          .send({ name: 'Caja Principal' }),
+        request(app.getHttpServer())
+          .put('/api/v1/onboarding/initial-cash-register')
+          .set('Cookie', cookie)
+          .send({ name: 'Caja Principal' }),
+      ]);
+      expect(attempts.map(({ status }) => status)).toEqual([200, 200]);
+      expect(attempts[0].body).toEqual(attempts[1].body);
+      expect(attempts[0].body).toMatchObject({
+        data: {
+          cashRegister: { name: 'Caja Principal', code: 'MAIN' },
+          branch: { name: 'Sucursal Principal' },
+          progress: {
+            currentStep: 'COMPLETE',
+            completedSteps: ['COMPANY', 'BRANCH', 'REGISTER'],
+          },
+        },
+      });
+
+      const [state] = await dataSource.query<
+        Array<{ cash_registers: number | string; completed: number | string }>
+      >(`SELECT (SELECT COUNT(*) FROM cash_registers) AS cash_registers,
+                (SELECT COUNT(*) FROM tenants WHERE onboarding_completed_at IS NOT NULL) AS completed`);
+      expect(Number(state.cash_registers)).toBe(1);
+      expect(Number(state.completed)).toBe(1);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              user: {
+                roles: ['ADMIN'],
+                permissions: [
+                  'TENANT_MANAGE',
+                  'PRODUCTS_MANAGE',
+                  'STOCK_MANAGE',
+                  'SALES_MANAGE',
+                ],
+              },
+              context: {
+                branch: { name: 'Sucursal Principal' },
+                warehouse: { name: 'Bodega Principal' },
+                cashRegister: { name: 'Caja Principal', code: 'MAIN' },
+              },
+              nextStep: 'APPLICATION',
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Cookie', existingDeviceCookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              context: {
+                branch: { name: 'Sucursal Principal' },
+                warehouse: { name: 'Bodega Principal' },
+                cashRegister: { name: 'Caja Principal' },
+              },
+              nextStep: 'APPLICATION',
             },
           });
         });

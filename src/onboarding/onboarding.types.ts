@@ -26,3 +26,17 @@ export interface InitialLocationResponse {
   data: InitialLocationData | null;
   meta: { apiVersion: '1' };
 }
+
+export interface InitialCashRegisterData {
+  cashRegister: { id: string; name: string; code: string };
+  branch: { id: string; name: string };
+  progress: {
+    currentStep: 'COMPLETE';
+    completedSteps: ['COMPANY', 'BRANCH', 'REGISTER'];
+  };
+}
+
+export interface InitialCashRegisterResponse {
+  data: InitialCashRegisterData | null;
+  meta: { apiVersion: '1' };
+}

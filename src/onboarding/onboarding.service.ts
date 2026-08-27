@@ -4,10 +4,12 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigureCompanyDto } from './dto/configure-company.dto';
+import { ConfigureInitialCashRegisterDto } from './dto/configure-initial-cash-register.dto';
 import { ConfigureInitialLocationDto } from './dto/configure-initial-location.dto';
 import { CompanyProfile, OnboardingRepository } from './onboarding.repository';
 import {
   CompanyOnboardingResponse,
+  InitialCashRegisterResponse,
   InitialLocationResponse,
 } from './onboarding.types';
 
@@ -61,6 +63,46 @@ export class OnboardingService {
           code: 'COMPANY_NOT_CONFIGURED',
           message: 'Configura la empresa antes de crear la sucursal.',
         });
+      }
+      throw error;
+    }
+  }
+
+  async getInitialCashRegister(
+    tenantId: string,
+  ): Promise<InitialCashRegisterResponse> {
+    return {
+      data: await this.onboarding.findInitialCashRegister(tenantId),
+      meta: { apiVersion: '1' },
+    };
+  }
+
+  async configureInitialCashRegister(
+    tenantId: string,
+    sessionId: string,
+    dto: ConfigureInitialCashRegisterDto,
+  ): Promise<InitialCashRegisterResponse> {
+    try {
+      return {
+        data: await this.onboarding.createInitialCashRegister(
+          tenantId,
+          sessionId,
+          dto,
+        ),
+        meta: { apiVersion: '1' },
+      };
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === 'INITIAL_LOCATION_NOT_CONFIGURED'
+      ) {
+        throw new ConflictException({
+          code: 'INITIAL_LOCATION_NOT_CONFIGURED',
+          message: 'Configura la sucursal y la bodega antes de crear la caja.',
+        });
+      }
+      if (error instanceof Error && error.message === 'TENANT_NOT_FOUND') {
+        throw new NotFoundException();
       }
       throw error;
     }

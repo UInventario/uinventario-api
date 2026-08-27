@@ -18,6 +18,9 @@ interface IdentityRow {
   branch_name: string | null;
   warehouse_id: string | null;
   warehouse_name: string | null;
+  cash_register_id: string | null;
+  cash_register_name: string | null;
+  cash_register_code: string | null;
 }
 
 export interface LoginIdentity extends Omit<
@@ -47,15 +50,19 @@ export class SessionRepository {
           b.name AS branch_name,
           w.id AS warehouse_id,
           w.name AS warehouse_name,
+          cr.id AS cash_register_id,
+          cr.name AS cash_register_name,
+          cr.code AS cash_register_code,
           GROUP_CONCAT(r.code ORDER BY r.code) AS roles
         FROM users u
         INNER JOIN tenants t ON t.id = u.tenant_id
         LEFT JOIN branches b ON b.tenant_id = t.id AND b.onboarding_key = 'INITIAL'
         LEFT JOIN warehouses w ON w.tenant_id = t.id AND w.branch_id = b.id AND w.onboarding_key = 'INITIAL'
+        LEFT JOIN cash_registers cr ON cr.tenant_id = t.id AND cr.branch_id = b.id AND cr.onboarding_key = 'INITIAL'
         LEFT JOIN user_roles ur ON ur.user_id = u.id
         LEFT JOIN roles r ON r.id = ur.role_id
         WHERE u.normalized_email = ?
-        GROUP BY u.id, u.email, u.password_hash, t.id, t.name, t.onboarding_completed_at, b.id, b.name, w.id, w.name
+        GROUP BY u.id, u.email, u.password_hash, t.id, t.name, t.onboarding_completed_at, b.id, b.name, w.id, w.name, cr.id, cr.name, cr.code
         LIMIT 1
       `,
       [normalizedEmail],
@@ -71,6 +78,7 @@ export class SessionRepository {
         id: row.user_id,
         email: row.email,
         roles: this.parseRoles(row.roles),
+        permissions: this.permissionsFor(row.roles),
       },
       tenant: { id: row.tenant_id, name: row.tenant_name },
       context: this.toContext(row),
@@ -85,6 +93,7 @@ export class SessionRepository {
     expiresAt: Date;
     activeBranchId: string | null;
     activeWarehouseId: string | null;
+    activeCashRegisterId: string | null;
   }): Promise<string> {
     const id = randomUUID();
     await this.dataSource.manager.insert(SessionEntity, {
@@ -96,6 +105,7 @@ export class SessionRepository {
       revokedAt: null,
       activeBranchId: input.activeBranchId,
       activeWarehouseId: input.activeWarehouseId,
+      activeCashRegisterId: input.activeCashRegisterId,
     });
     return id;
   }
@@ -118,16 +128,32 @@ export class SessionRepository {
           b.name AS branch_name,
           w.id AS warehouse_id,
           w.name AS warehouse_name,
+          cr.id AS cash_register_id,
+          cr.name AS cash_register_name,
+          cr.code AS cash_register_code,
           GROUP_CONCAT(r.code ORDER BY r.code) AS roles
         FROM sessions s
         INNER JOIN users u ON u.id = s.user_id AND u.tenant_id = s.tenant_id
         INNER JOIN tenants t ON t.id = s.tenant_id
-        LEFT JOIN branches b ON b.id = s.active_branch_id AND b.tenant_id = s.tenant_id
-        LEFT JOIN warehouses w ON w.id = s.active_warehouse_id AND w.tenant_id = s.tenant_id
+        LEFT JOIN branches b ON b.id = COALESCE(
+          s.active_branch_id,
+          (SELECT initial_branch.id FROM branches initial_branch
+           WHERE initial_branch.tenant_id = s.tenant_id AND initial_branch.onboarding_key = 'INITIAL' LIMIT 1)
+        ) AND b.tenant_id = s.tenant_id
+        LEFT JOIN warehouses w ON w.id = COALESCE(
+          s.active_warehouse_id,
+          (SELECT initial_warehouse.id FROM warehouses initial_warehouse
+           WHERE initial_warehouse.tenant_id = s.tenant_id AND initial_warehouse.onboarding_key = 'INITIAL' LIMIT 1)
+        ) AND w.tenant_id = s.tenant_id AND w.branch_id = b.id
+        LEFT JOIN cash_registers cr ON cr.id = COALESCE(
+          s.active_cash_register_id,
+          (SELECT initial_register.id FROM cash_registers initial_register
+           WHERE initial_register.tenant_id = s.tenant_id AND initial_register.onboarding_key = 'INITIAL' LIMIT 1)
+        ) AND cr.tenant_id = s.tenant_id AND cr.branch_id = b.id
         LEFT JOIN user_roles ur ON ur.user_id = u.id
         LEFT JOIN roles r ON r.id = ur.role_id AND r.tenant_id = s.tenant_id
         WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?
-        GROUP BY s.id, u.id, u.email, t.id, t.name, t.onboarding_completed_at, b.id, b.name, w.id, w.name
+        GROUP BY s.id, u.id, u.email, t.id, t.name, t.onboarding_completed_at, b.id, b.name, w.id, w.name, cr.id, cr.name, cr.code
         LIMIT 1
       `,
       [tokenHash, now],
@@ -144,6 +170,7 @@ export class SessionRepository {
         id: row.user_id,
         email: row.email,
         roles: this.parseRoles(row.roles),
+        permissions: this.permissionsFor(row.roles),
       },
       tenant: { id: row.tenant_id, name: row.tenant_name },
       context: this.toContext(row),
@@ -185,6 +212,12 @@ export class SessionRepository {
     return roles ? roles.split(',') : [];
   }
 
+  private permissionsFor(roles: string | null): string[] {
+    return this.parseRoles(roles).includes('ADMIN')
+      ? ['TENANT_MANAGE', 'PRODUCTS_MANAGE', 'STOCK_MANAGE', 'SALES_MANAGE']
+      : [];
+  }
+
   private toContext(row: IdentityRow): SessionIdentity['context'] {
     return {
       branch:
@@ -194,6 +227,14 @@ export class SessionRepository {
       warehouse:
         row.warehouse_id && row.warehouse_name
           ? { id: row.warehouse_id, name: row.warehouse_name }
+          : null,
+      cashRegister:
+        row.cash_register_id && row.cash_register_name && row.cash_register_code
+          ? {
+              id: row.cash_register_id,
+              name: row.cash_register_name,
+              code: row.cash_register_code,
+            }
           : null,
     };
   }

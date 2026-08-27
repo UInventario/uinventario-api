@@ -2,8 +2,12 @@ import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { DataSource, QueryRunner } from 'typeorm';
 import { TenantEntity } from '../tenancy/entities/tenant.entity';
+import { ConfigureInitialCashRegisterDto } from './dto/configure-initial-cash-register.dto';
 import { ConfigureInitialLocationDto } from './dto/configure-initial-location.dto';
-import { InitialLocationData } from './onboarding.types';
+import {
+  InitialCashRegisterData,
+  InitialLocationData,
+} from './onboarding.types';
 
 interface InitialLocationRow {
   branch_id: string;
@@ -14,6 +18,14 @@ interface InitialLocationRow {
   location_id: string;
   location_name: string;
   location_code: string;
+}
+
+interface InitialCashRegisterRow {
+  cash_register_id: string;
+  cash_register_name: string;
+  cash_register_code: string;
+  branch_id: string;
+  branch_name: string;
 }
 
 export interface CompanyProfile {
@@ -139,6 +151,89 @@ export class OnboardingRepository {
     }
   }
 
+  async findInitialCashRegister(
+    tenantId: string,
+  ): Promise<InitialCashRegisterData | null> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    try {
+      return await this.findInitialCashRegisterWithRunner(
+        queryRunner,
+        tenantId,
+      );
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async createInitialCashRegister(
+    tenantId: string,
+    sessionId: string,
+    dto: ConfigureInitialCashRegisterDto,
+  ): Promise<InitialCashRegisterData> {
+    const queryRunner = this.dataSource.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+    try {
+      const tenantRows = (await queryRunner.query(
+        'SELECT id FROM tenants WHERE id = ? FOR UPDATE',
+        [tenantId],
+      )) as Array<{ id: string }>;
+      if (!tenantRows[0]) throw new Error('TENANT_NOT_FOUND');
+
+      const location = await this.findInitialLocationWithRunner(
+        queryRunner,
+        tenantId,
+      );
+      if (!location) throw new Error('INITIAL_LOCATION_NOT_CONFIGURED');
+
+      let initial = await this.findInitialCashRegisterWithRunner(
+        queryRunner,
+        tenantId,
+      );
+      if (!initial) {
+        const cashRegisterId = randomUUID();
+        await queryRunner.query(
+          `INSERT INTO cash_registers (id, tenant_id, branch_id, name, code, onboarding_key)
+           VALUES (?, ?, ?, ?, 'MAIN', 'INITIAL')`,
+          [cashRegisterId, tenantId, location.branch.id, dto.name],
+        );
+        initial = {
+          cashRegister: { id: cashRegisterId, name: dto.name, code: 'MAIN' },
+          branch: { id: location.branch.id, name: location.branch.name },
+          progress: {
+            currentStep: 'COMPLETE',
+            completedSteps: ['COMPANY', 'BRANCH', 'REGISTER'],
+          },
+        };
+      }
+
+      await queryRunner.query(
+        'UPDATE tenants SET onboarding_completed_at = COALESCE(onboarding_completed_at, CURRENT_TIMESTAMP(6)) WHERE id = ?',
+        [tenantId],
+      );
+      await queryRunner.query(
+        `UPDATE sessions
+         SET active_branch_id = ?, active_warehouse_id = ?, active_cash_register_id = ?
+         WHERE id = ? AND tenant_id = ?`,
+        [
+          location.branch.id,
+          location.warehouse.id,
+          initial.cashRegister.id,
+          sessionId,
+          tenantId,
+        ],
+      );
+      await queryRunner.commitTransaction();
+      return initial;
+    } catch (error) {
+      await queryRunner.rollbackTransaction();
+      throw error;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
   private async findInitialLocationWithRunner(
     queryRunner: QueryRunner,
     tenantId: string,
@@ -170,6 +265,34 @@ export class OnboardingRepository {
       progress: {
         currentStep: 'REGISTER',
         completedSteps: ['COMPANY', 'BRANCH'],
+      },
+    };
+  }
+
+  private async findInitialCashRegisterWithRunner(
+    queryRunner: QueryRunner,
+    tenantId: string,
+  ): Promise<InitialCashRegisterData | null> {
+    const rows = (await queryRunner.query(
+      `SELECT cr.id AS cash_register_id, cr.name AS cash_register_name,
+              cr.code AS cash_register_code, b.id AS branch_id, b.name AS branch_name
+       FROM cash_registers cr
+       INNER JOIN branches b ON b.id = cr.branch_id AND b.tenant_id = cr.tenant_id
+       WHERE cr.tenant_id = ? AND cr.onboarding_key = 'INITIAL' LIMIT 1`,
+      [tenantId],
+    )) as InitialCashRegisterRow[];
+    const [row] = rows;
+    if (!row) return null;
+    return {
+      cashRegister: {
+        id: row.cash_register_id,
+        name: row.cash_register_name,
+        code: row.cash_register_code,
+      },
+      branch: { id: row.branch_id, name: row.branch_name },
+      progress: {
+        currentStep: 'COMPLETE',
+        completedSteps: ['COMPANY', 'BRANCH', 'REGISTER'],
       },
     };
   }
