@@ -32,6 +32,13 @@ export interface CatalogOptionsResponse {
   meta: { apiVersion: '1' };
 }
 
+export interface CatalogClassificationData {
+  id: string;
+  name: string;
+  active: boolean;
+  productCount: number;
+}
+
 export interface ProductListResponse {
   data: ProductData[];
   meta: {

@@ -1,10 +1,12 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { CatalogRepository } from './catalog.repository';
 import {
+  CatalogClassificationConflictError,
   ProductIdentifierConflictError,
   ProductVersionConflictError,
 } from './catalog.errors';
@@ -17,6 +19,10 @@ import {
 import { CreateProductDto } from './dto/create-product.dto';
 import { ListProductsDto } from './dto/list-products.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
+import {
+  CatalogClassificationKind,
+  UpdateCatalogClassificationDto,
+} from './dto/catalog-classification.dto';
 
 @Injectable()
 export class CatalogService {
@@ -118,6 +124,68 @@ export class CatalogService {
     return { data: retirement, meta: { apiVersion: '1' } };
   }
 
+  listClassifications(
+    tenantId: string,
+    kind: CatalogClassificationKind,
+    includeInactive: boolean,
+  ) {
+    return this.catalog.listClassifications(tenantId, kind, includeInactive);
+  }
+
+  async createClassification(
+    tenantId: string,
+    kind: CatalogClassificationKind,
+    name: string,
+  ) {
+    this.assertClassificationName(kind, name);
+    try {
+      return await this.catalog.createClassification(tenantId, kind, name);
+    } catch (error) {
+      this.mapClassificationError(error);
+    }
+  }
+
+  async updateClassification(
+    tenantId: string,
+    kind: CatalogClassificationKind,
+    id: string,
+    dto: UpdateCatalogClassificationDto,
+  ) {
+    if (dto.name) this.assertClassificationName(kind, dto.name);
+    try {
+      const result = await this.catalog.updateClassification(
+        tenantId,
+        kind,
+        id,
+        dto,
+      );
+      if (!result) throw new NotFoundException();
+      return result;
+    } catch (error) {
+      this.mapClassificationError(error);
+    }
+  }
+
+  async deactivateClassification(
+    tenantId: string,
+    kind: CatalogClassificationKind,
+    id: string,
+    replacementId?: string,
+  ) {
+    try {
+      const result = await this.catalog.deactivateClassification(
+        tenantId,
+        kind,
+        id,
+        replacementId,
+      );
+      if (!result) throw new NotFoundException();
+      return result;
+    } catch (error) {
+      this.mapClassificationError(error);
+    }
+  }
+
   private throwIdentifierConflict(
     error: ProductIdentifierConflictError,
   ): never {
@@ -130,5 +198,28 @@ export class CatalogService {
           ? 'Ya existe un producto con ese SKU en la empresa.'
           : 'Ya existe un producto con ese código de barras en la empresa.',
     });
+  }
+
+  private assertClassificationName(
+    kind: CatalogClassificationKind,
+    name: string,
+  ): void {
+    if (kind === CatalogClassificationKind.CATEGORIES && name.length > 80) {
+      throw new BadRequestException({
+        code: 'CATEGORY_NAME_TOO_LONG',
+        message: 'La categoría admite hasta 80 caracteres.',
+      });
+    }
+  }
+
+  private mapClassificationError(error: unknown): never {
+    if (error instanceof CatalogClassificationConflictError) {
+      throw new ConflictException({
+        code: 'CATALOG_CLASSIFICATION_CONFLICT',
+        message:
+          'Ya existe ese nombre o la reasignación seleccionada no es válida.',
+      });
+    }
+    throw error;
   }
 }
