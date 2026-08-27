@@ -51,6 +51,7 @@ export class SessionService {
       expiresAt,
       activeBranchId: identity.context.branch?.id ?? null,
       activeWarehouseId: identity.context.warehouse?.id ?? null,
+      activeCashRegisterId: identity.context.cashRegister?.id ?? null,
     });
 
     return {
