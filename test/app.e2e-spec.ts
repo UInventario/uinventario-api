@@ -9779,10 +9779,103 @@ describe('UInventario API (e2e)', () => {
           expect(body).toMatchObject({ code: 'OFFLINE_DEVICE_REVOKED' }),
         );
 
+      const refreshedCookie = await createPersistedSession(payload.email);
+      await request(app.getHttpServer())
+        .get('/api/v1/offline/bootstrap')
+        .set('Cookie', refreshedCookie)
+        .query({ deviceId: revokedDeviceId, pageSize: 500 })
+        .expect(200);
+      const deviceHealth = await request(app.getHttpServer())
+        .get('/api/v1/offline/devices')
+        .set('Cookie', refreshedCookie)
+        .expect(200);
+      const deviceHealthBody = deviceHealth.body as {
+        data: Array<{
+          deviceId: string;
+          user: { id: string; email: string };
+          health: string;
+          revokedAt: string | null;
+          bootstrapRequiredAt: string | null;
+          cursorFingerprint: string | null;
+          correlationId: string | null;
+          metrics: Record<string, number | string | null>;
+        }>;
+      };
+      const reauthorized = deviceHealthBody.data.find(
+        ({ deviceId }) => deviceId === revokedDeviceId,
+      );
+      expect(reauthorized).toBeDefined();
+      expect(reauthorized?.user).toEqual({
+        id: identity.user.id,
+        email: payload.email,
+      });
+      expect(reauthorized?.health).toBe('HEALTHY');
+      expect(reauthorized?.revokedAt).toBeNull();
+      expect(reauthorized?.bootstrapRequiredAt).toBeNull();
+      expect(reauthorized?.cursorFingerprint).toMatch(/^[a-f0-9]{12}$/);
+      expect(typeof reauthorized?.correlationId).toBe('string');
+      expect(reauthorized?.metrics).toEqual({
+        pending: 0,
+        errors: 0,
+        conflicts: 0,
+        retries: 0,
+        oldestPendingAt: null,
+      });
+      expect(JSON.stringify(deviceHealthBody)).not.toMatch(
+        /request_fingerprint|result_json|error_json|payload/i,
+      );
+      const isolatedPayload = {
+        organizationName: 'Otro tenant offline',
+        email: 'otro-offline@example.com',
+        password: 'Otro-Offline-2026!',
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'other-offline-health-registration')
+        .send(isolatedPayload)
+        .expect(201);
+      const isolatedDeviceId = randomUUID();
+      const [isolatedIdentity] = await dataSource.query<
+        Array<{ user_id: string; tenant_id: string }>
+      >(
+        'SELECT id AS user_id, tenant_id FROM users WHERE normalized_email = ?',
+        [isolatedPayload.email],
+      );
+      await dataSource.query(
+        `INSERT INTO offline_devices (tenant_id, user_id, device_id)
+         VALUES (?, ?, ?)`,
+        [
+          isolatedIdentity.tenant_id,
+          isolatedIdentity.user_id,
+          isolatedDeviceId,
+        ],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/offline/devices')
+        .set('Cookie', refreshedCookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: Array<{ deviceId: string }> } }) => {
+          expect(
+            body.data.some(({ deviceId }) => deviceId === isolatedDeviceId),
+          ).toBe(false);
+        });
+      const [revocationAudit] = await dataSource.query<
+        Array<{ total: string | number }>
+      >(
+        `SELECT COUNT(*) AS total FROM audit_events
+         WHERE tenant_id = ? AND action = 'OFFLINE_DEVICE_REVOKED' AND entity_id = ?`,
+        [identity.tenant.id, revokedDeviceId],
+      );
+      expect(Number(revocationAudit.total)).toBe(1);
+
       await dataSource.query(
         'DELETE FROM user_roles WHERE tenant_id = ? AND user_id = ?',
         [identity.tenant.id, identity.user.id],
       );
+      await request(app.getHttpServer())
+        .get('/api/v1/offline/devices')
+        .set('Cookie', refreshedCookie)
+        .expect(403);
       await request(app.getHttpServer())
         .post('/api/v1/offline/commands/batch')
         .set('Cookie', cookie)
