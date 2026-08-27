@@ -10,18 +10,20 @@ import { SessionModule } from './auth/session/session.module';
 import { appConfig } from './config/app.config';
 import { databaseConfig } from './config/database.config';
 import { sessionConfig } from './config/session.config';
+import { posConfig } from './config/pos.config';
 import { CatalogModule } from './catalog/catalog.module';
 import { validationSchema } from './config/validation.schema';
 import { HealthModule } from './health/health.module';
 import { InventoryModule } from './inventory/inventory.module';
 import { OnboardingModule } from './onboarding/onboarding.module';
+import { PosModule } from './pos/pos.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
       cache: true,
-      load: [appConfig, databaseConfig, sessionConfig],
+      load: [appConfig, databaseConfig, sessionConfig, posConfig],
       validationSchema,
       validationOptions: { abortEarly: true, allowUnknown: true },
     }),
@@ -45,6 +47,7 @@ import { OnboardingModule } from './onboarding/onboarding.module';
     OnboardingModule,
     CatalogModule,
     InventoryModule,
+    PosModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })

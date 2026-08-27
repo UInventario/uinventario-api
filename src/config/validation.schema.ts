@@ -14,4 +14,9 @@ export const validationSchema = Joi.object({
     .pattern(/^[A-Za-z0-9_-]+$/)
     .default('uinventario_session'),
   SESSION_TTL_MINUTES: Joi.number().integer().min(5).max(10_080).default(480),
+  POS_TAX_RATES: Joi.string()
+    .pattern(
+      /^(?:[A-Z]{2}|DEFAULT)=(?:0|0\.\d{1,4}|1\.0{1,4})(?:,(?:[A-Z]{2}|DEFAULT)=(?:0|0\.\d{1,4}|1\.0{1,4}))*$/,
+    )
+    .default('MX=0.1600,CL=0.1900,DEFAULT=0.0000'),
 });

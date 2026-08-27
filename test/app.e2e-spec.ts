@@ -1205,6 +1205,152 @@ describe('UInventario API (e2e)', () => {
     });
   });
 
+  describe('POS cart quote', () => {
+    beforeEach(resetIdentityData);
+
+    async function preparePos(): Promise<{
+      cookie: string;
+      productId: string;
+      locationId: string;
+    }> {
+      await registerAccount('pos-cart-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Tienda POS Legal',
+          tradeName: 'Tienda POS',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Sucursal POS',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega POS',
+          locationName: 'General POS',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja POS' })
+        .expect(200);
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Café POS',
+          sku: 'CAFE-POS',
+          barcode: '7501234500000',
+          cost: '80.00',
+          price: '119.90',
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'pos-initial-stock')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '5',
+          reason: 'Stock para POS',
+        })
+        .expect(201);
+      return { cookie, productId, locationId: location.id };
+    }
+
+    it('recalculates prices, included tax and totals from server data', async () => {
+      const { cookie, productId } = await preparePos();
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({
+          lines: [{ productId, quantity: '1', total: '0.01' }],
+        })
+        .expect(400);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({
+          lines: [
+            { productId, quantity: '1' },
+            { productId, quantity: '1.5' },
+          ],
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              context: {
+                branch: { name: 'Sucursal POS' },
+                warehouse: { name: 'Bodega POS' },
+                cashRegister: { name: 'Caja POS', code: 'MAIN' },
+              },
+              currency: 'MXN',
+              taxRate: '0.1600',
+              lines: [
+                {
+                  product: { id: productId, name: 'Café POS', sku: 'CAFE-POS' },
+                  quantity: '2.500',
+                  availableQuantity: '5.000',
+                  unitPrice: '119.90',
+                  subtotal: '258.41',
+                  tax: '41.34',
+                  total: '299.75',
+                },
+              ],
+              totals: { subtotal: '258.41', tax: '41.34', total: '299.75' },
+            },
+          });
+        });
+    });
+
+    it('rejects insufficient stock, inactive and nonexistent products', async () => {
+      const { cookie, productId } = await preparePos();
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [{ productId, quantity: '6' }] })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INSUFFICIENT_STOCK');
+        });
+
+      await dataSource.query(
+        'UPDATE products SET active = FALSE WHERE id = ?',
+        [productId],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [{ productId, quantity: '1' }] })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PRODUCT_NOT_AVAILABLE');
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [{ productId: randomUUID(), quantity: '1' }] })
+        .expect(404);
+    });
+  });
+
   afterAll(async () => {
     await app.close();
   });
