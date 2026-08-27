@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { ResultSetHeader } from 'mysql2';
-import { DataSource, EntityManager } from 'typeorm';
+import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { ListPurchaseOrdersDto } from './dto/list-purchase-orders.dto';
 import {
   PurchaseOrderLineDto,
@@ -10,6 +10,8 @@ import {
 import { UpdatePurchaseOrderDto } from './dto/update-purchase-order.dto';
 import {
   PurchaseOrderReferenceError,
+  PurchaseOrderIdempotencyConflictError,
+  PurchaseOrderNotFoundError,
   PurchaseOrderStateError,
   PurchaseOrderVersionConflictError,
 } from './purchase-order.errors';
@@ -17,6 +19,7 @@ import {
   PurchaseOrderData,
   PurchaseOrderLineData,
   PurchaseOrderStatus,
+  PurchaseOrderTransitionData,
 } from './purchase-order.types';
 
 interface OrderRow {
@@ -32,6 +35,27 @@ interface OrderRow {
   version: number | string;
   created_at: Date | string;
   updated_at: Date | string;
+  approved_at: Date | string | null;
+  sent_at: Date | string | null;
+  cancelled_at: Date | string | null;
+  cancellation_reason: string | null;
+}
+
+interface TransitionRow {
+  id: string;
+  purchase_order_id: string;
+  from_status: PurchaseOrderStatus;
+  to_status: PurchaseOrderStatus;
+  reason: string | null;
+  delivery_mode: 'SIMULATED' | null;
+  delivery_recipient: string | null;
+  created_at: Date | string;
+}
+
+interface IdempotencyRow {
+  purchase_order_id: string;
+  to_status: PurchaseOrderStatus;
+  request_fingerprint: string;
 }
 
 interface LineRow {
@@ -145,6 +169,110 @@ export class PurchaseOrderRepository {
       await this.insertLines(manager, tenantId, id, lines);
       return this.find(manager, tenantId, id);
     });
+  }
+
+  async transition(input: {
+    tenantId: string;
+    orderId: string;
+    actorUserId: string;
+    version: number;
+    from: PurchaseOrderStatus[];
+    to: PurchaseOrderStatus;
+    reason?: string;
+    delivery?: { mode: 'SIMULATED'; recipient: string | null };
+    idempotencyKey: string;
+    fingerprint: string;
+  }): Promise<{ order: PurchaseOrderData; replay: boolean }> {
+    const replay = await this.findTransitionRequest(input);
+    if (replay) return replay;
+    try {
+      return await this.dataSource.transaction(async (manager) => {
+        const current = await this.find(
+          manager,
+          input.tenantId,
+          input.orderId,
+          true,
+        );
+        if (!current) throw new PurchaseOrderNotFoundError();
+        if (current.version !== input.version) {
+          throw new PurchaseOrderVersionConflictError(current.version);
+        }
+        if (!input.from.includes(current.status)) {
+          throw new PurchaseOrderStateError(current.status);
+        }
+        const metadata = this.transitionMetadata(input);
+        const result = await manager.query<ResultSetHeader>(
+          `UPDATE purchase_orders
+           SET status = ?, version = version + 1, ${metadata.clause}
+           WHERE id = ? AND tenant_id = ? AND version = ? AND status = ?`,
+          [
+            input.to,
+            ...metadata.parameters,
+            input.orderId,
+            input.tenantId,
+            input.version,
+            current.status,
+          ],
+        );
+        if (result.affectedRows === 0) {
+          const fresh = await this.find(manager, input.tenantId, input.orderId);
+          if (!fresh) throw new PurchaseOrderNotFoundError();
+          if (fresh.version !== input.version) {
+            throw new PurchaseOrderVersionConflictError(fresh.version);
+          }
+          throw new PurchaseOrderStateError(fresh.status);
+        }
+        await manager.query(
+          `INSERT INTO purchase_order_transitions
+            (id, tenant_id, purchase_order_id, from_status, to_status, reason,
+             delivery_mode, delivery_recipient, idempotency_key,
+             request_fingerprint, actor_user_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            randomUUID(),
+            input.tenantId,
+            input.orderId,
+            current.status,
+            input.to,
+            input.reason ?? null,
+            input.delivery?.mode ?? null,
+            input.delivery?.recipient ?? null,
+            input.idempotencyKey,
+            input.fingerprint,
+            input.actorUserId,
+          ],
+        );
+        return {
+          order: (await this.find(manager, input.tenantId, input.orderId))!,
+          replay: false,
+        };
+      });
+    } catch (error) {
+      if (
+        this.isDuplicate(error) ||
+        error instanceof PurchaseOrderVersionConflictError ||
+        error instanceof PurchaseOrderStateError
+      ) {
+        const racedReplay = await this.findTransitionRequest(input);
+        if (racedReplay) return racedReplay;
+      }
+      throw error;
+    }
+  }
+
+  async findSupplierEmail(
+    tenantId: string,
+    orderId: string,
+  ): Promise<string | null> {
+    const [row] = await this.dataSource.query<Array<{ email: string | null }>>(
+      `SELECT sc.email FROM purchase_orders po
+       LEFT JOIN supplier_contacts sc ON sc.supplier_id = po.supplier_id
+         AND sc.tenant_id = po.tenant_id AND sc.email IS NOT NULL
+       WHERE po.id = ? AND po.tenant_id = ?
+       ORDER BY sc.is_primary DESC, sc.created_at, sc.id LIMIT 1`,
+      [orderId, tenantId],
+    );
+    return row?.email ?? null;
   }
 
   async list(
@@ -305,19 +433,35 @@ export class PurchaseOrderRepository {
     rows: OrderRow[],
   ): Promise<PurchaseOrderData[]> {
     if (rows.length === 0) return [];
-    const lines = await manager.query<LineRow[]>(
-      `SELECT id, purchase_order_id, supplier_product_id, product_id,
-              product_name, product_sku, supplier_code, quantity, unit_cost,
-              subtotal, notes
-       FROM purchase_order_lines
-       WHERE tenant_id = ? AND purchase_order_id IN (${rows.map(() => '?').join(',')})
-       ORDER BY purchase_order_id, position`,
-      [tenantId, ...rows.map((row) => row.id)],
-    );
-    return rows.map((row) => this.toData(row, lines));
+    const placeholders = rows.map(() => '?').join(',');
+    const parameters = [tenantId, ...rows.map((row) => row.id)];
+    const [lines, transitions] = await Promise.all([
+      manager.query<LineRow[]>(
+        `SELECT id, purchase_order_id, supplier_product_id, product_id,
+                product_name, product_sku, supplier_code, quantity, unit_cost,
+                subtotal, notes
+         FROM purchase_order_lines
+         WHERE tenant_id = ? AND purchase_order_id IN (${placeholders})
+         ORDER BY purchase_order_id, position`,
+        parameters,
+      ),
+      manager.query<TransitionRow[]>(
+        `SELECT id, purchase_order_id, from_status, to_status, reason,
+                delivery_mode, delivery_recipient, created_at
+         FROM purchase_order_transitions
+         WHERE tenant_id = ? AND purchase_order_id IN (${placeholders})
+         ORDER BY purchase_order_id, created_at, id`,
+        parameters,
+      ),
+    ]);
+    return rows.map((row) => this.toData(row, lines, transitions));
   }
 
-  private toData(row: OrderRow, lines: LineRow[]): PurchaseOrderData {
+  private toData(
+    row: OrderRow,
+    lines: LineRow[],
+    transitions: TransitionRow[],
+  ): PurchaseOrderData {
     return {
       id: row.id,
       folio: row.folio,
@@ -328,6 +472,25 @@ export class PurchaseOrderRepository {
       subtotal: row.subtotal,
       total: row.total,
       version: Number(row.version),
+      approvedAt: this.dateTime(row.approved_at),
+      sentAt: this.dateTime(row.sent_at),
+      cancelledAt: this.dateTime(row.cancelled_at),
+      cancellationReason: row.cancellation_reason,
+      transitions: transitions
+        .filter((transition) => transition.purchase_order_id === row.id)
+        .map((transition): PurchaseOrderTransitionData => ({
+          id: transition.id,
+          fromStatus: transition.from_status,
+          toStatus: transition.to_status,
+          reason: transition.reason,
+          delivery: transition.delivery_mode
+            ? {
+                mode: transition.delivery_mode,
+                recipient: transition.delivery_recipient,
+              }
+            : null,
+          createdAt: new Date(transition.created_at).toISOString(),
+        })),
       lines: lines
         .filter((line) => line.purchase_order_id === row.id)
         .map((line): PurchaseOrderLineData => ({
@@ -351,7 +514,8 @@ export class PurchaseOrderRepository {
     return `SELECT po.id, po.folio, po.supplier_id,
                    COALESCE(s.trade_name, s.legal_name) AS supplier_name,
                    po.currency, po.status, po.notes, po.subtotal, po.total,
-                   po.version, po.created_at, po.updated_at
+                   po.version, po.created_at, po.updated_at, po.approved_at,
+                   po.sent_at, po.cancelled_at, po.cancellation_reason
             FROM purchase_orders po
             INNER JOIN suppliers s ON s.id = po.supplier_id AND s.tenant_id = po.tenant_id`;
   }
@@ -376,5 +540,63 @@ export class PurchaseOrderRepository {
 
   private money(cents: bigint): string {
     return `${cents / 100n}.${(cents % 100n).toString().padStart(2, '0')}`;
+  }
+
+  private transitionMetadata(input: {
+    to: PurchaseOrderStatus;
+    actorUserId: string;
+    reason?: string;
+  }): { clause: string; parameters: Array<string | null> } {
+    if (input.to === 'APPROVED') {
+      return {
+        clause: 'approved_at = CURRENT_TIMESTAMP(6), approved_by_user_id = ?',
+        parameters: [input.actorUserId],
+      };
+    }
+    if (input.to === 'SENT') {
+      return { clause: 'sent_at = CURRENT_TIMESTAMP(6)', parameters: [] };
+    }
+    return {
+      clause:
+        'cancelled_at = CURRENT_TIMESTAMP(6), cancelled_by_user_id = ?, cancellation_reason = ?',
+      parameters: [input.actorUserId, input.reason ?? null],
+    };
+  }
+
+  private async findTransitionRequest(input: {
+    tenantId: string;
+    orderId: string;
+    to: PurchaseOrderStatus;
+    idempotencyKey: string;
+    fingerprint: string;
+  }): Promise<{ order: PurchaseOrderData; replay: true } | null> {
+    const [row] = await this.dataSource.query<IdempotencyRow[]>(
+      `SELECT purchase_order_id, to_status, request_fingerprint
+       FROM purchase_order_transitions
+       WHERE tenant_id = ? AND idempotency_key = ? LIMIT 1`,
+      [input.tenantId, input.idempotencyKey],
+    );
+    if (!row) return null;
+    if (
+      row.purchase_order_id !== input.orderId ||
+      row.to_status !== input.to ||
+      row.request_fingerprint !== input.fingerprint
+    ) {
+      throw new PurchaseOrderIdempotencyConflictError();
+    }
+    const order = await this.findById(input.tenantId, input.orderId);
+    if (!order) throw new PurchaseOrderIdempotencyConflictError();
+    return { order, replay: true };
+  }
+
+  private isDuplicate(error: unknown): boolean {
+    return (
+      error instanceof QueryFailedError &&
+      (error.driverError as { errno?: number }).errno === 1062
+    );
+  }
+
+  private dateTime(value: Date | string | null): string | null {
+    return value ? new Date(value).toISOString() : null;
   }
 }

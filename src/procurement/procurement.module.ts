@@ -4,10 +4,22 @@ import { SessionModule } from '../auth/session/session.module';
 import { PurchaseOrderController } from './purchase-order.controller';
 import { PurchaseOrderRepository } from './purchase-order.repository';
 import { PurchaseOrderService } from './purchase-order.service';
+import {
+  PurchaseOrderDelivery,
+  SimulatedPurchaseOrderDelivery,
+} from './purchase-order.delivery';
 
 @Module({
   imports: [SessionModule],
   controllers: [PurchaseOrderController],
-  providers: [PurchaseOrderRepository, PurchaseOrderService, PermissionGuard],
+  providers: [
+    PurchaseOrderRepository,
+    PurchaseOrderService,
+    PermissionGuard,
+    {
+      provide: PurchaseOrderDelivery,
+      useClass: SimulatedPurchaseOrderDelivery,
+    },
+  ],
 })
 export class ProcurementModule {}

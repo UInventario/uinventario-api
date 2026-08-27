@@ -52,6 +52,7 @@ describe('UInventario API (e2e)', () => {
       'inventory_transfer_lines',
       'inventory_transfers',
       'inventory_balances',
+      'purchase_order_transitions',
       'purchase_order_lines',
       'purchase_orders',
       'purchase_order_sequences',
@@ -248,7 +249,7 @@ describe('UInventario API (e2e)', () => {
         .set('Idempotency-Key', 'registration-success-1')
         .send(payload)
         .expect(201)
-        .expect(({ body }: { body: unknown }) => {
+        .expect(({ body }) => {
           expect(body).toMatchObject({
             data: {
               tenant: { name: payload.organizationName },
@@ -902,6 +903,7 @@ describe('UInventario API (e2e)', () => {
                   'INVENTORY_TRANSFER',
                   'INVENTORY_VIEW',
                   'PRODUCTS_MANAGE',
+                  'PURCHASE_ORDERS_APPROVE',
                   'PURCHASE_ORDERS_MANAGE',
                   'SALE_REPRINT',
                   'SALES_DISCOUNT',
@@ -1788,6 +1790,11 @@ describe('UInventario API (e2e)', () => {
          WHERE role_id = ? AND tenant_id = ? AND permission = 'PURCHASE_ORDERS_MANAGE'`,
         [admin.role_id, admin.tenant_id],
       );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'PURCHASE_ORDERS_APPROVE'`,
+        [admin.role_id, admin.tenant_id],
+      );
       await request(app.getHttpServer())
         .get('/api/v1/purchase-orders')
         .set('Cookie', cookie)
@@ -1795,6 +1802,230 @@ describe('UInventario API (e2e)', () => {
         .expect(({ body }: { body: { code?: string } }) => {
           expect(body.code).toBe('PERMISSION_DENIED');
         });
+    });
+
+    it('enforces and idempotently records approve, send and cancel transitions', async () => {
+      await registerAccount('purchase-order-lifecycle-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      const setup = await setupProcurement(
+        registrationPayload.email,
+        cookie,
+        'Lifecycle',
+      );
+      let order!: { id: string; version: number };
+      await request(app.getHttpServer())
+        .post('/api/v1/purchase-orders')
+        .set('Cookie', cookie)
+        .send({
+          supplierId: setup.supplierId,
+          currency: 'MXN',
+          lines: [
+            {
+              supplierProductId: setup.supplierProductId,
+              quantity: '1.000',
+              unitCost: '80.00',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: { data: typeof order } }) => {
+          order = body.data;
+        });
+
+      const [admin] = await dataSource.query<
+        Array<{ role_id: string; tenant_id: string }>
+      >(
+        `SELECT ur.role_id, u.tenant_id FROM users u
+         INNER JOIN user_roles ur ON ur.user_id = u.id AND ur.tenant_id = u.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'PURCHASE_ORDERS_APPROVE'`,
+        [admin.role_id, admin.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/approve`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'po-approve-denied')
+        .send({ version: 1 })
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'PURCHASE_ORDERS_APPROVE')`,
+        [admin.role_id, admin.tenant_id],
+      );
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/approve`)
+        .set('Cookie', cookie)
+        .send({ version: 1 })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVALID_IDEMPOTENCY_KEY');
+        });
+
+      const approveKey = 'po-approve-lifecycle-1';
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/approve`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', approveKey)
+        .send({ version: 1, reason: 'Presupuesto confirmado' })
+        .expect(200)
+        .expect(({ body }: { body: { data: { approvedAt: unknown } } }) => {
+          expect(typeof body.data.approvedAt).toBe('string');
+          expect(body).toMatchObject({
+            data: {
+              status: 'APPROVED',
+              version: 2,
+              transitions: [
+                {
+                  fromStatus: 'DRAFT',
+                  toStatus: 'APPROVED',
+                  reason: 'Presupuesto confirmado',
+                },
+              ],
+            },
+            meta: { idempotentReplay: false },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/approve`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', approveKey)
+        .send({ version: 1, reason: 'Presupuesto confirmado' })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { status: 'APPROVED', version: 2 },
+            meta: { idempotentReplay: true },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/send`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', approveKey)
+        .send({ version: 2 })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('IDEMPOTENCY_KEY_REUSED');
+        });
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/send`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'po-send-lifecycle-1')
+        .send({ version: 2 })
+        .expect(200)
+        .expect(({ body }: { body: { data: { sentAt: unknown } } }) => {
+          expect(typeof body.data.sentAt).toBe('string');
+          expect(body).toMatchObject({
+            data: {
+              status: 'SENT',
+              version: 3,
+              transitions: [
+                { toStatus: 'APPROVED' },
+                {
+                  fromStatus: 'APPROVED',
+                  toStatus: 'SENT',
+                  delivery: { mode: 'SIMULATED', recipient: null },
+                },
+              ],
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/send`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'po-send-invalid-state')
+        .send({ version: 3 })
+        .expect(409)
+        .expect(
+          ({ body }: { body: { code?: string; currentStatus?: string } }) => {
+            expect(body.code).toBe('PURCHASE_ORDER_STATE_CONFLICT');
+            expect(body.currentStatus).toBe('SENT');
+          },
+        );
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/cancel`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'po-cancel-no-reason')
+        .send({ version: 3 })
+        .expect(400);
+      const cancelKey = 'po-cancel-lifecycle-1';
+      const cancellation = {
+        version: 3,
+        reason: 'Proveedor sin disponibilidad',
+      };
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/cancel`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', cancelKey)
+        .send(cancellation)
+        .expect(200)
+        .expect(({ body }: { body: { data: { cancelledAt: unknown } } }) => {
+          expect(typeof body.data.cancelledAt).toBe('string');
+          expect(body).toMatchObject({
+            data: {
+              status: 'CANCELLED',
+              version: 4,
+              cancellationReason: cancellation.reason,
+            },
+            meta: { idempotentReplay: false },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/cancel`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', cancelKey)
+        .send(cancellation)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { idempotentReplay: true } });
+        });
+
+      const [counts] = await dataSource.query<
+        Array<{ transitions: number | string; audits: number | string }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM purchase_order_transitions
+            WHERE purchase_order_id = ?) AS transitions,
+           (SELECT COUNT(*) FROM audit_events
+            WHERE entity_id = ? AND action IN (
+              'PURCHASE_ORDER_APPROVED', 'PURCHASE_ORDER_SENT', 'PURCHASE_ORDER_CANCELLED'
+            )) AS audits`,
+        [order.id, order.id],
+      );
+      expect(Number(counts.transitions)).toBe(3);
+      expect(Number(counts.audits)).toBe(3);
+
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'PURCHASE_ORDERS_MANAGE'`,
+        [admin.role_id, admin.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/purchase-orders')
+        .set('Cookie', cookie)
+        .expect(200);
+      await request(app.getHttpServer())
+        .patch(`/api/v1/purchase-orders/${order.id}`)
+        .set('Cookie', cookie)
+        .send({
+          supplierId: setup.supplierId,
+          currency: 'MXN',
+          version: 4,
+          lines: [
+            {
+              supplierProductId: setup.supplierProductId,
+              quantity: '1.000',
+              unitCost: '80.00',
+            },
+          ],
+        })
+        .expect(403);
     });
   });
 
