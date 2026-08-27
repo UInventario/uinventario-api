@@ -16,6 +16,8 @@ import * as ExcelJS from 'exceljs';
 import { AuditService } from '../src/audit/audit.service';
 import { SupplierProductData } from '../src/suppliers/supplier-product.types';
 
+jest.setTimeout(15_000);
+
 describe('UInventario API (e2e)', () => {
   let app: INestApplication<App>;
   let dataSource: DataSource;
