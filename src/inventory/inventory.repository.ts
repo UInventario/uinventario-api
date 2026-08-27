@@ -9,10 +9,12 @@ import {
   InitialStockAlreadyExistsError,
   InsufficientStockError,
   InventoryTargetNotFoundError,
+  MovementReferenceRequiredError,
 } from './inventory.errors';
 import {
   InventoryBalanceData,
   InventoryLocationData,
+  InventoryMovementType,
   InventoryMovementHistoryItem,
   InventoryMovementData,
   InventoryStockItem,
@@ -20,7 +22,7 @@ import {
 
 interface MovementRow {
   id: string;
-  type: 'INITIAL' | 'ENTRY' | 'ADJUSTMENT' | 'SALE';
+  type: InventoryMovementType;
   quantity_change: string;
   resulting_quantity: string;
   reason: string;
@@ -354,6 +356,9 @@ export class InventoryRepository {
               throw new IdempotencyConflictError();
             return { movement: this.toMovement(replay), replay: true };
           }
+          if (input.dto.type !== 'INITIAL' && !input.dto.reference) {
+            throw new MovementReferenceRequiredError();
+          }
           if (input.dto.type === 'INITIAL') {
             const [existing] = await manager.query<
               Array<{ total: number | string }>
@@ -461,9 +466,11 @@ export class InventoryRepository {
 
   private quantityChange(dto: CreateInventoryMovementDto): string {
     const units = this.toUnits(dto.quantity);
-    if (units === 0n || (dto.type !== 'ADJUSTMENT' && units < 0n))
-      throw new InsufficientStockError();
-    return this.fromUnits(units);
+    if (units === 0n) throw new InsufficientStockError();
+    if (dto.type === 'ADJUSTMENT') return this.fromUnits(units);
+    if (units < 0n) throw new InsufficientStockError();
+    const direction = ['EXIT', 'LOSS', 'DAMAGE'].includes(dto.type) ? -1n : 1n;
+    return this.fromUnits(units * direction);
   }
 
   private toUnits(value: string): bigint {

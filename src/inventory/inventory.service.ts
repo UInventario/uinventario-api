@@ -12,6 +12,7 @@ import {
   InitialStockAlreadyExistsError,
   InsufficientStockError,
   InventoryTargetNotFoundError,
+  MovementReferenceRequiredError,
 } from './inventory.errors';
 import { InventoryRepository } from './inventory.repository';
 import {
@@ -163,6 +164,13 @@ export class InventoryService {
           code: 'INITIAL_STOCK_ALREADY_EXISTS',
           message:
             'El stock inicial ya fue registrado para este producto y ubicación.',
+        });
+      }
+      if (error instanceof MovementReferenceRequiredError) {
+        throw new BadRequestException({
+          code: 'MOVEMENT_REFERENCE_REQUIRED',
+          message:
+            'La referencia o evidencia es obligatoria para este tipo de movimiento.',
         });
       }
       if (error instanceof IdempotencyConflictError) {

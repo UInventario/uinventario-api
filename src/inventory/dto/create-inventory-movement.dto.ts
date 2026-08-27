@@ -8,6 +8,17 @@ import {
   MaxLength,
   MinLength,
 } from 'class-validator';
+import type { UserInventoryMovementType } from '../inventory.types';
+
+const USER_MOVEMENT_TYPES: UserInventoryMovementType[] = [
+  'INITIAL',
+  'ENTRY',
+  'EXIT',
+  'RETURN',
+  'LOSS',
+  'DAMAGE',
+  'ADJUSTMENT',
+];
 
 const trim = ({ value }: { value: unknown }) =>
   typeof value === 'string' ? value.trim() : value;
@@ -23,8 +34,8 @@ export class CreateInventoryMovementDto {
   @IsUUID()
   locationId!: string;
 
-  @IsIn(['INITIAL', 'ENTRY', 'ADJUSTMENT'])
-  type!: 'INITIAL' | 'ENTRY' | 'ADJUSTMENT';
+  @IsIn(USER_MOVEMENT_TYPES)
+  type!: UserInventoryMovementType;
 
   @Transform(trim)
   @IsString()

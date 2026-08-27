@@ -1,4 +1,16 @@
-export type InventoryMovementType = 'INITIAL' | 'ENTRY' | 'ADJUSTMENT' | 'SALE';
+export const INVENTORY_MOVEMENT_TYPES = [
+  'INITIAL',
+  'ENTRY',
+  'EXIT',
+  'RETURN',
+  'LOSS',
+  'DAMAGE',
+  'ADJUSTMENT',
+  'SALE',
+] as const;
+
+export type InventoryMovementType = (typeof INVENTORY_MOVEMENT_TYPES)[number];
+export type UserInventoryMovementType = Exclude<InventoryMovementType, 'SALE'>;
 
 export interface InventoryLocationData {
   id: string;

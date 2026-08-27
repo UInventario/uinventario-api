@@ -21,3 +21,9 @@ export class IdempotencyConflictError extends Error {
     super('IDEMPOTENCY_KEY_REUSED');
   }
 }
+
+export class MovementReferenceRequiredError extends Error {
+  constructor() {
+    super('MOVEMENT_REFERENCE_REQUIRED');
+  }
+}
