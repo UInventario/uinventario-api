@@ -19,6 +19,7 @@ import { InventoryModule } from './inventory/inventory.module';
 import { OnboardingModule } from './onboarding/onboarding.module';
 import { PosModule } from './pos/pos.module';
 import { PasswordResetModule } from './auth/password-reset/password-reset.module';
+import { AuditModule } from './audit/audit.module';
 
 @Module({
   imports: [
@@ -53,6 +54,7 @@ import { PasswordResetModule } from './auth/password-reset/password-reset.module
     RegistrationModule,
     SessionModule,
     PasswordResetModule,
+    AuditModule,
     OnboardingModule,
     CatalogModule,
     InventoryModule,

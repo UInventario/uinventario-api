@@ -18,11 +18,14 @@ import { CreateSessionDto } from './dto/create-session.dto';
 import { SessionGuard } from './session.guard';
 import { SessionService } from './session.service';
 import type { AuthenticatedRequest } from './session.types';
+import { AuditService } from '../../audit/audit.service';
+import type { RequestContext } from '../../security/request-context';
 
 @Controller('auth/sessions')
 export class SessionController {
   constructor(
     private readonly sessions: SessionService,
+    private readonly audit: AuditService,
     @Inject(sessionConfig.KEY)
     private readonly config: ConfigType<typeof sessionConfig>,
   ) {}
@@ -31,10 +34,19 @@ export class SessionController {
   @HttpCode(200)
   @Throttle({ default: { limit: 5, ttl: 60_000 } })
   async login(
+    @Req() request: RequestContext,
     @Body() dto: CreateSessionDto,
     @Res({ passthrough: true }) response: Response,
   ) {
     const result = await this.sessions.login(dto);
+    await this.audit.record({
+      tenantId: result.response.data.tenant.id,
+      actorUserId: result.response.data.user.id,
+      action: 'AUTH_LOGIN_SUCCEEDED',
+      entityType: 'USER',
+      entityId: result.response.data.user.id,
+      correlationId: request.requestId!,
+    });
     this.setSessionCookie(response, result.token, result.expiresAt);
     return result.response;
   }

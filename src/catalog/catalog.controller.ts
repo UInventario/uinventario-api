@@ -17,11 +17,15 @@ import { CreateProductDto } from './dto/create-product.dto';
 import { ListProductsDto } from './dto/list-products.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { ProductAccessGuard } from './product-access.guard';
+import { AuditService } from '../audit/audit.service';
 
 @Controller('products')
 @UseGuards(SessionGuard, ProductAccessGuard)
 export class CatalogController {
-  constructor(private readonly catalog: CatalogService) {}
+  constructor(
+    private readonly catalog: CatalogService,
+    private readonly audit: AuditService,
+  ) {}
 
   @Get('options')
   getOptions(@Req() request: AuthenticatedRequest) {
@@ -45,19 +49,45 @@ export class CatalogController {
   }
 
   @Post()
-  createProduct(
+  async createProduct(
     @Req() request: AuthenticatedRequest,
     @Body() dto: CreateProductDto,
   ) {
-    return this.catalog.createProduct(request.principal.tenant.id, dto);
+    const result = await this.catalog.createProduct(
+      request.principal.tenant.id,
+      dto,
+    );
+    await this.audit.record({
+      tenantId: request.principal.tenant.id,
+      actorUserId: request.principal.user.id,
+      action: 'PRODUCT_CREATED',
+      entityType: 'PRODUCT',
+      entityId: result.data.id,
+      correlationId: request.requestId!,
+      deduplicate: true,
+    });
+    return result;
   }
 
   @Patch(':id')
-  updateProduct(
+  async updateProduct(
     @Req() request: AuthenticatedRequest,
     @Param('id', new ParseUUIDPipe()) id: string,
     @Body() dto: UpdateProductDto,
   ) {
-    return this.catalog.updateProduct(request.principal.tenant.id, id, dto);
+    const result = await this.catalog.updateProduct(
+      request.principal.tenant.id,
+      id,
+      dto,
+    );
+    await this.audit.record({
+      tenantId: request.principal.tenant.id,
+      actorUserId: request.principal.user.id,
+      action: 'PRODUCT_UPDATED',
+      entityType: 'PRODUCT',
+      entityId: result.data.id,
+      correlationId: request.requestId!,
+    });
+    return result;
   }
 }

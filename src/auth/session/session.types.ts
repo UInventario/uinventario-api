@@ -19,6 +19,7 @@ export interface SessionResponse {
 }
 
 export interface AuthenticatedRequest extends Request {
+  requestId?: string;
   principal: SessionIdentity;
   sessionToken: string;
 }

@@ -5,11 +5,15 @@ import { ConfigureCompanyDto } from './dto/configure-company.dto';
 import { ConfigureInitialCashRegisterDto } from './dto/configure-initial-cash-register.dto';
 import { ConfigureInitialLocationDto } from './dto/configure-initial-location.dto';
 import { OnboardingService } from './onboarding.service';
+import { AuditService } from '../audit/audit.service';
 
 @Controller('onboarding')
 @UseGuards(SessionGuard)
 export class OnboardingController {
-  constructor(private readonly onboarding: OnboardingService) {}
+  constructor(
+    private readonly onboarding: OnboardingService,
+    private readonly audit: AuditService,
+  ) {}
 
   @Get('company')
   getCompany(@Req() request: AuthenticatedRequest) {
@@ -17,11 +21,23 @@ export class OnboardingController {
   }
 
   @Put('company')
-  configureCompany(
+  async configureCompany(
     @Req() request: AuthenticatedRequest,
     @Body() dto: ConfigureCompanyDto,
   ) {
-    return this.onboarding.configureCompany(request.principal.tenant.id, dto);
+    const result = await this.onboarding.configureCompany(
+      request.principal.tenant.id,
+      dto,
+    );
+    await this.audit.record({
+      tenantId: request.principal.tenant.id,
+      actorUserId: request.principal.user.id,
+      action: 'COMPANY_UPDATED',
+      entityType: 'TENANT',
+      entityId: request.principal.tenant.id,
+      correlationId: request.requestId!,
+    });
+    return result;
   }
 
   @Get('initial-location')

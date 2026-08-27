@@ -48,6 +48,7 @@ el usuario, sus roles y el tenant de esa sesión.
 - `POST /api/v1/pos/sales/cash`: persiste venta, pago y descuento trazable de inventario en una sola transacción idempotente.
 - `GET /api/v1/pos/sales`: lista ventas de la sucursal activa con filtros y paginación.
 - `GET /api/v1/pos/sales/:id`: consulta líneas, pago, operador y movimientos de una venta autorizada.
+- `GET /api/v1/audit-events`: lista para administradores los eventos críticos del tenant activo.
 
 Cada login crea una sesión independiente por dispositivo. Las pestañas de un mismo
 navegador comparten la cookie; una rotación invalida el token anterior y logout no
@@ -69,6 +70,14 @@ catálogo, stock, movimientos y ventas con dos tenants reales. Actualmente no ex
 jobs ni cachés con datos de negocio; la configuración es global y no almacena estado
 de tenants. Cualquier job, caché o logging estructurado futuro que transporte datos de
 negocio deberá incluir y validar explícitamente `tenantId`.
+
+## Auditoría Core
+
+Registro, login exitoso, configuración de empresa, altas y cambios de producto,
+movimientos de stock y ventas confirmadas generan eventos append-only. Cada evento
+conserva tenant, actor, acción, entidad, fecha y `X-Request-Id`, sin copiar cuerpos,
+contraseñas ni tokens. La aplicación sólo expone lectura paginada a administradores;
+la migración requiere únicamente permisos DDL/DML estándar de MySQL.
 
 ## Seguridad HTTP
 

@@ -18,11 +18,15 @@ import { ListSalesDto } from './dto/list-sales.dto';
 import { QuoteCartDto } from './dto/quote-cart.dto';
 import { PosAccessGuard } from './pos-access.guard';
 import { PosService } from './pos.service';
+import { AuditService } from '../audit/audit.service';
 
 @Controller('pos')
 @UseGuards(SessionGuard, PosAccessGuard)
 export class PosController {
-  constructor(private readonly pos: PosService) {}
+  constructor(
+    private readonly pos: PosService,
+    private readonly audit: AuditService,
+  ) {}
 
   @Get('sales')
   listSales(
@@ -64,13 +68,13 @@ export class PosController {
   }
 
   @Post('sales/cash')
-  createCashSale(
+  async createCashSale(
     @Req() request: AuthenticatedRequest,
     @Headers('idempotency-key') idempotencyKey: string | undefined,
     @Body() dto: CreateCashSaleDto,
   ) {
     const { principal } = request;
-    return this.pos.createCashSale({
+    const result = await this.pos.createCashSale({
       tenantId: principal.tenant.id,
       branchId: principal.context.branch!.id,
       warehouseId: principal.context.warehouse!.id,
@@ -79,5 +83,15 @@ export class PosController {
       idempotencyKey,
       dto,
     });
+    await this.audit.record({
+      tenantId: principal.tenant.id,
+      actorUserId: principal.user.id,
+      action: 'SALE_COMPLETED',
+      entityType: 'SALE',
+      entityId: result.data.id,
+      correlationId: request.requestId!,
+      deduplicate: true,
+    });
+    return result;
   }
 }
