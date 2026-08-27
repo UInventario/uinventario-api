@@ -1,4 +1,5 @@
 import { PosRepository } from './pos.repository';
+import { SalesRepository } from './sales.repository';
 import { PosService } from './pos.service';
 
 describe('PosService', () => {
@@ -21,9 +22,13 @@ describe('PosService', () => {
         },
       ]),
     };
-    const service = new PosService(repository as unknown as PosRepository, {
-      taxRates: { MX: '0.1600', CL: '0.1900', DEFAULT: '0.0000' },
-    });
+    const service = new PosService(
+      repository as unknown as PosRepository,
+      {} as SalesRepository,
+      {
+        taxRates: { MX: '0.1600', CL: '0.1900', DEFAULT: '0.0000' },
+      },
+    );
 
     const quote = await service.quoteCart({
       tenantId: 'tenant',

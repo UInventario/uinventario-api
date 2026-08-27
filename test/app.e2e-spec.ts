@@ -31,6 +31,9 @@ describe('UInventario API (e2e)', () => {
   async function resetIdentityData(): Promise<void> {
     await dataSource.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const table of [
+      'sale_payments',
+      'sale_lines',
+      'sales',
       'inventory_movements',
       'inventory_balances',
       'products',
@@ -1318,6 +1321,92 @@ describe('UInventario API (e2e)', () => {
             },
           });
         });
+
+      const salePayload = {
+        lines: [
+          { productId, quantity: '1' },
+          { productId, quantity: '1.5' },
+        ],
+        cashReceived: '300.00',
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .send(salePayload)
+        .expect(400);
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'pos-cash-insufficient')
+        .send({ ...salePayload, cashReceived: '299.74' })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INSUFFICIENT_CASH_RECEIVED');
+        });
+      const beforeSale = await dataSource.query<
+        Array<{ total: number | string }>
+      >('SELECT COUNT(*) AS total FROM sales');
+      expect(Number(beforeSale[0].total)).toBe(0);
+
+      const completed = await Promise.all(
+        [1, 2].map(() =>
+          request(app.getHttpServer())
+            .post('/api/v1/pos/sales/cash')
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', 'pos-cash-double-submit')
+            .send(salePayload),
+        ),
+      );
+      expect(completed.map(({ status }) => status)).toEqual([201, 201]);
+      const saleBodies = completed.map(
+        ({ body }) =>
+          body as {
+            data: { id: string; receiptNumber: string };
+            meta: { idempotentReplay: boolean };
+          },
+      );
+      expect(saleBodies[0].data.id).toBe(saleBodies[1].data.id);
+      expect(
+        saleBodies.map(({ meta }) => meta.idempotentReplay).sort(),
+      ).toEqual([false, true]);
+      expect(saleBodies[0].data.receiptNumber).toMatch(/^V-[A-F0-9]{12}$/);
+      expect(completed[0].body).toMatchObject({
+        data: {
+          status: 'COMPLETED',
+          currency: 'MXN',
+          totals: { total: '299.75' },
+          payment: {
+            method: 'CASH',
+            amountReceived: '300.00',
+            amountApplied: '299.75',
+            change: '0.25',
+          },
+          context: { cashRegister: { name: 'Caja POS' } },
+        },
+      });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'pos-cash-double-submit')
+        .send({ ...salePayload, cashReceived: '301.00' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('IDEMPOTENCY_KEY_REUSED');
+        });
+      const [saleCounts] = await dataSource.query<
+        Array<{
+          sales: number | string;
+          line_count: number | string;
+          payments: number | string;
+        }>
+      >(`SELECT (SELECT COUNT(*) FROM sales) AS sales,
+                (SELECT COUNT(*) FROM sale_lines) AS line_count,
+                (SELECT COUNT(*) FROM sale_payments) AS payments`);
+      expect({
+        sales: Number(saleCounts.sales),
+        lines: Number(saleCounts.line_count),
+        payments: Number(saleCounts.payments),
+      }).toEqual({ sales: 1, lines: 1, payments: 1 });
     });
 
     it('rejects insufficient stock, inactive and nonexistent products', async () => {
