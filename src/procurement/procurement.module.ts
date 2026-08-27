@@ -5,6 +5,7 @@ import { PurchaseOrderController } from './purchase-order.controller';
 import { PurchaseOrderRepository } from './purchase-order.repository';
 import { PurchaseOrderService } from './purchase-order.service';
 import { PurchaseReceiptRepository } from './purchase-receipt.repository';
+import { PurchaseReturnRepository } from './purchase-return.repository';
 import {
   PurchaseOrderDelivery,
   SimulatedPurchaseOrderDelivery,
@@ -16,6 +17,7 @@ import {
   providers: [
     PurchaseOrderRepository,
     PurchaseReceiptRepository,
+    PurchaseReturnRepository,
     PurchaseOrderService,
     PermissionGuard,
     {

@@ -15,6 +15,7 @@ export const INVENTORY_MOVEMENT_TYPES = [
   'SALE',
   'SALE_VOID',
   'PURCHASE_RECEIPT',
+  'SUPPLIER_RETURN',
 ] as const;
 
 export type InventoryMovementType = (typeof INVENTORY_MOVEMENT_TYPES)[number];
@@ -29,6 +30,7 @@ export type UserInventoryMovementType = Exclude<
   | 'SALE'
   | 'SALE_VOID'
   | 'PURCHASE_RECEIPT'
+  | 'SUPPLIER_RETURN'
 >;
 export type InventoryStockState =
   'AVAILABLE' | 'RESERVED' | 'DAMAGED' | 'IN_TRANSIT';
@@ -115,7 +117,8 @@ export interface InventoryMovementHistoryItem {
       | 'SALE'
       | 'TRANSFER'
       | 'RECEIPT'
-      | 'PURCHASE_RECEIPT';
+      | 'PURCHASE_RECEIPT'
+      | 'SUPPLIER_RETURN';
     id: string;
     reference: string | null;
   };

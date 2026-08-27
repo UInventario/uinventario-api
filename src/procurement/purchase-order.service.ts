@@ -10,6 +10,7 @@ import { ListPurchaseOrdersDto } from './dto/list-purchase-orders.dto';
 import { SavePurchaseOrderDto } from './dto/save-purchase-order.dto';
 import { UpdatePurchaseOrderDto } from './dto/update-purchase-order.dto';
 import { ReceivePurchaseOrderDto } from './dto/receive-purchase-order.dto';
+import { ReturnPurchaseReceiptDto } from './dto/return-purchase-receipt.dto';
 import {
   InvalidPurchaseReceiptError,
   PurchaseOrderDuplicateLineError,
@@ -21,10 +22,14 @@ import {
   PurchaseReceiptLocationError,
   PurchaseReceiptOveragePermissionError,
   PurchaseReceiptOverageReasonError,
+  InvalidPurchaseReturnError,
+  PurchaseReturnQuantityError,
+  PurchaseReturnStockError,
 } from './purchase-order.errors';
 import { PurchaseOrderRepository } from './purchase-order.repository';
 import { PurchaseOrderDelivery } from './purchase-order.delivery';
 import { PurchaseReceiptRepository } from './purchase-receipt.repository';
+import { PurchaseReturnRepository } from './purchase-return.repository';
 import {
   PurchaseOrderListResponse,
   PurchaseOrderResponse,
@@ -36,6 +41,7 @@ export class PurchaseOrderService {
     private readonly orders: PurchaseOrderRepository,
     private readonly delivery: PurchaseOrderDelivery,
     private readonly receipts: PurchaseReceiptRepository,
+    private readonly returns: PurchaseReturnRepository,
   ) {}
 
   async create(
@@ -172,6 +178,35 @@ export class PurchaseOrderService {
     }
   }
 
+  async returnToSupplier(input: {
+    tenantId: string;
+    orderId: string;
+    actorUserId: string;
+    warehouseId: string;
+    idempotencyKey: string | undefined;
+    dto: ReturnPurchaseReceiptDto;
+  }): Promise<PurchaseOrderResponse> {
+    const idempotencyKey = this.idempotencyKey(input.idempotencyKey);
+    try {
+      const purchaseReturn = await this.returns.create({
+        ...input,
+        idempotencyKey,
+      });
+      const order = await this.orders.findById(input.tenantId, input.orderId);
+      if (!order) throw new PurchaseOrderNotFoundError();
+      return {
+        data: order,
+        meta: {
+          apiVersion: '1',
+          idempotentReplay: purchaseReturn.replay,
+          returnId: purchaseReturn.returnId,
+        },
+      };
+    } catch (error) {
+      this.rethrow(error);
+    }
+  }
+
   private async changeStatus(input: {
     tenantId: string;
     orderId: string;
@@ -287,6 +322,25 @@ export class PurchaseOrderService {
       throw new BadRequestException({
         code: 'PURCHASE_RECEIPT_OVERAGE_REASON_REQUIRED',
         message: 'Indica el motivo para recibir cantidades sobrantes.',
+      });
+    }
+    if (error instanceof InvalidPurchaseReturnError) {
+      throw new BadRequestException({
+        code: 'INVALID_PURCHASE_RETURN',
+        message: 'La devolución no corresponde a esta orden o recepción.',
+      });
+    }
+    if (error instanceof PurchaseReturnQuantityError) {
+      throw new ConflictException({
+        code: 'PURCHASE_RETURN_QUANTITY_EXCEEDED',
+        message: 'La cantidad acumulada a devolver supera lo recibido.',
+      });
+    }
+    if (error instanceof PurchaseReturnStockError) {
+      throw new ConflictException({
+        code: 'INSUFFICIENT_PURCHASE_RETURN_STOCK',
+        message:
+          'No hay stock disponible suficiente en la ubicación de recepción.',
       });
     }
     if (error instanceof PurchaseOrderVersionConflictError) {
