@@ -13,6 +13,7 @@ import { sessionConfig } from './config/session.config';
 import { CatalogModule } from './catalog/catalog.module';
 import { validationSchema } from './config/validation.schema';
 import { HealthModule } from './health/health.module';
+import { InventoryModule } from './inventory/inventory.module';
 import { OnboardingModule } from './onboarding/onboarding.module';
 
 @Module({
@@ -43,6 +44,7 @@ import { OnboardingModule } from './onboarding/onboarding.module';
     SessionModule,
     OnboardingModule,
     CatalogModule,
+    InventoryModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })

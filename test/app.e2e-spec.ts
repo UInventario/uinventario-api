@@ -31,6 +31,8 @@ describe('UInventario API (e2e)', () => {
   async function resetIdentityData(): Promise<void> {
     await dataSource.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const table of [
+      'inventory_movements',
+      'inventory_balances',
       'products',
       'brands',
       'categories',
@@ -916,6 +918,237 @@ describe('UInventario API (e2e)', () => {
             },
           });
         });
+    });
+  });
+
+  describe('inventory stock', () => {
+    beforeEach(resetIdentityData);
+
+    async function completeInventoryOnboarding(
+      email: string,
+      cookie: string,
+    ): Promise<void> {
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: `${email} Legal`,
+          tradeName: email,
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Sucursal Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Principal',
+          locationName: 'Ubicación General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Principal' })
+        .expect(200);
+    }
+
+    it('updates balance atomically and makes retries idempotent', async () => {
+      await registerAccount('inventory-primary-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeInventoryOnboarding(registrationPayload.email, cookie);
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Café',
+          sku: 'CAFE-STOCK',
+          cost: '10.00',
+          price: '15.00',
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '10',
+          reason: 'Apertura de inventario',
+        })
+        .expect(400);
+
+      const initial = {
+        productId,
+        locationId: location.id,
+        type: 'INITIAL',
+        quantity: '10',
+        reason: 'Apertura de inventario',
+        reference: 'CONTEO-001',
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'inventory-initial-001')
+        .send(initial)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { quantityChange: '10.000', quantity: '10.000' },
+            meta: { idempotentReplay: false },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'inventory-initial-001')
+        .send(initial)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { quantity: '10.000' },
+            meta: { idempotentReplay: true },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'inventory-initial-001')
+        .send({ ...initial, quantity: '11' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('IDEMPOTENCY_KEY_REUSED');
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'inventory-initial-002')
+        .send(initial)
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INITIAL_STOCK_ALREADY_EXISTS');
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'inventory-entry-001')
+        .send({
+          ...initial,
+          type: 'ENTRY',
+          quantity: '2.5',
+          reason: 'Recepción manual',
+        })
+        .expect(201);
+      const concurrent = await Promise.all(
+        ['inventory-entry-002', 'inventory-entry-003'].map((key) =>
+          request(app.getHttpServer())
+            .post('/api/v1/inventory/movements')
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', key)
+            .send({
+              ...initial,
+              type: 'ENTRY',
+              quantity: '1',
+              reason: 'Entrada concurrente',
+            }),
+        ),
+      );
+      expect(concurrent.map(({ status }) => status)).toEqual([201, 201]);
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'inventory-adjustment-001')
+        .send({
+          ...initial,
+          type: 'ADJUSTMENT',
+          quantity: '-20',
+          reason: 'Conteo físico',
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVALID_STOCK_QUANTITY');
+        });
+
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/balance`)
+        .query({ locationId: location.id })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              product: { id: productId, sku: 'CAFE-STOCK' },
+              location: { id: location.id },
+              quantity: '14.500',
+            },
+          });
+        });
+      const [counts] = await dataSource.query<
+        Array<{ movements: number | string }>
+      >('SELECT COUNT(*) AS movements FROM inventory_movements');
+      expect(Number(counts.movements)).toBe(4);
+    });
+
+    it('rejects products and locations outside the active tenant', async () => {
+      await registerAccount('inventory-isolation-primary');
+      const primaryCookie = await createPersistedSession(
+        registrationPayload.email,
+      );
+      await completeInventoryOnboarding(
+        registrationPayload.email,
+        primaryCookie,
+      );
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', primaryCookie)
+        .send({ name: 'Café', sku: 'ISOLATED-1', cost: '1.00', price: '2.00' })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+
+      const secondary = {
+        organizationName: 'Otra Tienda',
+        email: 'other-inventory@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'inventory-isolation-secondary')
+        .send(secondary)
+        .expect(201);
+      const secondaryCookie = await createPersistedSession(secondary.email);
+      await completeInventoryOnboarding(secondary.email, secondaryCookie);
+      const [foreignLocation] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [secondary.email],
+      );
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', primaryCookie)
+        .set('Idempotency-Key', 'inventory-foreign-location')
+        .send({
+          productId,
+          locationId: foreignLocation.id,
+          type: 'INITIAL',
+          quantity: '1',
+          reason: 'No autorizado',
+        })
+        .expect(404);
     });
   });
 
