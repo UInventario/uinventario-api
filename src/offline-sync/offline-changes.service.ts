@@ -7,6 +7,7 @@ import type { OfflineServerCursorV1 } from './offline-bootstrap.service';
 import { OfflineChangesRepository } from './offline-changes.repository';
 import {
   assertOfflineSyncPageSize,
+  OFFLINE_FRESHNESS_POLICY_V1,
   OFFLINE_SYNC_PROTOCOL_VERSION,
   OfflineChangeV1,
   OfflineChangesResponseV1,
@@ -125,7 +126,17 @@ export class OfflineChangesService {
     }));
     return {
       protocolVersion: OFFLINE_SYNC_PROTOCOL_VERSION,
+      generatedAt: new Date().toISOString(),
+      sessionExpiresAt: principal.expiresAt.toISOString(),
+      freshnessPolicy: OFFLINE_FRESHNESS_POLICY_V1,
       scope,
+      identity: {
+        user: {
+          id: principal.user.id,
+          roles: principal.user.roles,
+          permissions: principal.user.permissions,
+        },
+      },
       cursor: query.cursor,
       nextCursor: this.encode(next, principal.sessionId),
       hasMore,

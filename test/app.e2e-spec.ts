@@ -44,6 +44,7 @@ describe('UInventario API (e2e)', () => {
       'audit_chain_heads',
       'offline_commands',
       'offline_device_sequences',
+      'offline_devices',
       'offline_sync_tombstones',
       'password_reset_tokens',
       'sale_payments',
@@ -9687,6 +9688,88 @@ describe('UInventario API (e2e)', () => {
       expect(rejectedReplay.body).toMatchObject({
         data: { results: [{ status: 'ERROR', replay: true }] },
       });
+
+      const staleDeviceId = randomUUID();
+      const staleCommand = {
+        ...firstCommand,
+        commandId: randomUUID(),
+        idempotencyKey: `offline-stale-${randomUUID()}`,
+        scope: { ...scope, deviceId: staleDeviceId },
+        sequence: 1,
+        createdAt: new Date(Date.now() - 61 * 60_000).toISOString(),
+        payload: {
+          productId,
+          locationId,
+          type: 'ENTRY',
+          quantity: '1',
+          reason: 'Movimiento con permisos obsoletos',
+          reference: 'STALE-OFFLINE-MOVEMENT',
+        },
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/offline/commands/batch')
+        .set('Cookie', cookie)
+        .send({ commands: [staleCommand] })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: {
+              results: [
+                {
+                  status: 'ERROR',
+                  error: { details: { code: 'OFFLINE_COMMAND_STALE' } },
+                },
+              ],
+            },
+          }),
+        );
+
+      const revokedDeviceId = randomUUID();
+      await request(app.getHttpServer())
+        .get('/api/v1/offline/bootstrap')
+        .set('Cookie', cookie)
+        .query({ deviceId: revokedDeviceId, pageSize: 500 })
+        .expect(200);
+      await request(app.getHttpServer())
+        .delete(`/api/v1/offline/devices/${revokedDeviceId}`)
+        .set('Cookie', cookie)
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/offline/bootstrap')
+        .set('Cookie', cookie)
+        .query({ deviceId: revokedDeviceId, pageSize: 500 })
+        .expect(403)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({ code: 'OFFLINE_DEVICE_REVOKED' }),
+        );
+
+      await dataSource.query(
+        'DELETE FROM user_roles WHERE tenant_id = ? AND user_id = ?',
+        [identity.tenant.id, identity.user.id],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/offline/commands/batch')
+        .set('Cookie', cookie)
+        .send({
+          commands: [
+            {
+              ...firstCommand,
+              commandId: randomUUID(),
+              idempotencyKey: `offline-revoked-user-${randomUUID()}`,
+              scope: { ...scope, deviceId: randomUUID() },
+              sequence: 1,
+              payload: {
+                productId,
+                locationId,
+                type: 'ENTRY',
+                quantity: '1',
+                reason: 'Permiso revocado al reconectar',
+                reference: 'REVOKED-USER-MOVEMENT',
+              },
+            },
+          ],
+        })
+        .expect(403);
     });
   });
 

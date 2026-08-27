@@ -3,6 +3,20 @@ import type { AppPermission } from '../auth/authorization/authorization.types';
 export const OFFLINE_SYNC_PROTOCOL_VERSION = '1.0' as const;
 export const OFFLINE_SYNC_MAX_PAGE_SIZE = 500 as const;
 
+export const OFFLINE_FRESHNESS_POLICY_V1 = {
+  version: 1,
+  maxClockSkewSeconds: 300,
+  catalogTtlSeconds: 86_400,
+  permissionsTtlSeconds: 3_600,
+  actionTtlSeconds: {
+    CASH_SALE: 900,
+    INVENTORY_COUNT: 14_400,
+    INVENTORY_MOVEMENT: 3_600,
+  },
+} as const;
+
+export type OfflineFreshnessPolicyV1 = typeof OFFLINE_FRESHNESS_POLICY_V1;
+
 export const OFFLINE_SYNC_ENTITY_KINDS = [
   'BRANCH',
   'WAREHOUSE',
@@ -117,6 +131,8 @@ export interface OfflineBootstrapRequestV1 {
 export interface OfflineBootstrapResponseV1 {
   protocolVersion: typeof OFFLINE_SYNC_PROTOCOL_VERSION;
   generatedAt: string;
+  sessionExpiresAt: string;
+  freshnessPolicy: OfflineFreshnessPolicyV1;
   scope: OfflineSyncScopeV1;
   identity: {
     tenant: { id: string; name: string };
@@ -141,7 +157,13 @@ export interface OfflineChangeV1 {
 
 export interface OfflineChangesResponseV1 {
   protocolVersion: typeof OFFLINE_SYNC_PROTOCOL_VERSION;
+  generatedAt: string;
+  sessionExpiresAt: string;
+  freshnessPolicy: OfflineFreshnessPolicyV1;
   scope: OfflineSyncScopeV1;
+  identity: {
+    user: { id: string; roles: string[]; permissions: AppPermission[] };
+  };
   cursor: string;
   nextCursor: string;
   hasMore: boolean;
