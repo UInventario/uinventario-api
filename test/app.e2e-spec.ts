@@ -2052,7 +2052,7 @@ describe('UInventario API (e2e)', () => {
       let order!: {
         id: string;
         version: number;
-        lines: Array<{ id: string }>;
+        lines: Array<{ id: string; productId: string }>;
       };
       await request(app.getHttpServer())
         .post('/api/v1/purchase-orders')
@@ -2072,6 +2072,28 @@ describe('UInventario API (e2e)', () => {
         .expect(({ body }: { body: { data: typeof order } }) => {
           order = body.data;
         });
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'po-receipt-history-initial-stock')
+        .send({
+          productId: order.lines[0].productId,
+          locationId: setup.locationId,
+          type: 'INITIAL',
+          quantity: '1.000',
+          reason: 'Stock previo para validar costo histórico',
+        })
+        .expect(201);
+      await openCurrentCashRegister(cookie, 'po-receipt-history-shift');
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'po-receipt-history-sale')
+        .send({
+          lines: [{ productId: order.lines[0].productId, quantity: '1.000' }],
+          cashReceived: '120.00',
+        })
+        .expect(201);
       await request(app.getHttpServer())
         .post(`/api/v1/purchase-orders/${order.id}/approve`)
         .set('Cookie', cookie)
@@ -2134,6 +2156,10 @@ describe('UInventario API (e2e)', () => {
                       purchaseOrderLineId: order.lines[0].id,
                       receivedQuantity: '2.000',
                       overageQuantity: '0.000',
+                      unitCost: '80.00',
+                      totalCost: '160.00',
+                      previousCatalogCost: '85.40',
+                      resultingCatalogCost: '80.00',
                     },
                   ],
                 },
@@ -2262,6 +2288,11 @@ describe('UInventario API (e2e)', () => {
         Array<{
           receipts: number | string;
           receiptLines: number | string;
+          purchaseMovements: number | string;
+          balance: string;
+          productCost: string;
+          historicalSaleCost: string;
+          receivedCost: string;
           audits: number | string;
         }>
       >(
@@ -2270,13 +2301,165 @@ describe('UInventario API (e2e)', () => {
            (SELECT COUNT(*) FROM purchase_receipt_lines prl
             INNER JOIN purchase_receipts pr ON pr.id = prl.receipt_id
             WHERE pr.purchase_order_id = ?) AS receiptLines,
+           (SELECT COUNT(*) FROM inventory_movements
+            WHERE purchase_receipt_id IN (
+              SELECT id FROM purchase_receipts WHERE purchase_order_id = ?
+            )) AS purchaseMovements,
+           (SELECT quantity FROM inventory_balances
+            WHERE product_id = ? AND location_id = ?) AS balance,
+           (SELECT cost FROM products WHERE id = ?) AS productCost,
+           (SELECT unit_cost FROM sale_lines
+            WHERE product_id = ? LIMIT 1) AS historicalSaleCost,
+           (SELECT SUM(prl.total_cost) FROM purchase_receipt_lines prl
+            INNER JOIN purchase_receipts pr ON pr.id = prl.receipt_id
+            WHERE pr.purchase_order_id = ?) AS receivedCost,
            (SELECT COUNT(*) FROM audit_events
             WHERE entity_id = ? AND action = 'PURCHASE_ORDER_RECEIVED') AS audits`,
-        [order.id, order.id, order.id],
+        [
+          order.id,
+          order.id,
+          order.id,
+          order.lines[0].productId,
+          setup.locationId,
+          order.lines[0].productId,
+          order.lines[0].productId,
+          order.id,
+          order.id,
+        ],
       );
       expect(Number(counts.receipts)).toBe(3);
       expect(Number(counts.receiptLines)).toBe(3);
+      expect(Number(counts.purchaseMovements)).toBe(3);
+      expect(counts.balance).toBe('6.000');
+      expect(counts.productCost).toBe('80.00');
+      expect(counts.historicalSaleCost).toBe('85.40');
+      expect(counts.receivedCost).toBe('480.00');
       expect(Number(counts.audits)).toBe(3);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .query({ type: 'PURCHASE_RECEIPT', document: 'REM-100', pageSize: 10 })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[]; meta: unknown } }) => {
+          expect(body.data).toHaveLength(3);
+          expect(body.data[0]).toMatchObject({
+            type: 'PURCHASE_RECEIPT',
+            direction: 'IN',
+            product: { id: order.lines[0].productId },
+            location: { id: setup.locationId },
+            document: { type: 'PURCHASE_RECEIPT' },
+          });
+          expect(body.meta).toMatchObject({ pagination: { total: 3 } });
+        });
+    });
+
+    it('rolls back receipt, stock, cost and order state when movement persistence fails', async () => {
+      await registerAccount('purchase-receipt-rollback-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      const setup = await setupProcurement(
+        registrationPayload.email,
+        cookie,
+        'ReceiptRollback',
+      );
+      let order!: {
+        id: string;
+        lines: Array<{ id: string; productId: string }>;
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/purchase-orders')
+        .set('Cookie', cookie)
+        .send({
+          supplierId: setup.supplierId,
+          currency: 'MXN',
+          lines: [
+            {
+              supplierProductId: setup.supplierProductId,
+              quantity: '1.000',
+              unitCost: '80.00',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: { data: typeof order } }) => {
+          order = body.data;
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/approve`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'po-receipt-rollback-approve')
+        .send({ version: 1 })
+        .expect(200);
+
+      await dataSource.query(`
+        ALTER TABLE inventory_movements
+        ADD CONSTRAINT ck_test_reject_purchase_receipt
+        CHECK (type <> 'PURCHASE_RECEIPT')
+      `);
+      try {
+        await request(app.getHttpServer())
+          .post(`/api/v1/purchase-orders/${order.id}/receipts`)
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', 'po-receipt-forced-rollback')
+          .send({
+            version: 2,
+            locationId: setup.locationId,
+            documentReference: 'REM-ROLLBACK',
+            lines: [
+              {
+                purchaseOrderLineId: order.lines[0].id,
+                receivedQuantity: '1.000',
+              },
+            ],
+          })
+          .expect(500);
+      } finally {
+        await dataSource.query(`
+          ALTER TABLE inventory_movements
+          DROP CHECK ck_test_reject_purchase_receipt
+        `);
+      }
+
+      const [state] = await dataSource.query<
+        Array<{
+          status: string;
+          version: number | string;
+          receivedQuantity: string;
+          receipts: number | string;
+          movements: number | string;
+          balances: number | string;
+          productCost: string;
+        }>
+      >(
+        `SELECT po.status, po.version, pol.received_quantity AS receivedQuantity,
+           (SELECT COUNT(*) FROM purchase_receipts WHERE purchase_order_id = po.id) AS receipts,
+           (SELECT COUNT(*) FROM inventory_movements
+            WHERE purchase_receipt_id IS NOT NULL) AS movements,
+           (SELECT COUNT(*) FROM inventory_balances
+            WHERE product_id = pol.product_id AND location_id = ?) AS balances,
+           (SELECT cost FROM products WHERE id = pol.product_id) AS productCost
+         FROM purchase_orders po
+         INNER JOIN purchase_order_lines pol ON pol.purchase_order_id = po.id
+         WHERE po.id = ?`,
+        [setup.locationId, order.id],
+      );
+      expect({
+        status: state.status,
+        version: Number(state.version),
+        receivedQuantity: state.receivedQuantity,
+        receipts: Number(state.receipts),
+        movements: Number(state.movements),
+        balances: Number(state.balances),
+        productCost: state.productCost,
+      }).toEqual({
+        status: 'APPROVED',
+        version: 2,
+        receivedQuantity: '0.000',
+        receipts: 0,
+        movements: 0,
+        balances: 0,
+        productCost: '85.40',
+      });
     });
   });
 

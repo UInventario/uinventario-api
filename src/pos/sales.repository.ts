@@ -567,11 +567,16 @@ export class SalesRepository {
           );
           for (const [index, line] of input.quote.lines.entries()) {
             const saleLineId = randomUUID();
+            const [productCost] = await manager.query<Array<{ cost: string }>>(
+              `SELECT cost FROM products WHERE id = ? AND tenant_id = ? LIMIT 1`,
+              [line.product.id, input.tenantId],
+            );
+            if (!productCost) throw new Error('SALE_PRODUCT_COST_NOT_FOUND');
             await manager.query(
               `INSERT INTO sale_lines
               (id, tenant_id, sale_id, line_number, product_id, product_name,
-               product_sku, quantity, unit_price, subtotal, tax, total)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               product_sku, quantity, unit_price, unit_cost, subtotal, tax, total)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 saleLineId,
                 input.tenantId,
@@ -582,6 +587,7 @@ export class SalesRepository {
                 line.product.sku,
                 line.quantity,
                 line.unitPrice,
+                productCost.cost,
                 line.subtotal,
                 line.tax,
                 line.total,
