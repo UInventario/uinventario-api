@@ -52,6 +52,8 @@ describe('UInventario API (e2e)', () => {
       'inventory_transfer_lines',
       'inventory_transfers',
       'inventory_balances',
+      'purchase_receipt_lines',
+      'purchase_receipts',
       'purchase_order_transitions',
       'purchase_order_lines',
       'purchase_orders',
@@ -905,6 +907,7 @@ describe('UInventario API (e2e)', () => {
                   'PRODUCTS_MANAGE',
                   'PURCHASE_ORDERS_APPROVE',
                   'PURCHASE_ORDERS_MANAGE',
+                  'PURCHASE_RECEIPTS_OVERAGE',
                   'SALE_REPRINT',
                   'SALES_DISCOUNT',
                   'SALES_MANAGE',
@@ -1451,7 +1454,11 @@ describe('UInventario API (e2e)', () => {
       email: string,
       cookie: string,
       suffix: string,
-    ): Promise<{ supplierId: string; supplierProductId: string }> {
+    ): Promise<{
+      supplierId: string;
+      supplierProductId: string;
+      locationId: string;
+    }> {
       await request(app.getHttpServer())
         .put('/api/v1/onboarding/company')
         .set('Cookie', cookie)
@@ -1519,7 +1526,13 @@ describe('UInventario API (e2e)', () => {
         .expect(({ body }: { body: { data: { id: string } } }) => {
           supplierProductId = body.data.id;
         });
-      return { supplierId, supplierProductId };
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [email],
+      );
+      return { supplierId, supplierProductId, locationId: location.id };
     }
 
     it('calculates, edits and isolates tenant-scoped draft orders with sequential folios', async () => {
@@ -2026,6 +2039,244 @@ describe('UInventario API (e2e)', () => {
           ],
         })
         .expect(403);
+    });
+
+    it('records partial, complete and authorized overage receipts idempotently', async () => {
+      await registerAccount('purchase-receipt-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      const setup = await setupProcurement(
+        registrationPayload.email,
+        cookie,
+        'Receipts',
+      );
+      let order!: {
+        id: string;
+        version: number;
+        lines: Array<{ id: string }>;
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/purchase-orders')
+        .set('Cookie', cookie)
+        .send({
+          supplierId: setup.supplierId,
+          currency: 'MXN',
+          lines: [
+            {
+              supplierProductId: setup.supplierProductId,
+              quantity: '5.000',
+              unitCost: '80.00',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: { data: typeof order } }) => {
+          order = body.data;
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/approve`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'po-receipt-approve-1')
+        .send({ version: 1 })
+        .expect(200);
+
+      const [admin] = await dataSource.query<
+        Array<{ role_id: string; tenant_id: string }>
+      >(
+        `SELECT ur.role_id, u.tenant_id FROM users u
+         INNER JOIN user_roles ur ON ur.user_id = u.id AND ur.tenant_id = u.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ?
+           AND permission = 'PURCHASE_RECEIPTS_OVERAGE'`,
+        [admin.role_id, admin.tenant_id],
+      );
+
+      const partial = {
+        version: 2,
+        locationId: setup.locationId,
+        documentReference: 'REM-100-PARCIAL',
+        lines: [
+          {
+            purchaseOrderLineId: order.lines[0].id,
+            receivedQuantity: '2.000',
+          },
+        ],
+      };
+      const partialKey = 'po-receipt-partial-1';
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', partialKey)
+        .send(partial)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              status: 'PARTIALLY_RECEIVED',
+              version: 3,
+              lines: [
+                {
+                  receivedQuantity: '2.000',
+                  remainingQuantity: '3.000',
+                  overageQuantity: '0.000',
+                },
+              ],
+              receipts: [
+                {
+                  documentReference: partial.documentReference,
+                  location: { id: setup.locationId },
+                  responsible: { email: registrationPayload.email },
+                  lines: [
+                    {
+                      purchaseOrderLineId: order.lines[0].id,
+                      receivedQuantity: '2.000',
+                      overageQuantity: '0.000',
+                    },
+                  ],
+                },
+              ],
+            },
+            meta: { idempotentReplay: false },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', partialKey)
+        .send(partial)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { version: 3 },
+            meta: { idempotentReplay: true },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', partialKey)
+        .send({ ...partial, documentReference: 'REM-ALTERADA' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('IDEMPOTENCY_KEY_REUSED');
+        });
+
+      const excess = {
+        version: 3,
+        locationId: setup.locationId,
+        documentReference: 'REM-100-EXCESO',
+        lines: [
+          {
+            purchaseOrderLineId: order.lines[0].id,
+            receivedQuantity: '4.000',
+          },
+        ],
+      };
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'po-receipt-overage-denied')
+        .send({
+          ...excess,
+          overageReason: 'El proveedor envió una unidad adicional',
+        })
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe(
+            'PURCHASE_RECEIPT_OVERAGE_PERMISSION_REQUIRED',
+          );
+        });
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'PURCHASE_RECEIPTS_OVERAGE')`,
+        [admin.role_id, admin.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'po-receipt-overage-no-reason')
+        .send(excess)
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PURCHASE_RECEIPT_OVERAGE_REASON_REQUIRED');
+        });
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'po-receipt-complete-1')
+        .send({
+          ...partial,
+          version: 3,
+          documentReference: 'REM-100-COMPLETA',
+          lines: [{ ...partial.lines[0], receivedQuantity: '3.000' }],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              status: 'RECEIVED',
+              version: 4,
+              lines: [
+                {
+                  receivedQuantity: '5.000',
+                  remainingQuantity: '0.000',
+                  overageQuantity: '0.000',
+                },
+              ],
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${order.id}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'po-receipt-overage-allowed')
+        .send({
+          ...excess,
+          version: 4,
+          overageReason: 'El proveedor envió una unidad adicional',
+          lines: [{ ...excess.lines[0], receivedQuantity: '1.000' }],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              status: 'RECEIVED',
+              version: 5,
+              lines: [
+                {
+                  receivedQuantity: '6.000',
+                  remainingQuantity: '0.000',
+                  overageQuantity: '1.000',
+                },
+              ],
+            },
+          });
+        });
+
+      const [counts] = await dataSource.query<
+        Array<{
+          receipts: number | string;
+          receiptLines: number | string;
+          audits: number | string;
+        }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM purchase_receipts WHERE purchase_order_id = ?) AS receipts,
+           (SELECT COUNT(*) FROM purchase_receipt_lines prl
+            INNER JOIN purchase_receipts pr ON pr.id = prl.receipt_id
+            WHERE pr.purchase_order_id = ?) AS receiptLines,
+           (SELECT COUNT(*) FROM audit_events
+            WHERE entity_id = ? AND action = 'PURCHASE_ORDER_RECEIVED') AS audits`,
+        [order.id, order.id, order.id],
+      );
+      expect(Number(counts.receipts)).toBe(3);
+      expect(Number(counts.receiptLines)).toBe(3);
+      expect(Number(counts.audits)).toBe(3);
     });
   });
 

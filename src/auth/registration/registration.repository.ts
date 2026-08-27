@@ -91,10 +91,11 @@ export class RegistrationRepository {
         (?, ?, 'SUPPLIERS_MANAGE'),
         (?, ?, 'PURCHASE_ORDERS_MANAGE'),
         (?, ?, 'PURCHASE_ORDERS_APPROVE'),
+        (?, ?, 'PURCHASE_RECEIPTS_OVERAGE'),
         (?, ?, 'INVENTORY_VIEW'), (?, ?, 'INVENTORY_ADJUST'),
         (?, ?, 'INVENTORY_TRANSFER'), (?, ?, 'INVENTORY_COUNT'),
         (?, ?, 'INVENTORY_APPROVE')`,
-      Array.from({ length: 20 }, () => [role.id, tenant.id]).flat(),
+      Array.from({ length: 21 }, () => [role.id, tenant.id]).flat(),
     );
     await manager.update(
       RegistrationRequestEntity,

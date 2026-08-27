@@ -14,6 +14,9 @@ export interface PurchaseOrderLineData {
   productSku: string;
   supplierCode: string;
   quantity: string;
+  receivedQuantity: string;
+  remainingQuantity: string;
+  overageQuantity: string;
   unitCost: string;
   subtotal: string;
   notes: string | null;
@@ -34,9 +37,25 @@ export interface PurchaseOrderData {
   cancelledAt: string | null;
   cancellationReason: string | null;
   transitions: PurchaseOrderTransitionData[];
+  receipts: PurchaseReceiptData[];
   lines: PurchaseOrderLineData[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface PurchaseReceiptData {
+  id: string;
+  documentReference: string;
+  location: { id: string; name: string; code: string };
+  responsible: { id: string; email: string };
+  overageReason: string | null;
+  lines: Array<{
+    id: string;
+    purchaseOrderLineId: string;
+    receivedQuantity: string;
+    overageQuantity: string;
+  }>;
+  createdAt: string;
 }
 
 export interface PurchaseOrderTransitionData {
@@ -50,7 +69,7 @@ export interface PurchaseOrderTransitionData {
 
 export interface PurchaseOrderResponse {
   data: PurchaseOrderData;
-  meta: { apiVersion: '1'; idempotentReplay?: boolean };
+  meta: { apiVersion: '1'; idempotentReplay?: boolean; receiptId?: string };
 }
 
 export interface PurchaseOrderListResponse {
