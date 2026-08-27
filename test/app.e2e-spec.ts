@@ -14,6 +14,7 @@ import { RegistrationService } from '../src/auth/registration/registration.servi
 import { ThrottlerStorage, ThrottlerStorageService } from '@nestjs/throttler';
 import * as ExcelJS from 'exceljs';
 import { AuditService } from '../src/audit/audit.service';
+import { SupplierProductData } from '../src/suppliers/supplier-product.types';
 
 describe('UInventario API (e2e)', () => {
   let app: INestApplication<App>;
@@ -51,6 +52,8 @@ describe('UInventario API (e2e)', () => {
       'inventory_transfer_lines',
       'inventory_transfers',
       'inventory_balances',
+      'supplier_product_prices',
+      'supplier_products',
       'supplier_contacts',
       'suppliers',
       'products',
@@ -1198,6 +1201,239 @@ describe('UInventario API (e2e)', () => {
         .expect(({ body }: { body: { code?: string } }) => {
           expect(body.code).toBe('PERMISSION_DENIED');
         });
+    });
+
+    it('keeps tenant-scoped supplier prices with immutable history without changing catalog costs', async () => {
+      await registerAccount('supplier-price-primary-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeSupplierOnboarding(registrationPayload.email, cookie);
+
+      let product!: { id: string; cost: string; price: string };
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Cafe molido 500 g',
+          sku: 'CAFE-PROV-500',
+          cost: '85.40',
+          price: '119.90',
+        })
+        .expect(201)
+        .expect(({ body }: { body: { data: typeof product } }) => {
+          product = body.data;
+        });
+
+      let supplier!: { id: string };
+      await request(app.getHttpServer())
+        .post('/api/v1/suppliers')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Proveedor Uno, S.A. de C.V.',
+          taxIdentifier: 'ABC010203AB1',
+        })
+        .expect(201)
+        .expect(({ body }: { body: { data: typeof supplier } }) => {
+          supplier = body.data;
+        });
+
+      const initialPrice = {
+        supplierId: supplier.id,
+        productId: product.id,
+        supplierCode: 'PROV-CAFE-500',
+        currency: 'MXN',
+        unitCost: '80.00',
+        minimumQuantity: '12.000',
+        validFrom: '2026-08-01',
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/supplier-products')
+        .set('Cookie', cookie)
+        .send({ ...initialPrice, currency: 'ZZZ' })
+        .expect(400);
+      await request(app.getHttpServer())
+        .post('/api/v1/supplier-products')
+        .set('Cookie', cookie)
+        .send({ ...initialPrice, validFrom: '2026-02-31' })
+        .expect(400);
+      await request(app.getHttpServer())
+        .post('/api/v1/supplier-products')
+        .set('Cookie', cookie)
+        .send({ ...initialPrice, validTo: '2026-07-31' })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVALID_SUPPLIER_PRICE_VALIDITY');
+        });
+
+      let link!: SupplierProductData;
+      await request(app.getHttpServer())
+        .post('/api/v1/supplier-products')
+        .set('Cookie', cookie)
+        .send(initialPrice)
+        .expect(201)
+        .expect(({ body }: { body: { data: SupplierProductData } }) => {
+          link = body.data;
+          expect(body.data).toMatchObject({
+            supplierCode: initialPrice.supplierCode,
+            minimumQuantity: initialPrice.minimumQuantity,
+            version: 1,
+            product: {
+              id: product.id,
+              catalogCost: '85.40',
+              catalogPrice: '119.90',
+            },
+            prices: [
+              {
+                currency: 'MXN',
+                unitCost: '80.00',
+                validFrom: '2026-08-01',
+                validTo: null,
+              },
+            ],
+          });
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/supplier-products')
+        .set('Cookie', cookie)
+        .send(initialPrice)
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SUPPLIER_PRODUCT_ALREADY_EXISTS');
+        });
+
+      let otherProduct!: { id: string };
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Cafe soluble',
+          sku: 'CAFE-SOLUBLE',
+          cost: '70.00',
+          price: '100.00',
+        })
+        .expect(201)
+        .expect(({ body }: { body: { data: typeof otherProduct } }) => {
+          otherProduct = body.data;
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/supplier-products')
+        .set('Cookie', cookie)
+        .send({
+          ...initialPrice,
+          productId: otherProduct.id,
+          supplierCode: ' prov-cafe-500 ',
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SUPPLIER_CODE_ALREADY_EXISTS');
+        });
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/supplier-products/${link.id}`)
+        .set('Cookie', cookie)
+        .send({
+          ...initialPrice,
+          version: 1,
+          currency: 'USD',
+          unitCost: '78.50',
+          minimumQuantity: '24.000',
+          validFrom: '2026-09-01',
+        })
+        .expect(200)
+        .expect(({ body }: { body: { data: SupplierProductData } }) => {
+          expect(body.data).toMatchObject({
+            version: 2,
+            minimumQuantity: '24.000',
+            product: { catalogCost: '85.40', catalogPrice: '119.90' },
+            prices: [
+              {
+                currency: 'USD',
+                unitCost: '78.50',
+                validFrom: '2026-09-01',
+                validTo: null,
+              },
+              {
+                currency: 'MXN',
+                unitCost: '80.00',
+                validFrom: '2026-08-01',
+                validTo: '2026-08-31',
+              },
+            ],
+          });
+        });
+      await request(app.getHttpServer())
+        .patch(`/api/v1/supplier-products/${link.id}`)
+        .set('Cookie', cookie)
+        .send({ ...initialPrice, version: 1, validFrom: '2026-10-01' })
+        .expect(409)
+        .expect(
+          ({ body }: { body: { code?: string; currentVersion?: number } }) => {
+            expect(body.code).toBe('SUPPLIER_PRODUCT_VERSION_CONFLICT');
+            expect(body.currentVersion).toBe(2);
+          },
+        );
+
+      await request(app.getHttpServer())
+        .get('/api/v1/supplier-products')
+        .query({ q: 'prov-cafe', page: 1, pageSize: 10 })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: SupplierProductData[];
+              meta: { pagination: { total: number; totalPages: number } };
+            };
+          }) => {
+            expect(body.data).toHaveLength(1);
+            expect(body.data[0].prices).toHaveLength(2);
+            expect(body.meta.pagination).toMatchObject({
+              total: 1,
+              totalPages: 1,
+            });
+          },
+        );
+
+      const [catalogProduct] = await dataSource.query<
+        Array<{ cost: string; price: string }>
+      >('SELECT cost, price FROM products WHERE id = ?', [product.id]);
+      expect(catalogProduct).toMatchObject({ cost: '85.40', price: '119.90' });
+
+      const secondary = {
+        organizationName: 'Otra empresa de compras',
+        email: 'other-supplier-price@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'supplier-price-secondary-registration')
+        .send(secondary)
+        .expect(201);
+      const secondaryCookie = await createPersistedSession(secondary.email);
+      await completeSupplierOnboarding(secondary.email, secondaryCookie);
+      await request(app.getHttpServer())
+        .get(`/api/v1/supplier-products/${link.id}`)
+        .set('Cookie', secondaryCookie)
+        .expect(404);
+      await request(app.getHttpServer())
+        .post('/api/v1/supplier-products')
+        .set('Cookie', secondaryCookie)
+        .send(initialPrice)
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(['INVALID_SUPPLIER', 'INVALID_PRODUCT']).toContain(body.code);
+        });
+
+      const [audit] = await dataSource.query<
+        Array<{ event_count: number | string }>
+      >(
+        `SELECT COUNT(*) AS event_count FROM audit_events
+         WHERE entity_type = 'SUPPLIER_PRODUCT' AND entity_id = ?`,
+        [link.id],
+      );
+      expect(Number(audit.event_count)).toBe(2);
     });
   });
 
