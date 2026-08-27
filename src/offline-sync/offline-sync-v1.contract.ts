@@ -85,6 +85,19 @@ export interface OfflineInventoryAvailabilityV1 extends OfflineSyncRecordV1 {
   availableQuantity: string;
 }
 
+export interface OfflinePosPolicyV1 extends OfflineSyncRecordV1 {
+  kind: 'POS_POLICY';
+  branchId: string;
+  warehouseId: string;
+  cashRegisterId: string;
+  shiftId: string;
+  shiftOpenedAt: string;
+  currency: string;
+  taxRate: string;
+  paymentMethods: ['CASH'];
+  negativeStock: 'DENY';
+}
+
 export type OfflineSyncEntityV1 =
   | OfflineBranchV1
   | OfflineWarehouseV1
@@ -109,6 +122,7 @@ export interface OfflineBootstrapResponseV1 {
     tenant: { id: string; name: string };
     user: { id: string; roles: string[]; permissions: AppPermission[] };
   };
+  posPolicy: OfflinePosPolicyV1 | null;
   page: {
     initialSyncCursor: string;
     cursor: string;
