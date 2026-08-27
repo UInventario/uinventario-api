@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
 import { ListInventoryStockDto } from './dto/list-inventory-stock.dto';
+import { ListInventoryMovementsDto } from './dto/list-inventory-movements.dto';
 import {
   IdempotencyConflictError,
   InitialStockAlreadyExistsError,
@@ -12,6 +13,7 @@ import {
 import {
   InventoryBalanceData,
   InventoryLocationData,
+  InventoryMovementHistoryItem,
   InventoryMovementData,
   InventoryStockItem,
 } from './inventory.types';
@@ -46,6 +48,121 @@ export class InventoryRepository {
        WHERE tenant_id = ? AND warehouse_id = ? ORDER BY name, id`,
       [tenantId, warehouseId],
     );
+  }
+
+  async listMovements(
+    tenantId: string,
+    branchId: string,
+    query: ListInventoryMovementsDto,
+  ): Promise<{
+    items: InventoryMovementHistoryItem[];
+    total: number;
+    scope: { branch: { id: string; name: string } };
+  }> {
+    const [branch] = await this.dataSource.query<
+      Array<{ id: string; name: string }>
+    >('SELECT id, name FROM branches WHERE id = ? AND tenant_id = ? LIMIT 1', [
+      branchId,
+      tenantId,
+    ]);
+    if (!branch) throw new InventoryTargetNotFoundError();
+
+    const filters = ['im.tenant_id = ?', 'b.id = ?'];
+    const parameters: unknown[] = [tenantId, branchId];
+    if (query.productId) {
+      filters.push('im.product_id = ?');
+      parameters.push(query.productId);
+    }
+    if (query.q) {
+      const search = `%${query.q}%`;
+      filters.push(
+        '(p.name LIKE ? OR p.normalized_sku LIKE ? OR p.barcode LIKE ?)',
+      );
+      parameters.push(search, search.toUpperCase(), search);
+    }
+    if (query.type) {
+      filters.push('im.type = ?');
+      parameters.push(query.type);
+    }
+    if (query.dateFrom) {
+      filters.push('im.created_at >= ?');
+      parameters.push(query.dateFrom);
+    }
+    if (query.dateTo) {
+      filters.push('im.created_at < DATE_ADD(?, INTERVAL 1 DAY)');
+      parameters.push(query.dateTo);
+    }
+    const joins = `FROM inventory_movements im
+      INNER JOIN products p ON p.id = im.product_id AND p.tenant_id = im.tenant_id
+      INNER JOIN locations l ON l.id = im.location_id AND l.tenant_id = im.tenant_id
+      INNER JOIN warehouses w ON w.id = l.warehouse_id AND w.tenant_id = im.tenant_id
+      INNER JOIN branches b ON b.id = w.branch_id AND b.tenant_id = im.tenant_id
+      INNER JOIN users u ON u.id = im.created_by_user_id AND u.tenant_id = im.tenant_id`;
+    const where = filters.join(' AND ');
+    const offset = (query.page - 1) * query.pageSize;
+    const [rows, countRows] = await Promise.all([
+      this.dataSource.query<
+        Array<{
+          id: string;
+          type: InventoryMovementHistoryItem['type'];
+          quantity_change: string;
+          resulting_quantity: string;
+          reason: string;
+          reference: string | null;
+          created_at: Date | string;
+          product_id: string;
+          product_name: string;
+          product_sku: string;
+          location_id: string;
+          location_name: string;
+          location_code: string;
+          warehouse_id: string;
+          warehouse_name: string;
+          user_id: string;
+          user_email: string;
+        }>
+      >(
+        `SELECT im.id, im.type, im.quantity_change, im.resulting_quantity,
+                im.reason, im.reference, im.created_at,
+                p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
+                l.id AS location_id, l.name AS location_name, l.code AS location_code,
+                w.id AS warehouse_id, w.name AS warehouse_name,
+                u.id AS user_id, u.email AS user_email
+         ${joins} WHERE ${where}
+         ORDER BY im.created_at DESC, im.id DESC LIMIT ? OFFSET ?`,
+        [...parameters, query.pageSize, offset],
+      ),
+      this.dataSource.query<Array<{ total: number | string }>>(
+        `SELECT COUNT(*) AS total ${joins} WHERE ${where}`,
+        parameters,
+      ),
+    ]);
+    return {
+      items: rows.map((row) => ({
+        id: row.id,
+        type: row.type,
+        direction: row.quantity_change.startsWith('-') ? 'OUT' : 'IN',
+        quantityChange: this.normalizeDecimal(row.quantity_change),
+        resultingQuantity: this.normalizeDecimal(row.resulting_quantity),
+        reason: row.reason,
+        reference: row.reference,
+        createdAt: new Date(row.created_at).toISOString(),
+        product: {
+          id: row.product_id,
+          name: row.product_name,
+          sku: row.product_sku,
+        },
+        location: {
+          id: row.location_id,
+          name: row.location_name,
+          code: row.location_code,
+          warehouse: { id: row.warehouse_id, name: row.warehouse_name },
+        },
+        responsible: { id: row.user_id, email: row.user_email },
+      })),
+      total: Number(countRows[0]?.total ?? 0),
+      scope: { branch },
+    };
   }
 
   async listStock(

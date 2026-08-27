@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
 import { ListInventoryStockDto } from './dto/list-inventory-stock.dto';
+import { ListInventoryMovementsDto } from './dto/list-inventory-movements.dto';
 import {
   IdempotencyConflictError,
   InitialStockAlreadyExistsError,
@@ -17,6 +18,7 @@ import {
   InventoryBalanceResponse,
   InventoryLocationsResponse,
   InventoryMovementResponse,
+  InventoryMovementListResponse,
   InventoryStockListResponse,
 } from './inventory.types';
 
@@ -32,6 +34,43 @@ export class InventoryService {
       data: await this.inventory.listLocations(tenantId, warehouseId),
       meta: { apiVersion: '1' },
     };
+  }
+
+  async listMovements(
+    tenantId: string,
+    branchId: string,
+    query: ListInventoryMovementsDto,
+  ): Promise<InventoryMovementListResponse> {
+    if (query.dateFrom && query.dateTo && query.dateFrom > query.dateTo) {
+      throw new BadRequestException({
+        code: 'INVALID_DATE_RANGE',
+        message: 'La fecha inicial no puede ser posterior a la fecha final.',
+      });
+    }
+    try {
+      const result = await this.inventory.listMovements(
+        tenantId,
+        branchId,
+        query,
+      );
+      return {
+        data: result.items,
+        meta: {
+          apiVersion: '1',
+          scope: result.scope,
+          pagination: {
+            page: query.page,
+            pageSize: query.pageSize,
+            total: result.total,
+            totalPages: Math.ceil(result.total / query.pageSize),
+          },
+        },
+      };
+    } catch (error) {
+      if (error instanceof InventoryTargetNotFoundError)
+        throw new NotFoundException();
+      throw error;
+    }
   }
 
   async listStock(
