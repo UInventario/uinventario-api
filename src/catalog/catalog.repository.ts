@@ -214,9 +214,20 @@ export class CatalogRepository {
   } | null> {
     return this.dataSource.transaction(async (manager) => {
       const products = await manager.query<
-        Array<{ id: string; active: number | boolean }>
+        Array<{
+          id: string;
+          active: number | boolean;
+          sku: string;
+          barcode: string | null;
+          name: string;
+          category_id: string | null;
+          brand_id: string | null;
+          price: string;
+          version: number;
+        }>
       >(
-        'SELECT id, active FROM products WHERE id = ? AND tenant_id = ? FOR UPDATE',
+        `SELECT id, active, sku, barcode, name, category_id, brand_id, price, version
+         FROM products WHERE id = ? AND tenant_id = ? FOR UPDATE`,
         [id, tenantId],
       );
       if (!products[0]) return null;
@@ -252,6 +263,27 @@ export class CatalogRepository {
         };
       }
 
+      const removed = products[0];
+      await manager.query(
+        `INSERT INTO offline_sync_tombstones
+          (change_id, tenant_id, entity_kind, entity_id, payload)
+         VALUES (?, ?, 'PRODUCT', ?, ?)`,
+        [
+          randomUUID(),
+          tenantId,
+          id,
+          JSON.stringify({
+            sku: removed.sku,
+            barcode: removed.barcode,
+            name: removed.name,
+            categoryId: removed.category_id,
+            brandId: removed.brand_id,
+            price: Number(removed.price).toFixed(2),
+            version: Number(removed.version) + 1,
+            active: false,
+          }),
+        ],
+      );
       await manager.query(
         'DELETE FROM products WHERE id = ? AND tenant_id = ?',
         [id, tenantId],

@@ -10,6 +10,7 @@ interface StructureRow {
   id: string;
   name: string;
   created_at: Date | string;
+  updated_at: Date | string;
   active?: number | boolean;
   timezone?: string;
   branch_id?: string;
@@ -28,9 +29,9 @@ export class OfflineBootstrapRepository {
     snapshotAt: string;
   }): Promise<OfflineSyncEntityV1[]> {
     const branchRows = await this.dataSource.query<StructureRow[]>(
-      `SELECT b.id, b.name, b.timezone, b.active, b.created_at
+      `SELECT b.id, b.name, b.timezone, b.active, b.created_at, b.updated_at
        FROM branches b
-       WHERE b.tenant_id = ? AND b.active = TRUE AND b.created_at <= ?
+       WHERE b.tenant_id = ? AND b.active = TRUE AND b.updated_at <= ?
          AND (? = TRUE OR EXISTS (
            SELECT 1 FROM user_branch_access uba
            WHERE uba.tenant_id = b.tenant_id AND uba.user_id = ? AND uba.branch_id = b.id
@@ -48,15 +49,15 @@ export class OfflineBootstrapRepository {
     const inBranches = branchIds.map(() => '?').join(', ');
     const [warehouseRows, cashRegisterRows] = await Promise.all([
       this.dataSource.query<StructureRow[]>(
-        `SELECT id, branch_id, name, active, created_at FROM warehouses
-         WHERE tenant_id = ? AND active = TRUE AND created_at <= ?
+        `SELECT id, branch_id, name, active, created_at, updated_at FROM warehouses
+         WHERE tenant_id = ? AND active = TRUE AND updated_at <= ?
            AND branch_id IN (${inBranches}) ORDER BY id`,
         [input.scope.tenantId, input.snapshotAt, ...branchIds],
       ),
       this.dataSource.query<StructureRow[]>(
-        `SELECT cr.id, cr.branch_id, cr.name, cr.code, cr.created_at
+        `SELECT cr.id, cr.branch_id, cr.name, cr.code, cr.created_at, cr.updated_at
          FROM cash_registers cr
-         WHERE cr.tenant_id = ? AND cr.created_at <= ?
+         WHERE cr.tenant_id = ? AND cr.updated_at <= ?
            AND cr.branch_id IN (${inBranches})
            AND (? = TRUE OR EXISTS (
              SELECT 1 FROM user_cash_register_access ucra
@@ -75,8 +76,8 @@ export class OfflineBootstrapRepository {
     const warehouseIds = warehouseRows.map(({ id }) => id);
     const locationRows = warehouseIds.length
       ? await this.dataSource.query<StructureRow[]>(
-          `SELECT id, warehouse_id, name, code, active, created_at FROM locations
-           WHERE tenant_id = ? AND active = TRUE AND created_at <= ?
+          `SELECT id, warehouse_id, name, code, active, created_at, updated_at FROM locations
+           WHERE tenant_id = ? AND active = TRUE AND updated_at <= ?
              AND warehouse_id IN (${warehouseIds.map(() => '?').join(', ')}) ORDER BY id`,
           [input.scope.tenantId, input.snapshotAt, ...warehouseIds],
         )
@@ -235,7 +236,7 @@ export class OfflineBootstrapRepository {
       id: row.id,
       tenantId,
       version: 1,
-      updatedAt: this.iso(row.created_at),
+      updatedAt: this.iso(row.updated_at),
     };
   }
 
@@ -252,6 +253,19 @@ export class OfflineBootstrapRepository {
   }
 
   private iso(value: Date | string): string {
+    if (value instanceof Date) {
+      return new Date(
+        Date.UTC(
+          value.getFullYear(),
+          value.getMonth(),
+          value.getDate(),
+          value.getHours(),
+          value.getMinutes(),
+          value.getSeconds(),
+          value.getMilliseconds(),
+        ),
+      ).toISOString();
+    }
     return new Date(value).toISOString();
   }
 
