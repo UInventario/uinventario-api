@@ -30,6 +30,8 @@ el usuario, sus roles y el tenant de esa sesión.
 - `PUT /api/v1/onboarding/company`: guarda nombre legal/comercial y país sin aceptar IDs de tenant del cliente.
 - `GET/PUT /api/v1/onboarding/initial-location`: recupera o crea transaccionalmente la sucursal, bodega y ubicación iniciales.
 - `GET/PUT /api/v1/onboarding/initial-cash-register`: crea la caja inicial y completa el onboarding sólo cuando existe todo el contexto operativo.
+- `POST /api/v1/products`: crea un producto con importes decimales exactos e identificadores únicos por tenant.
+- `GET /api/v1/products/options`: recupera categorías y marcas disponibles para el tenant autenticado.
 
 Cada login crea una sesión independiente por dispositivo. Las pestañas de un mismo
 navegador comparten la cookie; una rotación invalida el token anterior y logout no

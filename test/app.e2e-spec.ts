@@ -31,6 +31,9 @@ describe('UInventario API (e2e)', () => {
   async function resetIdentityData(): Promise<void> {
     await dataSource.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const table of [
+      'products',
+      'brands',
+      'categories',
       'cash_registers',
       'locations',
       'warehouses',
@@ -709,6 +712,153 @@ describe('UInventario API (e2e)', () => {
                 cashRegister: { name: 'Caja Principal' },
               },
               nextStep: 'APPLICATION',
+            },
+          });
+        });
+    });
+  });
+
+  describe('product creation', () => {
+    beforeEach(resetIdentityData);
+
+    async function completeOnboarding(
+      email: string,
+      cookie: string,
+    ): Promise<void> {
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: `${email} Legal`,
+          tradeName: email,
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Sucursal Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Principal',
+          locationName: 'Ubicación General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Principal' })
+        .expect(200);
+    }
+
+    it('persists commercial data and scopes SKU and barcode uniqueness by tenant', async () => {
+      await registerAccount('product-primary-registration');
+      const primaryCookie = await createPersistedSession(
+        registrationPayload.email,
+      );
+
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', primaryCookie)
+        .send({ name: 'Café', sku: 'CAFE-1', cost: '10.00', price: '15.00' })
+        .expect(403);
+      await completeOnboarding(registrationPayload.email, primaryCookie);
+
+      const product = {
+        name: 'Café molido 500 g',
+        sku: 'CAFE-500',
+        barcode: '7501234567890',
+        categoryName: 'Abarrotes',
+        brandName: 'Casa',
+        cost: '85.40',
+        price: '119.90',
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', primaryCookie)
+        .send({ ...product, cost: '-1' })
+        .expect(400);
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', primaryCookie)
+        .send(product)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              name: product.name,
+              sku: product.sku,
+              barcode: product.barcode,
+              category: { name: product.categoryName },
+              brand: { name: product.brandName },
+              cost: product.cost,
+              price: product.price,
+              active: true,
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', primaryCookie)
+        .send({
+          ...product,
+          sku: product.sku.toLowerCase(),
+          barcode: '7500000000001',
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SKU_ALREADY_EXISTS');
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', primaryCookie)
+        .send({ ...product, sku: 'OTHER-1' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('BARCODE_ALREADY_EXISTS');
+        });
+
+      const secondary = {
+        organizationName: 'Otra Tienda',
+        email: 'other-product@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'product-secondary-registration')
+        .send(secondary)
+        .expect(201);
+      const secondaryCookie = await createPersistedSession(secondary.email);
+      await completeOnboarding(secondary.email, secondaryCookie);
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', secondaryCookie)
+        .send(product)
+        .expect(201);
+
+      const [counts] = await dataSource.query<
+        Array<{
+          products: number | string;
+          categories: number | string;
+          brands: number | string;
+        }>
+      >(`SELECT (SELECT COUNT(*) FROM products) AS products,
+                (SELECT COUNT(*) FROM categories) AS categories,
+                (SELECT COUNT(*) FROM brands) AS brands`);
+      expect(Number(counts.products)).toBe(2);
+      expect(Number(counts.categories)).toBe(2);
+      expect(Number(counts.brands)).toBe(2);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/products/options')
+        .set('Cookie', primaryCookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              categories: [{ name: product.categoryName }],
+              brands: [{ name: product.brandName }],
             },
           });
         });
