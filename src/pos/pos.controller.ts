@@ -26,6 +26,9 @@ import { CreateCashRegisterMovementDto } from './dto/create-cash-register-moveme
 import { ReverseCashRegisterMovementDto } from './dto/reverse-cash-register-movement.dto';
 import { CashRegisterClosureService } from './cash-register-closure.service';
 import { CloseCashRegisterShiftDto } from './dto/close-cash-register-shift.dto';
+import { VoidSaleDto } from './dto/void-sale.dto';
+import { PermissionGuard } from '../auth/authorization/permission.guard';
+import { RequirePermissions } from '../auth/authorization/require-permissions.decorator';
 
 @Controller('pos')
 @UseGuards(SessionGuard, PosAccessGuard)
@@ -175,6 +178,29 @@ export class PosController {
       principal.context.branch!.id,
       saleId,
     );
+  }
+
+  @Post('sales/:saleId/void')
+  @UseGuards(PermissionGuard)
+  @RequirePermissions('SALES_VOID')
+  async voidSale(
+    @Req() request: AuthenticatedRequest,
+    @Param('saleId', ParseUUIDPipe) saleId: string,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: VoidSaleDto,
+  ) {
+    const { principal } = request;
+    const result = await this.pos.voidSale({
+      tenantId: principal.tenant.id,
+      branchId: principal.context.branch!.id,
+      cashRegisterId: principal.context.cashRegister!.id,
+      userId: principal.user.id,
+      saleId,
+      idempotencyKey,
+      dto,
+      correlationId: request.requestId!,
+    });
+    return result;
   }
 
   @Post('cart/quote')

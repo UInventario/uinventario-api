@@ -33,7 +33,7 @@ export interface PosCartQuoteResponse {
 export interface CashSaleData {
   id: string;
   receiptNumber: string;
-  status: 'COMPLETED';
+  status: 'COMPLETED' | 'VOIDED';
   context: PosCartQuoteResponse['data']['context'];
   userId: string;
   currency: string;
@@ -49,11 +49,17 @@ export interface CashSaleData {
   totals: PosCartQuoteResponse['data']['totals'];
   payment: {
     method: 'CASH';
+    status: 'COMPLETED' | 'REVERSED';
     amountReceived: string;
     amountApplied: string;
     change: string;
   };
   createdAt: string;
+  void: {
+    reason: string;
+    user: { id: string; email: string };
+    voidedAt: string;
+  } | null;
 }
 
 export interface CashSaleResponse {
@@ -64,7 +70,7 @@ export interface CashSaleResponse {
 export interface SaleSummaryData {
   id: string;
   receiptNumber: string;
-  status: 'COMPLETED';
+  status: 'COMPLETED' | 'VOIDED';
   user: { id: string; email: string };
   cashRegister: { id: string; name: string; code: string };
   currency: string;
@@ -77,6 +83,7 @@ export interface SaleDetailData extends Omit<CashSaleData, 'userId'> {
   user: { id: string; email: string };
   movements: Array<{
     id: string;
+    type: 'SALE' | 'SALE_VOID';
     saleLineId: string;
     product: { id: string; name: string; sku: string };
     location: { id: string; name: string; code: string };

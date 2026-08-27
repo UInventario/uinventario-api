@@ -11,11 +11,14 @@ import { posConfig } from '../config/pos.config';
 import { CreateCashSaleDto } from './dto/create-cash-sale.dto';
 import { ListSalesDto } from './dto/list-sales.dto';
 import { QuoteCartDto } from './dto/quote-cart.dto';
+import { VoidSaleDto } from './dto/void-sale.dto';
 import {
   PosContextNotFoundError,
   PosIdempotencyConflictError,
   PosInsufficientStockError,
   PosProductNotAvailableError,
+  SaleAlreadyVoidedError,
+  SaleVoidNotAllowedError,
 } from './pos.errors';
 import { PosRepository } from './pos.repository';
 import { SalesRepository } from './sales.repository';
@@ -59,6 +62,69 @@ export class PosService {
     const sale = await this.sales.getSaleDetail(tenantId, branchId, saleId);
     if (!sale) throw new NotFoundException();
     return { data: sale, meta: { apiVersion: '1' as const } };
+  }
+
+  async voidSale(input: {
+    tenantId: string;
+    branchId: string;
+    cashRegisterId: string;
+    userId: string;
+    saleId: string;
+    idempotencyKey: string | undefined;
+    dto: VoidSaleDto;
+    correlationId: string;
+  }) {
+    this.assertIdempotencyKey(input.idempotencyKey);
+    const fingerprint = createHash('sha256')
+      .update(
+        JSON.stringify({ saleId: input.saleId, reason: input.dto.reason }),
+      )
+      .digest('hex');
+    try {
+      const result = await this.sales.voidSale({
+        tenantId: input.tenantId,
+        branchId: input.branchId,
+        cashRegisterId: input.cashRegisterId,
+        userId: input.userId,
+        saleId: input.saleId,
+        reason: input.dto.reason,
+        idempotencyKey: input.idempotencyKey!,
+        fingerprint,
+        correlationId: input.correlationId,
+      });
+      if (!result) throw new NotFoundException();
+      const detail = await this.sales.getSaleDetail(
+        input.tenantId,
+        input.branchId,
+        result.saleId,
+      );
+      if (!detail) throw new NotFoundException();
+      return {
+        data: detail,
+        meta: { apiVersion: '1' as const, idempotentReplay: result.replay },
+      };
+    } catch (error) {
+      if (error instanceof PosIdempotencyConflictError) {
+        throw new ConflictException({
+          code: 'IDEMPOTENCY_KEY_REUSED',
+          message: 'La clave de idempotencia ya fue usada con otros datos.',
+        });
+      }
+      if (error instanceof SaleAlreadyVoidedError) {
+        throw new ConflictException({
+          code: 'SALE_ALREADY_VOIDED',
+          message: 'La venta ya fue anulada.',
+        });
+      }
+      if (error instanceof SaleVoidNotAllowedError) {
+        throw new ConflictException({
+          code: 'SALE_VOID_NOT_ALLOWED',
+          message:
+            'La venta sólo puede anularse mientras su turno de caja siga abierto.',
+        });
+      }
+      throw error;
+    }
   }
 
   async createCashSale(input: {

@@ -3879,6 +3879,221 @@ describe('UInventario API (e2e)', () => {
         });
     });
 
+    it('voids a sale once with payment, stock, cash and audit compensation', async () => {
+      const { cookie, productId, locationId } = await preparePos();
+      const sale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-to-void')
+        .send({
+          lines: [{ productId, quantity: '2' }],
+          cashReceived: '240.00',
+        })
+        .expect(201);
+      const saleId = (sale.body as { data: { id: string } }).data.id;
+      const [principal] = await dataSource.query<
+        Array<{ id: string; tenant_id: string; role_id: string }>
+      >(
+        `SELECT u.id, u.tenant_id, ur.role_id FROM users u
+         INNER JOIN user_roles ur ON ur.user_id = u.id AND ur.tenant_id = u.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'SALES_VOID'`,
+        [principal.role_id, principal.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-void-without-permission')
+        .send({ reason: 'Error de captura' })
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PERMISSION_DENIED');
+        });
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'SALES_VOID')`,
+        [principal.role_id, principal.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-void-invalid-reason')
+        .send({ reason: ' ' })
+        .expect(400);
+
+      const voided = await Promise.all(
+        [1, 2].map(() =>
+          request(app.getHttpServer())
+            .post(`/api/v1/pos/sales/${saleId}/void`)
+            .set('Cookie', cookie)
+            .set('X-Request-Id', 'sale-void-audit')
+            .set('Idempotency-Key', 'sale-void-double-submit')
+            .send({ reason: 'Error de captura confirmado' }),
+        ),
+      );
+      expect(voided.map(({ status }) => status)).toEqual([201, 201]);
+      expect(
+        voided
+          .map(
+            ({ body }) =>
+              (body as { meta: { idempotentReplay: boolean } }).meta
+                .idempotentReplay,
+          )
+          .sort(),
+      ).toEqual([false, true]);
+      expect(voided[0].body).toMatchObject({
+        data: {
+          id: saleId,
+          status: 'VOIDED',
+          payment: { status: 'REVERSED', amountApplied: '239.80' },
+          void: {
+            reason: 'Error de captura confirmado',
+            user: { id: principal.id, email: registrationPayload.email },
+          },
+          movements: [
+            { type: 'SALE', quantityChange: '-2.000' },
+            { type: 'SALE_VOID', quantityChange: '2.000' },
+          ],
+        },
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-void-double-submit')
+        .send({ reason: 'Motivo distinto' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('IDEMPOTENCY_KEY_REUSED');
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-void-second-key')
+        .send({ reason: 'Segundo intento' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SALE_ALREADY_VOIDED');
+        });
+
+      const [state] = await dataSource.query<
+        Array<{
+          sales: number | string;
+          reversed_payments: number | string;
+          sale_void_movements: number | string;
+          balance: string;
+          audit_events: number | string;
+          before_data: string | { status: string };
+          after_data: string | { status: string; reason: string };
+        }>
+      >(
+        `SELECT (SELECT COUNT(*) FROM sales) AS sales,
+                (SELECT COUNT(*) FROM sale_payments WHERE status = 'REVERSED') AS reversed_payments,
+                (SELECT COUNT(*) FROM inventory_movements WHERE type = 'SALE_VOID') AS sale_void_movements,
+                (SELECT quantity FROM inventory_balances
+                  WHERE product_id = ? AND location_id = ?) AS balance,
+                (SELECT COUNT(*) FROM audit_events WHERE action = 'SALE_VOIDED') AS audit_events,
+                (SELECT before_data FROM audit_events WHERE action = 'SALE_VOIDED' LIMIT 1) AS before_data,
+                (SELECT after_data FROM audit_events WHERE action = 'SALE_VOIDED' LIMIT 1) AS after_data`,
+        [productId, locationId],
+      );
+      const before =
+        typeof state.before_data === 'string'
+          ? (JSON.parse(state.before_data) as { status: string })
+          : state.before_data;
+      const after =
+        typeof state.after_data === 'string'
+          ? (JSON.parse(state.after_data) as { status: string; reason: string })
+          : state.after_data;
+      expect({
+        sales: Number(state.sales),
+        reversedPayments: Number(state.reversed_payments),
+        saleVoidMovements: Number(state.sale_void_movements),
+        balance: state.balance,
+        auditEvents: Number(state.audit_events),
+        before,
+        after,
+      }).toEqual({
+        sales: 1,
+        reversedPayments: 1,
+        saleVoidMovements: 1,
+        balance: '5.000',
+        auditEvents: 1,
+        before: { status: 'COMPLETED', paymentStatus: 'COMPLETED' },
+        after: {
+          status: 'VOIDED',
+          paymentStatus: 'REVERSED',
+          reason: 'Error de captura confirmado',
+          restoredMovementCount: 1,
+        },
+      });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { expectedCash: '250.00' } });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .query({ productId, type: 'SALE_VOID' })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              {
+                type: 'SALE_VOID',
+                direction: 'IN',
+                quantityChange: '2.000',
+                responsible: { email: registrationPayload.email },
+                document: { type: 'SALE', id: saleId },
+              },
+            ],
+          });
+        });
+
+      const laterSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-after-void')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: '120.00',
+        })
+        .expect(201);
+      const laterSaleId = (laterSale.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/closure')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-void-close-shift')
+        .send({ countedAmount: '369.90' })
+        .expect(201);
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${laterSaleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-void-after-close')
+        .send({ reason: 'Turno ya cerrado' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SALE_VOID_NOT_ALLOWED');
+        });
+      const [laterState] = await dataSource.query<
+        Array<{ status: string; balance: string }>
+      >(
+        `SELECT s.status,
+                (SELECT quantity FROM inventory_balances
+                  WHERE product_id = ? AND location_id = ?) AS balance
+         FROM sales s WHERE s.id = ?`,
+        [productId, locationId, laterSaleId],
+      );
+      expect(laterState).toEqual({ status: 'COMPLETED', balance: '4.000' });
+    });
+
     it('does not expose a sale outside the active branch', async () => {
       const { cookie, productId } = await preparePos();
       const sale = await request(app.getHttpServer())
@@ -3929,6 +4144,12 @@ describe('UInventario API (e2e)', () => {
       await request(app.getHttpServer())
         .get(`/api/v1/pos/sales/${saleId}`)
         .set('Cookie', cookie)
+        .expect(404);
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'pos-void-branch-scope')
+        .send({ reason: 'No debe revelar la venta' })
         .expect(404);
     });
 
