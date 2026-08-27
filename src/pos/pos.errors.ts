@@ -15,3 +15,9 @@ export class PosInsufficientStockError extends Error {
     super('POS_INSUFFICIENT_STOCK');
   }
 }
+
+export class PosIdempotencyConflictError extends Error {
+  constructor() {
+    super('POS_IDEMPOTENCY_KEY_REUSED');
+  }
+}

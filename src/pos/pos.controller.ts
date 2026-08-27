@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Headers,
   HttpCode,
   Post,
   Req,
@@ -8,6 +9,7 @@ import {
 } from '@nestjs/common';
 import { SessionGuard } from '../auth/session/session.guard';
 import type { AuthenticatedRequest } from '../auth/session/session.types';
+import { CreateCashSaleDto } from './dto/create-cash-sale.dto';
 import { QuoteCartDto } from './dto/quote-cart.dto';
 import { PosAccessGuard } from './pos-access.guard';
 import { PosService } from './pos.service';
@@ -26,6 +28,24 @@ export class PosController {
       branchId: principal.context.branch!.id,
       warehouseId: principal.context.warehouse!.id,
       cashRegisterId: principal.context.cashRegister!.id,
+      dto,
+    });
+  }
+
+  @Post('sales/cash')
+  createCashSale(
+    @Req() request: AuthenticatedRequest,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: CreateCashSaleDto,
+  ) {
+    const { principal } = request;
+    return this.pos.createCashSale({
+      tenantId: principal.tenant.id,
+      branchId: principal.context.branch!.id,
+      warehouseId: principal.context.warehouse!.id,
+      cashRegisterId: principal.context.cashRegister!.id,
+      userId: principal.user.id,
+      idempotencyKey,
       dto,
     });
   }

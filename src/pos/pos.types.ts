@@ -29,3 +29,34 @@ export interface PosCartQuoteResponse {
   };
   meta: { apiVersion: '1'; recalculatedAt: string };
 }
+
+export interface CashSaleData {
+  id: string;
+  receiptNumber: string;
+  status: 'COMPLETED';
+  context: PosCartQuoteResponse['data']['context'];
+  userId: string;
+  currency: string;
+  taxRate: string;
+  lines: Array<{
+    product: { id: string; name: string; sku: string };
+    quantity: string;
+    unitPrice: string;
+    subtotal: string;
+    tax: string;
+    total: string;
+  }>;
+  totals: PosCartQuoteResponse['data']['totals'];
+  payment: {
+    method: 'CASH';
+    amountReceived: string;
+    amountApplied: string;
+    change: string;
+  };
+  createdAt: string;
+}
+
+export interface CashSaleResponse {
+  data: CashSaleData;
+  meta: { apiVersion: '1'; idempotentReplay: boolean };
+}

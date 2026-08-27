@@ -4,10 +4,11 @@ import { PosAccessGuard } from './pos-access.guard';
 import { PosController } from './pos.controller';
 import { PosRepository } from './pos.repository';
 import { PosService } from './pos.service';
+import { SalesRepository } from './sales.repository';
 
 @Module({
   imports: [SessionModule],
   controllers: [PosController],
-  providers: [PosRepository, PosService, PosAccessGuard],
+  providers: [PosRepository, SalesRepository, PosService, PosAccessGuard],
 })
 export class PosModule {}

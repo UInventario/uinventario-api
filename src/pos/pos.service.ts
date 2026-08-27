@@ -6,23 +6,91 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import type { ConfigType } from '@nestjs/config';
+import { createHash } from 'node:crypto';
 import { posConfig } from '../config/pos.config';
+import { CreateCashSaleDto } from './dto/create-cash-sale.dto';
 import { QuoteCartDto } from './dto/quote-cart.dto';
 import {
   PosContextNotFoundError,
+  PosIdempotencyConflictError,
   PosInsufficientStockError,
   PosProductNotAvailableError,
 } from './pos.errors';
 import { PosRepository } from './pos.repository';
-import { PosCartQuoteResponse } from './pos.types';
+import { SalesRepository } from './sales.repository';
+import { CashSaleResponse, PosCartQuoteResponse } from './pos.types';
 
 @Injectable()
 export class PosService {
   constructor(
     private readonly pos: PosRepository,
+    private readonly sales: SalesRepository,
     @Inject(posConfig.KEY)
     private readonly config: ConfigType<typeof posConfig>,
   ) {}
+
+  async createCashSale(input: {
+    tenantId: string;
+    branchId: string;
+    warehouseId: string;
+    cashRegisterId: string;
+    userId: string;
+    idempotencyKey: string | undefined;
+    dto: CreateCashSaleDto;
+  }): Promise<CashSaleResponse> {
+    this.assertIdempotencyKey(input.idempotencyKey);
+    const fingerprint = this.saleFingerprint(input.dto);
+    try {
+      const replay = await this.sales.findByIdempotency(
+        input.tenantId,
+        input.idempotencyKey!,
+      );
+      if (replay) {
+        if (replay.fingerprint !== fingerprint)
+          throw new PosIdempotencyConflictError();
+        return {
+          data: replay.sale,
+          meta: { apiVersion: '1', idempotentReplay: true },
+        };
+      }
+      const quote = await this.quoteCart({
+        tenantId: input.tenantId,
+        branchId: input.branchId,
+        warehouseId: input.warehouseId,
+        cashRegisterId: input.cashRegisterId,
+        dto: { lines: input.dto.lines },
+      });
+      const receivedCents = this.toMoneyCents(input.dto.cashReceived);
+      const totalCents = this.toMoneyCents(quote.data.totals.total);
+      if (receivedCents < totalCents) {
+        throw new BadRequestException({
+          code: 'INSUFFICIENT_CASH_RECEIVED',
+          message: 'El efectivo recibido no cubre el total de la venta.',
+        });
+      }
+      const result = await this.sales.persistCashSale({
+        tenantId: input.tenantId,
+        userId: input.userId,
+        idempotencyKey: input.idempotencyKey!,
+        fingerprint,
+        quote: quote.data,
+        amountReceived: this.fromMoneyCents(receivedCents),
+        change: this.fromMoneyCents(receivedCents - totalCents),
+      });
+      return {
+        data: result.sale,
+        meta: { apiVersion: '1', idempotentReplay: result.replay },
+      };
+    } catch (error) {
+      if (error instanceof PosIdempotencyConflictError) {
+        throw new ConflictException({
+          code: 'IDEMPOTENCY_KEY_REUSED',
+          message: 'La clave de idempotencia ya fue usada con otros datos.',
+        });
+      }
+      throw error;
+    }
+  }
 
   async quoteCart(input: {
     tenantId: string;
@@ -133,6 +201,37 @@ export class PosService {
       }
       throw error;
     }
+  }
+
+  private assertIdempotencyKey(value: string | undefined): void {
+    if (!value || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(value)) {
+      throw new BadRequestException({
+        code: 'INVALID_IDEMPOTENCY_KEY',
+        message:
+          'Idempotency-Key es obligatorio y debe tener entre 8 y 128 caracteres.',
+      });
+    }
+  }
+
+  private saleFingerprint(dto: CreateCashSaleDto): string {
+    const quantities = new Map<string, bigint>();
+    for (const line of dto.lines) {
+      quantities.set(
+        line.productId,
+        (quantities.get(line.productId) ?? 0n) +
+          this.toQuantityUnits(line.quantity),
+      );
+    }
+    const canonical = {
+      lines: [...quantities.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([productId, quantity]) => ({
+          productId,
+          quantity: this.fromQuantityUnits(quantity),
+        })),
+      cashReceived: this.fromMoneyCents(this.toMoneyCents(dto.cashReceived)),
+    };
+    return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
   }
 
   private toQuantityUnits(value: string): bigint {
