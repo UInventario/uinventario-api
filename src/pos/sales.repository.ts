@@ -41,6 +41,7 @@ interface StockAllocation {
   locationId: string;
   quantityChange: string;
   resultingQuantity: string;
+  resultingAvailableQuantity: string;
 }
 
 @Injectable()
@@ -237,9 +238,13 @@ export class SalesRepository {
             left.product.id.localeCompare(right.product.id),
           )) {
             const balances = await manager.query<
-              Array<{ location_id: string; quantity: string }>
+              Array<{
+                location_id: string;
+                quantity: string;
+                available_quantity: string;
+              }>
             >(
-              `SELECT ib.location_id, ib.quantity
+              `SELECT ib.location_id, ib.quantity, ib.available_quantity
              FROM inventory_balances ib
              INNER JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
              WHERE ib.tenant_id = ? AND ib.product_id = ? AND l.warehouse_id = ?
@@ -254,13 +259,19 @@ export class SalesRepository {
             const lineAllocations: StockAllocation[] = [];
             for (const balance of balances) {
               if (remaining === 0n) break;
-              const available = this.toQuantityUnits(balance.quantity);
+              const available = this.toQuantityUnits(
+                balance.available_quantity,
+              );
+              const total = this.toQuantityUnits(balance.quantity);
               const taken = available < remaining ? available : remaining;
               if (taken === 0n) continue;
               lineAllocations.push({
                 locationId: balance.location_id,
                 quantityChange: this.fromQuantityUnits(-taken),
-                resultingQuantity: this.fromQuantityUnits(available - taken),
+                resultingQuantity: this.fromQuantityUnits(total - taken),
+                resultingAvailableQuantity: this.fromQuantityUnits(
+                  available - taken,
+                ),
               });
               remaining -= taken;
             }
@@ -331,10 +342,12 @@ export class SalesRepository {
               allocations.get(line.product.id) ?? []
             ).entries()) {
               await manager.query(
-                `UPDATE inventory_balances SET quantity = ?
+                `UPDATE inventory_balances
+                 SET quantity = ?, available_quantity = ?
                WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
                 [
                   allocation.resultingQuantity,
+                  allocation.resultingAvailableQuantity,
                   input.tenantId,
                   line.product.id,
                   allocation.locationId,

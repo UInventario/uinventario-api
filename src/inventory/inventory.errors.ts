@@ -27,3 +27,15 @@ export class MovementReferenceRequiredError extends Error {
     super('MOVEMENT_REFERENCE_REQUIRED');
   }
 }
+
+export class InvalidStockStateTransitionError extends Error {
+  constructor() {
+    super('INVALID_STOCK_STATE_TRANSITION');
+  }
+}
+
+export class InsufficientStockStateError extends Error {
+  constructor() {
+    super('INSUFFICIENT_STOCK_STATE');
+  }
+}

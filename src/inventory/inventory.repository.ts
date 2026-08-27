@@ -2,12 +2,15 @@ import { Injectable } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
+import { CreateInventoryStateTransitionDto } from './dto/create-inventory-state-transition.dto';
 import { ListInventoryStockDto } from './dto/list-inventory-stock.dto';
 import { ListInventoryMovementsDto } from './dto/list-inventory-movements.dto';
 import {
   IdempotencyConflictError,
   InitialStockAlreadyExistsError,
   InsufficientStockError,
+  InsufficientStockStateError,
+  InvalidStockStateTransitionError,
   InventoryTargetNotFoundError,
   MovementReferenceRequiredError,
 } from './inventory.errors';
@@ -15,6 +18,7 @@ import {
   InventoryBalanceData,
   InventoryLocationData,
   InventoryMovementType,
+  InventoryStockState,
   InventoryMovementHistoryItem,
   InventoryMovementData,
   InventoryStockItem,
@@ -35,6 +39,9 @@ interface MovementRow {
   location_id: string;
   location_name: string;
   location_code: string;
+  from_state: InventoryStockState | null;
+  to_state: InventoryStockState | null;
+  state_quantity: string | null;
 }
 
 @Injectable()
@@ -122,9 +129,13 @@ export class InventoryRepository {
           warehouse_name: string;
           user_id: string;
           user_email: string;
+          from_state: InventoryStockState | null;
+          to_state: InventoryStockState | null;
+          state_quantity: string | null;
         }>
       >(
         `SELECT im.id, im.type, im.quantity_change, im.resulting_quantity,
+                im.from_state, im.to_state, im.state_quantity,
                 im.reason, im.reference, im.created_at,
                 p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
                 l.id AS location_id, l.name AS location_name, l.code AS location_code,
@@ -143,7 +154,12 @@ export class InventoryRepository {
       items: rows.map((row) => ({
         id: row.id,
         type: row.type,
-        direction: row.quantity_change.startsWith('-') ? 'OUT' : 'IN',
+        direction:
+          row.type === 'STATE_TRANSITION'
+            ? 'TRANSFER'
+            : row.quantity_change.startsWith('-')
+              ? 'OUT'
+              : 'IN',
         quantityChange: this.normalizeDecimal(row.quantity_change),
         resultingQuantity: this.normalizeDecimal(row.resulting_quantity),
         reason: row.reason,
@@ -161,6 +177,14 @@ export class InventoryRepository {
           warehouse: { id: row.warehouse_id, name: row.warehouse_name },
         },
         responsible: { id: row.user_id, email: row.user_email },
+        stateTransition:
+          row.from_state && row.to_state && row.state_quantity
+            ? {
+                from: row.from_state,
+                to: row.to_state,
+                quantity: this.normalizeDecimal(row.state_quantity),
+              }
+            : null,
       })),
       total: Number(countRows[0]?.total ?? 0),
       scope: { branch },
@@ -220,18 +244,35 @@ export class InventoryRepository {
           product_name: string;
           product_sku: string;
           active: number | boolean;
-          quantity: string;
+          available_quantity: string;
+          reserved_quantity: string;
+          damaged_quantity: string;
+          in_transit_quantity: string;
+          total_quantity: string;
         }>
       >(
         `SELECT p.id AS product_id, p.name AS product_name, p.sku AS product_sku, p.active,
-                COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.quantity ELSE 0 END), 0) AS quantity
+                COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.available_quantity ELSE 0 END), 0) AS available_quantity,
+                COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.reserved_quantity ELSE 0 END), 0) AS reserved_quantity,
+                COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.damaged_quantity ELSE 0 END), 0) AS damaged_quantity,
+                COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.in_transit_quantity ELSE 0 END), 0) AS in_transit_quantity,
+                COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.quantity ELSE 0 END), 0) AS total_quantity
          FROM products p
          LEFT JOIN inventory_balances ib ON ib.product_id = p.id AND ib.tenant_id = p.tenant_id
          LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
          WHERE ${where}
          GROUP BY p.id, p.name, p.sku, p.active, p.created_at
          ORDER BY p.created_at DESC, p.id DESC LIMIT ? OFFSET ?`,
-        [warehouseId, ...parameters, query.pageSize, offset],
+        [
+          warehouseId,
+          warehouseId,
+          warehouseId,
+          warehouseId,
+          warehouseId,
+          ...parameters,
+          query.pageSize,
+          offset,
+        ],
       ),
       this.dataSource.query<Array<{ total: number | string }>>(
         `SELECT COUNT(*) AS total FROM products p WHERE ${where}`,
@@ -240,7 +281,11 @@ export class InventoryRepository {
     ]);
     return {
       items: rows.map((row) => {
-        const quantity = this.normalizeDecimal(row.quantity);
+        const available = this.normalizeDecimal(row.available_quantity);
+        const reserved = this.normalizeDecimal(row.reserved_quantity);
+        const damaged = this.normalizeDecimal(row.damaged_quantity);
+        const inTransit = this.normalizeDecimal(row.in_transit_quantity);
+        const total = this.normalizeDecimal(row.total_quantity);
         return {
           product: {
             id: row.product_id,
@@ -248,9 +293,14 @@ export class InventoryRepository {
             sku: row.product_sku,
             active: Boolean(row.active),
           },
-          availableQuantity: quantity,
-          totalQuantity: quantity,
-          states: [{ code: 'AVAILABLE', quantity }],
+          availableQuantity: available,
+          totalQuantity: total,
+          states: [
+            { code: 'AVAILABLE', quantity: available },
+            { code: 'RESERVED', quantity: reserved },
+            { code: 'DAMAGED', quantity: damaged },
+            { code: 'IN_TRANSIT', quantity: inTransit },
+          ],
         };
       }),
       total: Number(countRows[0]?.total ?? 0),
@@ -276,11 +326,16 @@ export class InventoryRepository {
         location_name: string;
         location_code: string;
         quantity: string | null;
+        available_quantity: string | null;
+        reserved_quantity: string | null;
+        damaged_quantity: string | null;
+        in_transit_quantity: string | null;
       }>
     >(
       `SELECT p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
               l.id AS location_id, l.name AS location_name, l.code AS location_code,
-              ib.quantity
+              ib.quantity, ib.available_quantity, ib.reserved_quantity,
+              ib.damaged_quantity, ib.in_transit_quantity
        FROM products p
        INNER JOIN locations l ON l.id = ? AND l.tenant_id = p.tenant_id AND l.warehouse_id = ?
        LEFT JOIN inventory_balances ib ON ib.tenant_id = p.tenant_id
@@ -289,6 +344,11 @@ export class InventoryRepository {
       [locationId, warehouseId, productId, tenantId],
     );
     if (!rows[0]) throw new InventoryTargetNotFoundError();
+    const total = this.normalizeDecimal(rows[0].quantity ?? '0');
+    const available = this.normalizeDecimal(rows[0].available_quantity ?? '0');
+    const reserved = this.normalizeDecimal(rows[0].reserved_quantity ?? '0');
+    const damaged = this.normalizeDecimal(rows[0].damaged_quantity ?? '0');
+    const inTransit = this.normalizeDecimal(rows[0].in_transit_quantity ?? '0');
     return {
       product: {
         id: rows[0].product_id,
@@ -300,7 +360,15 @@ export class InventoryRepository {
         name: rows[0].location_name,
         code: rows[0].location_code,
       },
-      quantity: this.normalizeDecimal(rows[0].quantity ?? '0'),
+      quantity: total,
+      availableQuantity: available,
+      totalQuantity: total,
+      states: [
+        { code: 'AVAILABLE', quantity: available },
+        { code: 'RESERVED', quantity: reserved },
+        { code: 'DAMAGED', quantity: damaged },
+        { code: 'IN_TRANSIT', quantity: inTransit },
+      ],
     };
   }
 
@@ -341,8 +409,10 @@ export class InventoryRepository {
            VALUES (?, ?, ?, 0) ON DUPLICATE KEY UPDATE quantity = quantity`,
             [input.tenantId, input.dto.productId, input.dto.locationId],
           );
-          const [balance] = await manager.query<Array<{ quantity: string }>>(
-            `SELECT quantity FROM inventory_balances
+          const [balance] = await manager.query<
+            Array<{ quantity: string; available_quantity: string }>
+          >(
+            `SELECT quantity, available_quantity FROM inventory_balances
            WHERE tenant_id = ? AND product_id = ? AND location_id = ? FOR UPDATE`,
             [input.tenantId, input.dto.productId, input.dto.locationId],
           );
@@ -372,14 +442,20 @@ export class InventoryRepository {
           }
           const resultingUnits =
             this.toUnits(balance.quantity) + this.toUnits(quantityChange);
-          if (resultingUnits < 0n) throw new InsufficientStockError();
+          const resultingAvailableUnits =
+            this.toUnits(balance.available_quantity) +
+            this.toUnits(quantityChange);
+          if (resultingUnits < 0n || resultingAvailableUnits < 0n)
+            throw new InsufficientStockError();
           const resultingQuantity = this.fromUnits(resultingUnits);
+          const resultingAvailable = this.fromUnits(resultingAvailableUnits);
           const movementId = randomUUID();
           await manager.query(
-            `UPDATE inventory_balances SET quantity = ?
+            `UPDATE inventory_balances SET quantity = ?, available_quantity = ?
            WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
             [
               resultingQuantity,
+              resultingAvailable,
               input.tenantId,
               input.dto.productId,
               input.dto.locationId,
@@ -429,6 +505,141 @@ export class InventoryRepository {
     }
   }
 
+  async createStateTransition(input: {
+    tenantId: string;
+    warehouseId: string;
+    userId: string;
+    idempotencyKey: string;
+    dto: CreateInventoryStateTransitionDto;
+  }): Promise<{ movement: InventoryMovementData; replay: boolean }> {
+    if (
+      input.dto.fromState === input.dto.toState ||
+      (input.dto.fromState !== 'AVAILABLE' && input.dto.toState !== 'AVAILABLE')
+    ) {
+      throw new InvalidStockStateTransitionError();
+    }
+    const quantityUnits = this.toUnits(input.dto.quantity);
+    if (quantityUnits <= 0n) throw new InvalidStockStateTransitionError();
+    const normalizedQuantity = this.fromUnits(quantityUnits);
+    const fingerprint = createHash('sha256')
+      .update(
+        JSON.stringify({
+          productId: input.dto.productId,
+          locationId: input.dto.locationId,
+          fromState: input.dto.fromState,
+          toState: input.dto.toState,
+          quantity: normalizedQuantity,
+          reason: input.dto.reason,
+          reference: input.dto.reference,
+        }),
+      )
+      .digest('hex');
+
+    try {
+      return await this.dataSource.transaction(
+        'READ COMMITTED',
+        async (manager) => {
+          await this.assertTarget(
+            manager,
+            input.tenantId,
+            input.warehouseId,
+            input.dto.productId,
+            input.dto.locationId,
+          );
+          await manager.query(
+            `INSERT INTO inventory_balances (tenant_id, product_id, location_id, quantity)
+             VALUES (?, ?, ?, 0) ON DUPLICATE KEY UPDATE quantity = quantity`,
+            [input.tenantId, input.dto.productId, input.dto.locationId],
+          );
+          const replay = await this.findMovement(
+            manager,
+            input.tenantId,
+            input.idempotencyKey,
+          );
+          if (replay) {
+            if (replay.request_fingerprint !== fingerprint)
+              throw new IdempotencyConflictError();
+            return { movement: this.toMovement(replay), replay: true };
+          }
+          const [balance] = await manager.query<
+            Array<{
+              quantity: string;
+              available_quantity: string;
+              reserved_quantity: string;
+              damaged_quantity: string;
+              in_transit_quantity: string;
+            }>
+          >(
+            `SELECT quantity, available_quantity, reserved_quantity,
+                    damaged_quantity, in_transit_quantity
+             FROM inventory_balances
+             WHERE tenant_id = ? AND product_id = ? AND location_id = ? FOR UPDATE`,
+            [input.tenantId, input.dto.productId, input.dto.locationId],
+          );
+          const fromColumn = this.stateColumn(input.dto.fromState);
+          const toColumn = this.stateColumn(input.dto.toState);
+          const sourceUnits = this.toUnits(balance[fromColumn]);
+          if (sourceUnits < quantityUnits)
+            throw new InsufficientStockStateError();
+          const resultingSource = this.fromUnits(sourceUnits - quantityUnits);
+          const resultingTarget = this.fromUnits(
+            this.toUnits(balance[toColumn]) + quantityUnits,
+          );
+          await manager.query(
+            `UPDATE inventory_balances SET ${fromColumn} = ?, ${toColumn} = ?
+             WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
+            [
+              resultingSource,
+              resultingTarget,
+              input.tenantId,
+              input.dto.productId,
+              input.dto.locationId,
+            ],
+          );
+          await manager.query(
+            `INSERT INTO inventory_movements
+              (id, tenant_id, product_id, location_id, type, from_state, to_state,
+               state_quantity, quantity_change, resulting_quantity, reason, reference,
+               idempotency_key, request_fingerprint, created_by_user_id)
+             VALUES (?, ?, ?, ?, 'STATE_TRANSITION', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
+            [
+              randomUUID(),
+              input.tenantId,
+              input.dto.productId,
+              input.dto.locationId,
+              input.dto.fromState,
+              input.dto.toState,
+              normalizedQuantity,
+              balance.quantity,
+              input.dto.reason,
+              input.dto.reference,
+              input.idempotencyKey,
+              fingerprint,
+              input.userId,
+            ],
+          );
+          const movement = await this.findMovement(
+            manager,
+            input.tenantId,
+            input.idempotencyKey,
+          );
+          if (!movement) throw new Error('CREATED_STATE_TRANSITION_NOT_FOUND');
+          return { movement: this.toMovement(movement), replay: false };
+        },
+      );
+    } catch (error) {
+      if (!this.isDuplicate(error)) throw error;
+      const movement = await this.findMovement(
+        this.dataSource.manager,
+        input.tenantId,
+        input.idempotencyKey,
+      );
+      if (!movement || movement.request_fingerprint !== fingerprint)
+        throw new IdempotencyConflictError();
+      return { movement: this.toMovement(movement), replay: true };
+    }
+  }
+
   private async assertTarget(
     manager: EntityManager,
     tenantId: string,
@@ -452,6 +663,7 @@ export class InventoryRepository {
   ): Promise<MovementRow | null> {
     const rows = await manager.query<MovementRow[]>(
       `SELECT im.id, im.type, im.quantity_change, im.resulting_quantity,
+              im.from_state, im.to_state, im.state_quantity,
               im.reason, im.reference, im.request_fingerprint, im.created_at,
               p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
               l.id AS location_id, l.name AS location_name, l.code AS location_code
@@ -481,6 +693,23 @@ export class InventoryRepository {
     return negative ? -units : units;
   }
 
+  private stateColumn(
+    state: InventoryStockState,
+  ):
+    | 'available_quantity'
+    | 'reserved_quantity'
+    | 'damaged_quantity'
+    | 'in_transit_quantity' {
+    return (
+      {
+        AVAILABLE: 'available_quantity',
+        RESERVED: 'reserved_quantity',
+        DAMAGED: 'damaged_quantity',
+        IN_TRANSIT: 'in_transit_quantity',
+      } as const
+    )[state];
+  }
+
   private fromUnits(units: bigint): string {
     const sign = units < 0n ? '-' : '';
     const absolute = units < 0n ? -units : units;
@@ -500,6 +729,14 @@ export class InventoryRepository {
       reason: row.reason,
       reference: row.reference,
       createdAt: new Date(row.created_at).toISOString(),
+      stateTransition:
+        row.from_state && row.to_state && row.state_quantity
+          ? {
+              from: row.from_state,
+              to: row.to_state,
+              quantity: this.normalizeDecimal(row.state_quantity),
+            }
+          : null,
       product: {
         id: row.product_id,
         name: row.product_name,
