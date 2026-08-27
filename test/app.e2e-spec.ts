@@ -31,6 +31,9 @@ describe('UInventario API (e2e)', () => {
   async function resetIdentityData(): Promise<void> {
     await dataSource.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const table of [
+      'locations',
+      'warehouses',
+      'branches',
       'sessions',
       'registration_requests',
       'user_roles',
@@ -505,6 +508,95 @@ describe('UInventario API (e2e)', () => {
         .set('Cookie', primaryCookie)
         .send({ ...company, countryCode: 'MEX', tenantId: otherTenantId })
         .expect(400);
+    });
+  });
+
+  describe('initial branch onboarding', () => {
+    beforeEach(resetIdentityData);
+
+    it('creates one consistent branch hierarchy and activates it on retries', async () => {
+      await registerAccount('initial-branch-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Tienda Central, S.A. de C.V.',
+          tradeName: 'Tienda Central',
+          countryCode: 'MX',
+        })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Sucursal Principal',
+          timezone: 'Zona/Inexistente',
+          warehouseName: 'Bodega Principal',
+          locationName: 'Ubicación General',
+        })
+        .expect(400);
+
+      const payload = {
+        branchName: 'Sucursal Principal',
+        timezone: 'America/Mexico_City',
+        warehouseName: 'Bodega Principal',
+        locationName: 'Ubicación General',
+      };
+      const attempts = await Promise.all([
+        request(app.getHttpServer())
+          .put('/api/v1/onboarding/initial-location')
+          .set('Cookie', cookie)
+          .send(payload),
+        request(app.getHttpServer())
+          .put('/api/v1/onboarding/initial-location')
+          .set('Cookie', cookie)
+          .send(payload),
+      ]);
+      expect(attempts.map(({ status }) => status)).toEqual([200, 200]);
+      expect(attempts[0].body).toEqual(attempts[1].body);
+      expect(attempts[0].body).toMatchObject({
+        data: {
+          branch: { name: payload.branchName, timezone: payload.timezone },
+          warehouse: { name: payload.warehouseName },
+          location: { name: payload.locationName, code: 'GENERAL' },
+          progress: {
+            currentStep: 'REGISTER',
+            completedSteps: ['COMPANY', 'BRANCH'],
+          },
+        },
+      });
+
+      const [counts] = await dataSource.query<
+        Array<{
+          branches: number | string;
+          warehouses: number | string;
+          locations: number | string;
+        }>
+      >(`SELECT (SELECT COUNT(*) FROM branches) AS branches,
+                (SELECT COUNT(*) FROM warehouses) AS warehouses,
+                (SELECT COUNT(*) FROM locations) AS locations`);
+      expect(
+        Object.fromEntries(
+          Object.entries(counts).map(([key, value]) => [key, Number(value)]),
+        ),
+      ).toEqual({ branches: 1, warehouses: 1, locations: 1 });
+
+      await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              context: {
+                branch: { name: payload.branchName },
+                warehouse: { name: payload.warehouseName },
+              },
+            },
+          });
+        });
     });
   });
 

@@ -49,6 +49,8 @@ export class SessionService {
       userId: identity.user.id,
       tenantId: identity.tenant.id,
       expiresAt,
+      activeBranchId: identity.context.branch?.id ?? null,
+      activeWarehouseId: identity.context.warehouse?.id ?? null,
     });
 
     return {
@@ -110,6 +112,7 @@ export class SessionService {
       data: {
         user: identity.user,
         tenant: identity.tenant,
+        context: identity.context,
         nextStep: identity.nextStep,
       },
       meta: {
