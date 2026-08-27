@@ -18,11 +18,15 @@ import { ListInventoryStockDto } from './dto/list-inventory-stock.dto';
 import { ListInventoryMovementsDto } from './dto/list-inventory-movements.dto';
 import { InventoryAccessGuard } from './inventory-access.guard';
 import { InventoryService } from './inventory.service';
+import { AuditService } from '../audit/audit.service';
 
 @Controller('inventory')
 @UseGuards(SessionGuard, InventoryAccessGuard)
 export class InventoryController {
-  constructor(private readonly inventory: InventoryService) {}
+  constructor(
+    private readonly inventory: InventoryService,
+    private readonly audit: AuditService,
+  ) {}
 
   @Get('stock')
   listStock(
@@ -72,17 +76,27 @@ export class InventoryController {
   }
 
   @Post('movements')
-  createMovement(
+  async createMovement(
     @Req() request: AuthenticatedRequest,
     @Headers('idempotency-key') idempotencyKey: string | undefined,
     @Body() dto: CreateInventoryMovementDto,
   ) {
-    return this.inventory.createMovement({
+    const result = await this.inventory.createMovement({
       tenantId: request.principal.tenant.id,
       warehouseId: request.principal.context.warehouse!.id,
       userId: request.principal.user.id,
       idempotencyKey,
       dto,
     });
+    await this.audit.record({
+      tenantId: request.principal.tenant.id,
+      actorUserId: request.principal.user.id,
+      action: 'INVENTORY_MOVEMENT_CREATED',
+      entityType: 'INVENTORY_MOVEMENT',
+      entityId: result.data.id,
+      correlationId: request.requestId!,
+      deduplicate: true,
+    });
+    return result;
   }
 }

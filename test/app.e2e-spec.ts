@@ -10,6 +10,7 @@ import { PosCartQuoteResponse } from '../src/pos/pos.types';
 import { verify } from 'argon2';
 import { configureApp } from '../src/security/configure-app';
 import { RegistrationService } from '../src/auth/registration/registration.service';
+import { ThrottlerStorage, ThrottlerStorageService } from '@nestjs/throttler';
 
 describe('UInventario API (e2e)', () => {
   let app: INestApplication<App>;
@@ -29,6 +30,7 @@ describe('UInventario API (e2e)', () => {
   async function resetIdentityData(): Promise<void> {
     await dataSource.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const table of [
+      'audit_events',
       'password_reset_tokens',
       'sale_payments',
       'sale_lines',
@@ -2410,6 +2412,199 @@ describe('UInventario API (e2e)', () => {
         })
         .expect(404);
       expect(foreignSaleAttempt.body).toEqual(missingSaleAttempt.body);
+    });
+  });
+
+  describe('Core audit trail', () => {
+    beforeEach(async () => {
+      await resetIdentityData();
+      app.get<ThrottlerStorageService>(ThrottlerStorage).storage.clear();
+    });
+
+    it('records critical actions without secrets and exposes an admin-only append-only view', async () => {
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('X-Request-Id', 'audit-registration')
+        .set('Idempotency-Key', 'audit-registration-key')
+        .send(registrationPayload)
+        .expect(201);
+      const login = await request(app.getHttpServer())
+        .post('/api/v1/auth/sessions')
+        .set('X-Request-Id', 'audit-login-success')
+        .send({
+          email: registrationPayload.email,
+          password: registrationPayload.password,
+        })
+        .expect(200);
+      const cookie = (
+        login.headers['set-cookie'] as unknown as string[]
+      )[0].split(';')[0];
+
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .set('X-Request-Id', 'audit-company-update')
+        .send({
+          legalName: 'Tienda Auditada, S.A. de C.V.',
+          tradeName: 'Tienda Auditada',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      const location = await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Sucursal Auditada',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Auditada',
+          locationName: 'General Auditada',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Auditada' })
+        .expect(200);
+
+      const product = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .set('X-Request-Id', 'audit-product-create')
+        .send({
+          name: 'Producto Auditado',
+          sku: 'AUDIT-1',
+          cost: '5.00',
+          price: '10.00',
+        })
+        .expect(201);
+      const productId = (product.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${productId}`)
+        .set('Cookie', cookie)
+        .set('X-Request-Id', 'audit-product-update')
+        .send({
+          name: 'Producto Auditado Actualizado',
+          sku: 'AUDIT-1',
+          cost: '6.00',
+          price: '11.00',
+          version: 1,
+        })
+        .expect(200);
+      const locationId = (
+        location.body as { data: { location: { id: string } } }
+      ).data.location.id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('X-Request-Id', 'audit-stock-create')
+        .set('Idempotency-Key', 'audit-stock-key')
+        .send({
+          productId,
+          locationId,
+          type: 'INITIAL',
+          quantity: '5',
+          reason: 'Stock auditado',
+        })
+        .expect(201);
+      const sale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('X-Request-Id', 'audit-sale-complete')
+        .set('Idempotency-Key', 'audit-sale-key')
+        .send({ lines: [{ productId, quantity: '1' }], cashReceived: '11.00' })
+        .expect(201);
+      const saleId = (sale.body as { data: { id: string } }).data.id;
+
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'audit-foreign-registration')
+        .send({
+          organizationName: 'Empresa Auditada Ajena',
+          email: 'foreign-audit@example.com',
+          password: registrationPayload.password,
+        })
+        .expect(201);
+
+      const response = await request(app.getHttpServer())
+        .get('/api/v1/audit-events')
+        .query({ pageSize: 50 })
+        .set('Cookie', cookie)
+        .expect(200);
+      const body = response.body as {
+        data: Array<{
+          id: string;
+          action: string;
+          entityType: string;
+          entityId: string;
+          correlationId: string;
+          createdAt: string;
+          actor: { email: string };
+        }>;
+        meta: { pagination: { total: number } };
+      };
+      expect(body.meta.pagination.total).toBe(7);
+      expect(new Set(body.data.map(({ action }) => action))).toEqual(
+        new Set([
+          'REGISTRATION_CREATED',
+          'AUTH_LOGIN_SUCCEEDED',
+          'COMPANY_UPDATED',
+          'PRODUCT_CREATED',
+          'PRODUCT_UPDATED',
+          'INVENTORY_MOVEMENT_CREATED',
+          'SALE_COMPLETED',
+        ]),
+      );
+      expect(
+        body.data.find(({ action }) => action === 'SALE_COMPLETED'),
+      ).toMatchObject({
+        entityType: 'SALE',
+        entityId: saleId,
+        correlationId: 'audit-sale-complete',
+        actor: { email: registrationPayload.email },
+      });
+      expect(
+        body.data.every(
+          ({ createdAt }) => !Number.isNaN(Date.parse(createdAt)),
+        ),
+      ).toBe(true);
+      expect(JSON.stringify(body)).not.toContain(registrationPayload.password);
+      expect(JSON.stringify(body)).not.toContain('password');
+
+      const eventId = body.data[0].id;
+      await request(app.getHttpServer())
+        .patch(`/api/v1/audit-events/${eventId}`)
+        .set('Cookie', cookie)
+        .send({ action: 'ALTERED' })
+        .expect(404);
+      await request(app.getHttpServer())
+        .delete(`/api/v1/audit-events/${eventId}`)
+        .set('Cookie', cookie)
+        .expect(404);
+
+      const [principal] = await dataSource.query<
+        Array<{ id: string; tenant_id: string }>
+      >('SELECT id, tenant_id FROM users WHERE normalized_email = ? LIMIT 1', [
+        registrationPayload.email,
+      ]);
+      const staffRoleId = randomUUID();
+      await dataSource.query(
+        `INSERT INTO roles (id, tenant_id, code, name) VALUES (?, ?, 'STAFF', 'Personal')`,
+        [staffRoleId, principal.tenant_id],
+      );
+      await dataSource.query('DELETE FROM user_roles WHERE user_id = ?', [
+        principal.id,
+      ]);
+      await dataSource.query(
+        'INSERT INTO user_roles (user_id, role_id) VALUES (?, ?)',
+        [principal.id, staffRoleId],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/audit-events')
+        .set('Cookie', cookie)
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('AUDIT_ACCESS_DENIED');
+        });
     });
   });
 
