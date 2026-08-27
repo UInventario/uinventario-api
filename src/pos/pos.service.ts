@@ -18,6 +18,7 @@ import {
   PosIdempotencyConflictError,
   PosInsufficientStockError,
   PosProductNotAvailableError,
+  PosReservationNotAvailableError,
   SaleAlreadyVoidedError,
   SaleVoidNotAllowedError,
 } from './pos.errors';
@@ -158,7 +159,7 @@ export class PosService {
         warehouseId: input.warehouseId,
         cashRegisterId: input.cashRegisterId,
         userId: input.userId,
-        dto: { lines: input.dto.lines },
+        dto: { lines: input.dto.lines, reservationId: input.dto.reservationId },
       });
       const shift = await this.shifts.requireCurrent({
         tenantId: input.tenantId,
@@ -182,6 +183,7 @@ export class PosService {
         cashRegisterShiftId: shift.id,
         quote: quote.data,
         customerId: input.dto.customerId ?? null,
+        reservationId: input.dto.reservationId ?? null,
         amountReceived: this.fromMoneyCents(receivedCents),
         change: this.fromMoneyCents(receivedCents - totalCents),
       });
@@ -206,6 +208,13 @@ export class PosService {
         throw new BadRequestException({
           code: 'POS_CUSTOMER_NOT_AVAILABLE',
           message: 'El cliente no existe o está inactivo.',
+        });
+      }
+      if (error instanceof PosReservationNotAvailableError) {
+        throw new ConflictException({
+          code: 'POS_RESERVATION_NOT_AVAILABLE',
+          message: 'La reserva no está activa o no coincide con esta venta.',
+          status: error.status,
         });
       }
       if (error instanceof CashRegisterShiftRequiredError) {
@@ -252,10 +261,13 @@ export class PosService {
         input.tenantId,
         input.warehouseId,
         [...requested.keys()],
+        input.dto.reservationId,
       );
       const productMap = new Map(
         products.map((product) => [product.id, product]),
       );
+      if (input.dto.reservationId && productMap.size !== requested.size)
+        throw new PosReservationNotAvailableError();
       const taxRate =
         this.config.taxRates[context.countryCode] ??
         this.config.taxRates.DEFAULT ??
@@ -332,6 +344,12 @@ export class PosService {
           productId: error.productId,
         });
       }
+      if (error instanceof PosReservationNotAvailableError) {
+        throw new ConflictException({
+          code: 'POS_RESERVATION_NOT_AVAILABLE',
+          message: 'La reserva no está activa o no coincide con este carrito.',
+        });
+      }
       throw error;
     }
   }
@@ -364,6 +382,7 @@ export class PosService {
         })),
       cashReceived: this.fromMoneyCents(this.toMoneyCents(dto.cashReceived)),
       customerId: dto.customerId ?? null,
+      reservationId: dto.reservationId ?? null,
     };
     return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
   }

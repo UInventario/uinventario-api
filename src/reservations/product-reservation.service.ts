@@ -5,9 +5,11 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { CreateProductReservationDto } from './dto/create-product-reservation.dto';
+import { ReleaseProductReservationDto } from './dto/release-product-reservation.dto';
 import {
   ProductReservationIdempotencyConflictError,
   ProductReservationInsufficientStockError,
+  ProductReservationNotActiveError,
   ProductReservationTargetNotFoundError,
 } from './product-reservation.errors';
 import { ProductReservationRepository } from './product-reservation.repository';
@@ -78,5 +80,71 @@ export class ProductReservationService {
       data: await this.reservations.list(tenantId, branchId),
       meta: { apiVersion: '1' as const },
     };
+  }
+
+  async release(input: {
+    tenantId: string;
+    branchId: string;
+    userId: string;
+    reservationId: string;
+    idempotencyKey: string | undefined;
+    dto: ReleaseProductReservationDto;
+  }) {
+    this.assertIdempotencyKey(input.idempotencyKey);
+    try {
+      const result = await this.reservations.release({
+        ...input,
+        idempotencyKey: input.idempotencyKey!,
+        reason: input.dto.reason,
+      });
+      return {
+        data: result.reservation,
+        meta: { apiVersion: '1' as const, idempotentReplay: result.replay },
+      };
+    } catch (error) {
+      this.mapLifecycleError(error);
+    }
+  }
+
+  async expireDue(tenantId: string, branchId: string, userId: string) {
+    const expired = await this.reservations.expireDue({
+      tenantId,
+      branchId,
+      userId,
+    });
+    return {
+      data: expired,
+      meta: { apiVersion: '1' as const, expiredCount: expired.length },
+    };
+  }
+
+  private assertIdempotencyKey(value: string | undefined): void {
+    if (!value || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(value)) {
+      throw new BadRequestException({
+        code: 'INVALID_IDEMPOTENCY_KEY',
+        message:
+          'Idempotency-Key es obligatorio y debe tener entre 8 y 128 caracteres.',
+      });
+    }
+  }
+
+  private mapLifecycleError(error: unknown): never {
+    if (error instanceof ProductReservationTargetNotFoundError)
+      throw new NotFoundException();
+    if (error instanceof ProductReservationNotActiveError)
+      throw new ConflictException({
+        code: 'PRODUCT_RESERVATION_NOT_ACTIVE',
+        message: 'La reserva ya no está activa.',
+        status: error.status,
+      });
+    if (error instanceof ProductReservationInsufficientStockError)
+      throw new ConflictException({
+        code: 'PRODUCT_RESERVATION_STOCK_CONFLICT',
+        message: 'El stock reservado no coincide con la reserva.',
+        productId: error.productId,
+      });
+    if (error instanceof ProductReservationIdempotencyConflictError)
+      throw new ConflictException({ code: 'IDEMPOTENCY_KEY_REUSED' });
+    throw error;
   }
 }

@@ -59,8 +59,40 @@ export class PosRepository {
     tenantId: string,
     warehouseId: string,
     productIds: string[],
+    reservationId?: string,
   ): Promise<PosProductSnapshot[]> {
     const placeholders = productIds.map(() => '?').join(', ');
+    if (reservationId) {
+      const rows = await this.dataSource.query<
+        Array<{
+          id: string;
+          name: string;
+          sku: string;
+          price: string;
+          active: number | boolean;
+          available_quantity: string;
+        }>
+      >(
+        `SELECT p.id, p.name, p.sku, p.price, p.active,
+                rl.quantity AS available_quantity
+         FROM product_reservations r
+         INNER JOIN product_reservation_lines rl
+           ON rl.reservation_id = r.id AND rl.tenant_id = r.tenant_id
+         INNER JOIN products p ON p.id = rl.product_id AND p.tenant_id = r.tenant_id
+         WHERE r.id = ? AND r.tenant_id = ? AND r.warehouse_id = ?
+           AND r.status = 'ACTIVE' AND r.expires_at > CURRENT_TIMESTAMP(6)
+           AND p.id IN (${placeholders})`,
+        [reservationId, tenantId, warehouseId, ...productIds],
+      );
+      return rows.map((row) => ({
+        id: row.id,
+        name: row.name,
+        sku: row.sku,
+        price: row.price,
+        active: Boolean(row.active),
+        availableQuantity: this.normalizeQuantity(row.available_quantity),
+      }));
+    }
     const rows = await this.dataSource.query<
       Array<{
         id: string;

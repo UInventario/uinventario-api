@@ -250,6 +250,18 @@ export class PosController {
       correlationId: request.requestId!,
       deduplicate: true,
     });
+    if (dto.reservationId) {
+      await this.audit.record({
+        tenantId: principal.tenant.id,
+        actorUserId: principal.user.id,
+        action: 'PRODUCT_RESERVATION_CONSUMED',
+        entityType: 'PRODUCT_RESERVATION',
+        entityId: dto.reservationId,
+        correlationId: request.requestId!,
+        deduplicate: true,
+        after: { status: 'CONSUMED', saleId: result.data.id },
+      });
+    }
     return result;
   }
 

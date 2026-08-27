@@ -1,7 +1,7 @@
 export interface ProductReservationData {
   id: string;
   reservationNumber: string;
-  status: 'ACTIVE';
+  status: 'ACTIVE' | 'RELEASED' | 'EXPIRED' | 'CONSUMED';
   customer: { id: string; name: string; identifier: string | null };
   context: {
     branch: { id: string; name: string };
@@ -11,6 +11,9 @@ export interface ProductReservationData {
   responsible: { id: string; email: string };
   expiresAt: string;
   createdAt: string;
+  closedAt: string | null;
+  closureReason: string | null;
+  sale: { id: string; receiptNumber: string } | null;
   lines: Array<{
     id: string;
     product: { id: string; name: string; sku: string };

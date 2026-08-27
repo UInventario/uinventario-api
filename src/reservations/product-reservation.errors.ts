@@ -5,3 +5,8 @@ export class ProductReservationInsufficientStockError extends Error {
   }
 }
 export class ProductReservationIdempotencyConflictError extends Error {}
+export class ProductReservationNotActiveError extends Error {
+  constructor(readonly status: string) {
+    super('PRODUCT_RESERVATION_NOT_ACTIVE');
+  }
+}
