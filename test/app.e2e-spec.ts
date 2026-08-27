@@ -44,6 +44,7 @@ describe('UInventario API (e2e)', () => {
       'sales',
       'cash_register_movements',
       'cash_register_shifts',
+      'customers',
       'inventory_movements',
       'inventory_import_rows',
       'inventory_imports',
@@ -5313,6 +5314,200 @@ describe('UInventario API (e2e)', () => {
       }
       return { cookie, productId, locationId: location.id };
     }
+
+    it('manages tenant customers and associates an optional active customer to sales', async () => {
+      const { cookie, productId } = await preparePos();
+      await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Sin consentimiento',
+          email: 'private@example.com',
+          dataProcessingConsent: false,
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('CUSTOMER_CONSENT_REQUIRED');
+        });
+
+      let customer!: { id: string; version: number };
+      await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Ana Pérez',
+          identifier: 'CLI-001',
+          email: 'Ana@example.com',
+          phone: '+52 55 1234 5678',
+          dataProcessingConsent: true,
+        })
+        .expect(201)
+        .expect(({ body }: { body: { data: typeof customer } }) => {
+          customer = body.data;
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Duplicada',
+          email: 'ana@example.com',
+          dataProcessingConsent: true,
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('CUSTOMER_DUPLICATE');
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/customers')
+        .query({ q: '55 1234', status: 'ACTIVE', page: 1, pageSize: 10 })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              { id: customer.id, name: 'Ana Pérez', email: 'ana@example.com' },
+            ],
+            meta: { pagination: { total: 1 } },
+          });
+        });
+      await request(app.getHttpServer())
+        .patch(`/api/v1/customers/${customer.id}`)
+        .set('Cookie', cookie)
+        .send({
+          version: customer.version,
+          name: 'Ana Pérez López',
+          identifier: 'CLI-001',
+          email: 'ana@example.com',
+          phone: '+52 55 1234 5678',
+          dataProcessingConsent: true,
+          active: true,
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { version: 2, name: 'Ana Pérez López' },
+          });
+        });
+
+      const anonymousSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'customer-anonymous-sale')
+        .send({ lines: [{ productId, quantity: '1' }], cashReceived: '120.00' })
+        .expect(201);
+      expect(anonymousSale.body).toMatchObject({ data: { customer: null } });
+      const customerSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'customer-linked-sale')
+        .send({
+          customerId: customer.id,
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: '120.00',
+        })
+        .expect(201);
+      expect(customerSale.body).toMatchObject({
+        data: {
+          customer: {
+            id: customer.id,
+            name: 'Ana Pérez López',
+            identifier: 'CLI-001',
+          },
+        },
+      });
+      const customerSaleId = (customerSale.body as { data: { id: string } })
+        .data.id;
+
+      await request(app.getHttpServer())
+        .delete(`/api/v1/customers/${customer.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { active: false, version: 3 } });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'inactive-customer-sale')
+        .send({
+          customerId: customer.id,
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: '120.00',
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('POS_CUSTOMER_NOT_AVAILABLE');
+        });
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${customerSaleId}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { customer: { id: customer.id, name: 'Ana Pérez López' } },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/audit-events')
+        .query({ entityType: 'CUSTOMER', page: 1, pageSize: 10 })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: Array<{ action: string }> } }) => {
+          expect(body.data.map(({ action }) => action)).toEqual(
+            expect.arrayContaining([
+              'CUSTOMER_CREATED',
+              'CUSTOMER_UPDATED',
+              'CUSTOMER_DEACTIVATED',
+            ]),
+          );
+          expect(JSON.stringify(body.data)).not.toContain('ana@example.com');
+          expect(JSON.stringify(body.data)).not.toContain('+52 55 1234 5678');
+        });
+
+      const other = {
+        organizationName: 'Otra empresa clientes',
+        email: 'other-customers@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'other-customers-registration')
+        .send(other)
+        .expect(201);
+      const otherCookie = await createPersistedSession(other.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Otra empresa clientes Legal',
+          tradeName: 'Otra empresa clientes',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Sucursal clientes',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega clientes',
+          locationName: 'General clientes',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Caja clientes' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/customers')
+        .query({ q: 'Ana', status: 'ALL', page: 1, pageSize: 10 })
+        .set('Cookie', otherCookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toEqual([]);
+        });
+    });
 
     it('opens one auditable register shift idempotently and requires it for POS operations', async () => {
       const { cookie, productId } = await preparePos(false);

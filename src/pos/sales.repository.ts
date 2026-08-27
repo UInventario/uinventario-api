@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import {
   PosIdempotencyConflictError,
+  PosCustomerNotAvailableError,
   PosInsufficientStockError,
   SaleAlreadyVoidedError,
   SaleVoidNotAllowedError,
@@ -22,6 +23,9 @@ interface SaleRow {
   receipt_number: string;
   status: 'COMPLETED' | 'VOIDED';
   created_by_user_id: string;
+  customer_id: string | null;
+  customer_name: string | null;
+  customer_identifier: string | null;
   currency: string;
   tax_rate: string;
   subtotal: string;
@@ -93,6 +97,9 @@ export class SalesRepository {
           status: 'COMPLETED' | 'VOIDED';
           user_id: string;
           user_email: string;
+          customer_id: string | null;
+          customer_name: string | null;
+          customer_identifier: string | null;
           cash_register_id: string;
           cash_register_name: string;
           cash_register_code: string;
@@ -103,10 +110,13 @@ export class SalesRepository {
       >(
         `SELECT s.id, s.receipt_number, s.status,
                 u.id AS user_id, u.email AS user_email,
+                c.id AS customer_id, c.name AS customer_name,
+                c.identifier AS customer_identifier,
                 cr.id AS cash_register_id, cr.name AS cash_register_name,
                 cr.code AS cash_register_code, s.currency, s.total, s.created_at
          FROM sales s
          INNER JOIN users u ON u.id = s.created_by_user_id AND u.tenant_id = s.tenant_id
+         LEFT JOIN customers c ON c.id = s.customer_id AND c.tenant_id = s.tenant_id
          INNER JOIN cash_registers cr ON cr.id = s.cash_register_id AND cr.tenant_id = s.tenant_id
          WHERE ${where}
          ORDER BY s.created_at DESC, s.id DESC LIMIT ? OFFSET ?`,
@@ -123,6 +133,13 @@ export class SalesRepository {
         receiptNumber: row.receipt_number,
         status: row.status,
         user: { id: row.user_id, email: row.user_email },
+        customer: row.customer_id
+          ? {
+              id: row.customer_id,
+              name: row.customer_name!,
+              identifier: row.customer_identifier,
+            }
+          : null,
         cashRegister: {
           id: row.cash_register_id,
           name: row.cash_register_name,
@@ -448,6 +465,7 @@ export class SalesRepository {
     idempotencyKey: string;
     fingerprint: string;
     cashRegisterShiftId: string;
+    customerId?: string | null;
     quote: PosCartQuoteResponse['data'];
     amountReceived: string;
     change: string;
@@ -465,6 +483,14 @@ export class SalesRepository {
             if (replay.fingerprint !== input.fingerprint)
               throw new PosIdempotencyConflictError();
             return { sale: replay.sale, replay: true };
+          }
+          if (input.customerId) {
+            const [customer] = await manager.query<Array<{ id: string }>>(
+              `SELECT id FROM customers
+               WHERE id = ? AND tenant_id = ? AND active = TRUE FOR UPDATE`,
+              [input.customerId, input.tenantId],
+            );
+            if (!customer) throw new PosCustomerNotAvailableError();
           }
           const [openShift] = await manager.query<Array<{ id: string }>>(
             `SELECT id FROM cash_register_shifts
@@ -544,9 +570,9 @@ export class SalesRepository {
           await manager.query(
             `INSERT INTO sales
             (id, tenant_id, branch_id, warehouse_id, cash_register_id,
-             cash_register_shift_id, created_by_user_id, receipt_number, currency, tax_rate, subtotal,
+             cash_register_shift_id, created_by_user_id, customer_id, receipt_number, currency, tax_rate, subtotal,
              tax_total, total, status, idempotency_key, request_fingerprint)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
             [
               saleId,
               input.tenantId,
@@ -555,6 +581,7 @@ export class SalesRepository {
               input.quote.context.cashRegister.id,
               input.cashRegisterShiftId,
               input.userId,
+              input.customerId ?? null,
               receiptNumber,
               input.quote.currency,
               input.quote.taxRate,
@@ -687,6 +714,8 @@ export class SalesRepository {
   ): Promise<{ sale: CashSaleData; fingerprint: string } | null> {
     const rows = await manager.query<SaleRow[]>(
       `SELECT s.id, s.receipt_number, s.status, s.created_by_user_id,
+              c.id AS customer_id, c.name AS customer_name,
+              c.identifier AS customer_identifier,
               s.currency, s.tax_rate, s.subtotal, s.tax_total, s.total,
               s.request_fingerprint, s.created_at, s.voided_by_user_id,
               vu.email AS voided_by_email, s.void_reason, s.voided_at,
@@ -702,6 +731,7 @@ export class SalesRepository {
        INNER JOIN cash_registers cr ON cr.id = s.cash_register_id AND cr.tenant_id = s.tenant_id
        INNER JOIN sale_payments sp ON sp.sale_id = s.id AND sp.tenant_id = s.tenant_id AND sp.method = 'CASH'
        LEFT JOIN users vu ON vu.id = s.voided_by_user_id AND vu.tenant_id = s.tenant_id
+       LEFT JOIN customers c ON c.id = s.customer_id AND c.tenant_id = s.tenant_id
        WHERE s.tenant_id = ? AND s.idempotency_key = ? LIMIT 1`,
       [tenantId, idempotencyKey],
     );
@@ -740,6 +770,13 @@ export class SalesRepository {
           },
         },
         userId: row.created_by_user_id,
+        customer: row.customer_id
+          ? {
+              id: row.customer_id,
+              name: row.customer_name!,
+              identifier: row.customer_identifier,
+            }
+          : null,
         currency: row.currency,
         taxRate: this.decimal(row.tax_rate, 4),
         lines: lines.map((line) => ({

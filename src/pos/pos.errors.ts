@@ -10,6 +10,12 @@ export class PosProductNotAvailableError extends Error {
   }
 }
 
+export class PosCustomerNotAvailableError extends Error {
+  constructor() {
+    super('POS_CUSTOMER_NOT_AVAILABLE');
+  }
+}
+
 export class PosInsufficientStockError extends Error {
   constructor(readonly productId: string) {
     super('POS_INSUFFICIENT_STOCK');
