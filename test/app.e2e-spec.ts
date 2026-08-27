@@ -4,6 +4,7 @@ import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
 import { DataSource } from 'typeorm';
+import { createHash, randomUUID } from 'node:crypto';
 
 describe('UInventario API (e2e)', () => {
   let app: INestApplication<App>;
@@ -54,6 +55,29 @@ describe('UInventario API (e2e)', () => {
       .set('Idempotency-Key', idempotencyKey)
       .send(registrationPayload)
       .expect(201);
+  }
+
+  async function createPersistedSession(email: string): Promise<string> {
+    const [identity] = await dataSource.query<
+      Array<{ user_id: string; tenant_id: string }>
+    >('SELECT id AS user_id, tenant_id FROM users WHERE normalized_email = ?', [
+      email.toLowerCase(),
+    ]);
+    const token =
+      randomUUID().replaceAll('-', '') + randomUUID().replaceAll('-', '');
+    await dataSource.query(
+      `INSERT INTO sessions
+        (id, token_hash, user_id, tenant_id, expires_at, revoked_at)
+       VALUES (?, ?, ?, ?, ?, NULL)`,
+      [
+        randomUUID(),
+        createHash('sha256').update(token).digest('hex'),
+        identity.user_id,
+        identity.tenant_id,
+        new Date(Date.now() + 60 * 60_000),
+      ],
+    );
+    return `uinventario_session=${token}`;
   }
 
   describe('health', () => {
@@ -381,6 +405,106 @@ describe('UInventario API (e2e)', () => {
         .get('/api/v1/auth/sessions/current')
         .set('Cookie', cookie)
         .expect(401);
+    });
+  });
+
+  describe('company onboarding', () => {
+    beforeEach(resetIdentityData);
+
+    it('persists and resumes progress only for the session tenant', async () => {
+      await registerAccount('onboarding-primary-registration');
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'onboarding-secondary-registration')
+        .send({
+          organizationName: 'Empresa Ajena',
+          email: 'other@example.com',
+          password: registrationPayload.password,
+        })
+        .expect(201);
+
+      const primaryCookie = await createPersistedSession(
+        registrationPayload.email,
+      );
+      const [{ id: otherTenantId }] = await dataSource.query<
+        Array<{ id: string }>
+      >('SELECT id FROM tenants WHERE name = ?', ['Empresa Ajena']);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/onboarding/company')
+        .set('Cookie', primaryCookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              company: {
+                legalName: null,
+                tradeName: registrationPayload.organizationName,
+                countryCode: null,
+              },
+              progress: { currentStep: 'COMPANY', completedSteps: [] },
+            },
+          });
+        });
+
+      const company = {
+        legalName: 'Tienda Central, S.A. de C.V.',
+        tradeName: 'Tienda Central MX',
+        countryCode: 'mx',
+      };
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', primaryCookie)
+        .set('X-Tenant-Id', otherTenantId)
+        .send(company)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              company: { ...company, countryCode: 'MX' },
+              progress: {
+                currentStep: 'BRANCH',
+                completedSteps: ['COMPANY'],
+              },
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', primaryCookie)
+        .send({ ...company, tradeName: 'Tienda Central Actualizada' })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/onboarding/company')
+        .set('Cookie', primaryCookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              company: { tradeName: 'Tienda Central Actualizada' },
+              progress: { currentStep: 'BRANCH' },
+            },
+          });
+        });
+
+      const [otherTenant] = await dataSource.query<
+        Array<{ legal_name: string | null; country_code: string | null }>
+      >('SELECT legal_name, country_code FROM tenants WHERE id = ?', [
+        otherTenantId,
+      ]);
+      const [{ total }] = await dataSource.query<
+        Array<{ total: number | string }>
+      >('SELECT COUNT(*) AS total FROM tenants');
+      expect(otherTenant).toEqual({ legal_name: null, country_code: null });
+      expect(Number(total)).toBe(2);
+
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', primaryCookie)
+        .send({ ...company, countryCode: 'MEX', tenantId: otherTenantId })
+        .expect(400);
     });
   });
 

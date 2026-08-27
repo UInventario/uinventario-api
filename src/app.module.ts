@@ -12,6 +12,7 @@ import { databaseConfig } from './config/database.config';
 import { sessionConfig } from './config/session.config';
 import { validationSchema } from './config/validation.schema';
 import { HealthModule } from './health/health.module';
+import { OnboardingModule } from './onboarding/onboarding.module';
 
 @Module({
   imports: [
@@ -39,6 +40,7 @@ import { HealthModule } from './health/health.module';
     HealthModule,
     RegistrationModule,
     SessionModule,
+    OnboardingModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })
