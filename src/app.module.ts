@@ -11,19 +11,27 @@ import { appConfig } from './config/app.config';
 import { databaseConfig } from './config/database.config';
 import { sessionConfig } from './config/session.config';
 import { posConfig } from './config/pos.config';
+import { passwordResetConfig } from './config/password-reset.config';
 import { CatalogModule } from './catalog/catalog.module';
 import { validationSchema } from './config/validation.schema';
 import { HealthModule } from './health/health.module';
 import { InventoryModule } from './inventory/inventory.module';
 import { OnboardingModule } from './onboarding/onboarding.module';
 import { PosModule } from './pos/pos.module';
+import { PasswordResetModule } from './auth/password-reset/password-reset.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
       cache: true,
-      load: [appConfig, databaseConfig, sessionConfig, posConfig],
+      load: [
+        appConfig,
+        databaseConfig,
+        sessionConfig,
+        posConfig,
+        passwordResetConfig,
+      ],
       validationSchema,
       validationOptions: { abortEarly: true, allowUnknown: true },
     }),
@@ -44,6 +52,7 @@ import { PosModule } from './pos/pos.module';
     HealthModule,
     RegistrationModule,
     SessionModule,
+    PasswordResetModule,
     OnboardingModule,
     CatalogModule,
     InventoryModule,
