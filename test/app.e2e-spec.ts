@@ -1158,6 +1158,145 @@ describe('UInventario API (e2e)', () => {
         .send({ ...update, version: 1 })
         .expect(404);
     });
+
+    it('deletes unreferenced products and deactivates products with inventory history', async () => {
+      await request(app.getHttpServer())
+        .delete(`/api/v1/products/${randomUUID()}`)
+        .expect(401);
+
+      await registerAccount('product-retirement-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeOnboarding(registrationPayload.email, cookie);
+
+      const disposableResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto temporal',
+          sku: 'TEMP-DELETE',
+          cost: '1.00',
+          price: '2.00',
+        })
+        .expect(201);
+      const disposableId = (disposableResponse.body as { data: { id: string } })
+        .data.id;
+      await request(app.getHttpServer())
+        .delete(`/api/v1/products/${disposableId}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { outcome: 'DELETED', product: null },
+          });
+        });
+      await request(app.getHttpServer())
+        .get(`/api/v1/products/${disposableId}`)
+        .set('Cookie', cookie)
+        .expect(404);
+
+      const retainedResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto con historial',
+          sku: 'KEEP-HISTORY',
+          cost: '10.00',
+          price: '15.00',
+        })
+        .expect(201);
+      const retainedId = (retainedResponse.body as { data: { id: string } })
+        .data.id;
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'product-retirement-stock')
+        .send({
+          productId: retainedId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '3',
+          reason: 'Stock para conservar historial',
+        })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .delete(`/api/v1/products/${retainedId}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              outcome: 'DEACTIVATED',
+              product: { id: retainedId, active: false },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .delete(`/api/v1/products/${retainedId}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              outcome: 'DEACTIVATED',
+              product: { id: retainedId, active: false, version: 2 },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get(`/api/v1/products/${retainedId}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { id: retainedId, active: false },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .get('/api/v1/products')
+        .query({ q: 'KEEP-HISTORY' })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [],
+            meta: { pagination: { total: 0 } },
+          });
+        });
+      for (const status of ['INACTIVE', 'ALL']) {
+        await request(app.getHttpServer())
+          .get('/api/v1/products')
+          .query({ q: 'KEEP-HISTORY', status })
+          .set('Cookie', cookie)
+          .expect(200)
+          .expect(({ body }: { body: unknown }) => {
+            expect(body).toMatchObject({
+              data: [{ id: retainedId, active: false }],
+              meta: { pagination: { total: 1 } },
+            });
+          });
+      }
+      await request(app.getHttpServer())
+        .get('/api/v1/products')
+        .query({ status: 'UNKNOWN' })
+        .set('Cookie', cookie)
+        .expect(400);
+
+      const [history] = await dataSource.query<
+        Array<{ total: number | string }>
+      >(
+        'SELECT COUNT(*) AS total FROM inventory_movements WHERE product_id = ?',
+        [retainedId],
+      );
+      expect(Number(history.total)).toBe(1);
+    });
   });
 
   describe('inventory stock', () => {
@@ -2465,6 +2604,14 @@ describe('UInventario API (e2e)', () => {
             expect(body.code).toBe(code);
           });
       }
+
+      await request(app.getHttpServer())
+        .delete(`/api/v1/products/${randomUUID()}`)
+        .set('Cookie', cookie)
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PRODUCT_ACCESS_DENIED');
+        });
 
       await request(app.getHttpServer())
         .put('/api/v1/onboarding/company')

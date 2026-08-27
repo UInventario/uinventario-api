@@ -8,7 +8,7 @@ import {
   ProductVersionConflictError,
 } from './catalog.errors';
 import { CatalogOptionsResponse, ProductData } from './catalog.types';
-import { ListProductsDto } from './dto/list-products.dto';
+import { ListProductsDto, ProductStatusFilter } from './dto/list-products.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 
 interface ProductRow {
@@ -166,13 +166,19 @@ export class CatalogRepository {
     query: ListProductsDto,
   ): Promise<{ products: ProductData[]; total: number }> {
     const search = query.q ? `%${query.q.trim()}%` : null;
-    const where = search
-      ? `p.tenant_id = ? AND
-         (p.name LIKE ? OR p.normalized_sku LIKE ? OR p.barcode LIKE ?)`
-      : 'p.tenant_id = ?';
-    const parameters = search
-      ? [tenantId, search, search.toUpperCase(), search]
-      : [tenantId];
+    const conditions = ['p.tenant_id = ?'];
+    const parameters: Array<string | number> = [tenantId];
+    if (query.status !== ProductStatusFilter.ALL) {
+      conditions.push('p.active = ?');
+      parameters.push(query.status === ProductStatusFilter.ACTIVE ? 1 : 0);
+    }
+    if (search) {
+      conditions.push(
+        '(p.name LIKE ? OR p.normalized_sku LIKE ? OR p.barcode LIKE ?)',
+      );
+      parameters.push(search, search.toUpperCase(), search);
+    }
+    const where = conditions.join(' AND ');
     const offset = (query.page - 1) * query.pageSize;
     const [rows, countRows] = await Promise.all([
       this.dataSource.query<ProductRow[]>(
@@ -197,6 +203,61 @@ export class CatalogRepository {
       [id, tenantId],
     );
     return rows[0] ? this.toProduct(rows[0]) : null;
+  }
+
+  async retireProduct(
+    tenantId: string,
+    id: string,
+  ): Promise<{
+    outcome: 'DELETED' | 'DEACTIVATED';
+    product: ProductData | null;
+  } | null> {
+    return this.dataSource.transaction(async (manager) => {
+      const products = await manager.query<
+        Array<{ id: string; active: number | boolean }>
+      >(
+        'SELECT id, active FROM products WHERE id = ? AND tenant_id = ? FOR UPDATE',
+        [id, tenantId],
+      );
+      if (!products[0]) return null;
+
+      const [references] = await manager.query<
+        Array<{
+          has_movements: number | string;
+          has_sales: number | string;
+          has_stock: number | string;
+        }>
+      >(
+        `SELECT
+           EXISTS(SELECT 1 FROM inventory_movements WHERE tenant_id = ? AND product_id = ?) AS has_movements,
+           EXISTS(SELECT 1 FROM sale_lines WHERE tenant_id = ? AND product_id = ?) AS has_sales,
+           EXISTS(SELECT 1 FROM inventory_balances WHERE tenant_id = ? AND product_id = ? AND quantity <> 0) AS has_stock`,
+        [tenantId, id, tenantId, id, tenantId, id],
+      );
+      const mustPreserve =
+        Number(references.has_movements) === 1 ||
+        Number(references.has_sales) === 1 ||
+        Number(references.has_stock) === 1;
+      if (mustPreserve) {
+        if (products[0].active) {
+          await manager.query(
+            `UPDATE products SET active = FALSE, version = version + 1
+             WHERE id = ? AND tenant_id = ?`,
+            [id, tenantId],
+          );
+        }
+        return {
+          outcome: 'DEACTIVATED',
+          product: await this.findProduct(manager, tenantId, id),
+        };
+      }
+
+      await manager.query(
+        'DELETE FROM products WHERE id = ? AND tenant_id = ?',
+        [id, tenantId],
+      );
+      return { outcome: 'DELETED', product: null };
+    });
   }
 
   private async findOrCreateClassification(

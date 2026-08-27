@@ -11,6 +11,7 @@ import {
 import {
   CatalogOptionsResponse,
   ProductListResponse,
+  ProductRetirementResponse,
   ProductResponse,
 } from './catalog.types';
 import { CreateProductDto } from './dto/create-product.dto';
@@ -106,6 +107,15 @@ export class CatalogService {
     const product = await this.catalog.getProduct(tenantId, id);
     if (!product) throw new NotFoundException();
     return { data: product, meta: { apiVersion: '1' } };
+  }
+
+  async retireProduct(
+    tenantId: string,
+    id: string,
+  ): Promise<ProductRetirementResponse> {
+    const retirement = await this.catalog.retireProduct(tenantId, id);
+    if (!retirement) throw new NotFoundException();
+    return { data: retirement, meta: { apiVersion: '1' } };
   }
 
   private throwIdentifierConflict(

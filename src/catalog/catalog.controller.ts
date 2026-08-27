@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   ParseUUIDPipe,
@@ -86,6 +87,29 @@ export class CatalogController {
       action: 'PRODUCT_UPDATED',
       entityType: 'PRODUCT',
       entityId: result.data.id,
+      correlationId: request.requestId!,
+    });
+    return result;
+  }
+
+  @Delete(':id')
+  async retireProduct(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', new ParseUUIDPipe()) id: string,
+  ) {
+    const result = await this.catalog.retireProduct(
+      request.principal.tenant.id,
+      id,
+    );
+    await this.audit.record({
+      tenantId: request.principal.tenant.id,
+      actorUserId: request.principal.user.id,
+      action:
+        result.data.outcome === 'DELETED'
+          ? 'PRODUCT_DELETED'
+          : 'PRODUCT_DEACTIVATED',
+      entityType: 'PRODUCT',
+      entityId: id,
       correlationId: request.requestId!,
     });
     return result;
