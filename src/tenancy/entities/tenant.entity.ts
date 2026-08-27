@@ -10,4 +10,12 @@ export class TenantEntity {
 
   @CreateDateColumn({ name: 'created_at', type: 'datetime', precision: 6 })
   createdAt!: Date;
+
+  @Column({
+    name: 'onboarding_completed_at',
+    type: 'datetime',
+    precision: 6,
+    nullable: true,
+  })
+  onboardingCompletedAt!: Date | null;
 }
