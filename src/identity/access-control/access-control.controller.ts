@@ -64,7 +64,13 @@ export class AccessControlController {
       request.principal.user.id,
       dto,
     );
-    await this.record(request, 'ACCESS_USER_CREATED', 'USER', result.data.id);
+    await this.record(
+      request,
+      'ACCESS_USER_CREATED',
+      'USER',
+      result.data.id,
+      this.assignmentSnapshot(result.data),
+    );
     return result;
   }
 
@@ -80,7 +86,13 @@ export class AccessControlController {
       userId,
       dto,
     );
-    await this.record(request, 'ACCESS_USER_UPDATED', 'USER', result.data.id);
+    await this.record(
+      request,
+      'ACCESS_USER_UPDATED',
+      'USER',
+      result.data.id,
+      this.assignmentSnapshot(result.data),
+    );
     return result;
   }
 
@@ -89,6 +101,7 @@ export class AccessControlController {
     action: string,
     entityType: string,
     entityId: string,
+    after?: Record<string, unknown>,
   ) {
     return this.audit.record({
       tenantId: request.principal.tenant.id,
@@ -97,6 +110,19 @@ export class AccessControlController {
       entityType,
       entityId,
       correlationId: request.requestId!,
+      after,
     });
+  }
+
+  private assignmentSnapshot(user: {
+    roles: Array<{ id: string }>;
+    branches: Array<{ id: string }>;
+    cashRegisters: Array<{ id: string }>;
+  }): Record<string, unknown> {
+    return {
+      roleIds: user.roles.map((role) => role.id),
+      branchIds: user.branches.map((branch) => branch.id),
+      cashRegisterIds: user.cashRegisters.map((register) => register.id),
+    };
   }
 }

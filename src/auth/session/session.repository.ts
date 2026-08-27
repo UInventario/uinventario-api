@@ -88,7 +88,29 @@ export class SessionRepository {
                    candidate.created_at, candidate.id
           LIMIT 1
         )
-        LEFT JOIN cash_registers cr ON cr.tenant_id = t.id AND cr.branch_id = b.id AND cr.onboarding_key = 'INITIAL'
+        LEFT JOIN cash_registers cr ON cr.id = (
+          SELECT candidate.id FROM cash_registers candidate
+          WHERE candidate.tenant_id = t.id AND candidate.branch_id = b.id
+            AND (
+              EXISTS (
+                SELECT 1 FROM user_roles register_admin_ur
+                INNER JOIN roles register_admin_role
+                  ON register_admin_role.id = register_admin_ur.role_id
+                  AND register_admin_role.tenant_id = register_admin_ur.tenant_id
+                WHERE register_admin_ur.user_id = u.id
+                  AND register_admin_ur.tenant_id = t.id
+                  AND register_admin_role.code = 'ADMIN'
+              )
+              OR EXISTS (
+                SELECT 1 FROM user_cash_register_access ucra
+                WHERE ucra.user_id = u.id AND ucra.tenant_id = t.id
+                  AND ucra.branch_id = b.id AND ucra.cash_register_id = candidate.id
+              )
+            )
+          ORDER BY (candidate.onboarding_key = 'INITIAL') DESC,
+                   candidate.created_at, candidate.id
+          LIMIT 1
+        )
         LEFT JOIN user_roles ur ON ur.user_id = u.id AND ur.tenant_id = t.id
         LEFT JOIN roles r ON r.id = ur.role_id AND r.tenant_id = ur.tenant_id
         LEFT JOIN role_permissions rp ON rp.role_id = r.id AND rp.tenant_id = r.tenant_id
@@ -216,8 +238,47 @@ export class SessionRepository {
         LEFT JOIN cash_registers cr ON cr.id = COALESCE(
           s.active_cash_register_id,
           (SELECT initial_register.id FROM cash_registers initial_register
-           WHERE initial_register.tenant_id = s.tenant_id AND initial_register.onboarding_key = 'INITIAL' LIMIT 1)
+           WHERE initial_register.tenant_id = s.tenant_id
+             AND initial_register.branch_id = b.id
+             AND (
+               EXISTS (
+                 SELECT 1 FROM user_roles register_admin_ur
+                 INNER JOIN roles register_admin_role
+                   ON register_admin_role.id = register_admin_ur.role_id
+                   AND register_admin_role.tenant_id = register_admin_ur.tenant_id
+                 WHERE register_admin_ur.user_id = u.id
+                   AND register_admin_ur.tenant_id = s.tenant_id
+                   AND register_admin_role.code = 'ADMIN'
+               )
+               OR EXISTS (
+                 SELECT 1 FROM user_cash_register_access initial_register_access
+                 WHERE initial_register_access.user_id = u.id
+                   AND initial_register_access.tenant_id = s.tenant_id
+                   AND initial_register_access.branch_id = b.id
+                   AND initial_register_access.cash_register_id = initial_register.id
+               )
+             )
+           ORDER BY (initial_register.onboarding_key = 'INITIAL') DESC,
+                    initial_register.created_at, initial_register.id LIMIT 1)
         ) AND cr.tenant_id = s.tenant_id AND cr.branch_id = b.id
+          AND (
+            EXISTS (
+              SELECT 1 FROM user_roles active_register_admin_ur
+              INNER JOIN roles active_register_admin_role
+                ON active_register_admin_role.id = active_register_admin_ur.role_id
+                AND active_register_admin_role.tenant_id = active_register_admin_ur.tenant_id
+              WHERE active_register_admin_ur.user_id = u.id
+                AND active_register_admin_ur.tenant_id = s.tenant_id
+                AND active_register_admin_role.code = 'ADMIN'
+            )
+            OR EXISTS (
+              SELECT 1 FROM user_cash_register_access active_register_access
+              WHERE active_register_access.user_id = u.id
+                AND active_register_access.tenant_id = s.tenant_id
+                AND active_register_access.branch_id = b.id
+                AND active_register_access.cash_register_id = cr.id
+            )
+          )
         LEFT JOIN user_roles ur ON ur.user_id = u.id AND ur.tenant_id = s.tenant_id
         LEFT JOIN roles r ON r.id = ur.role_id AND r.tenant_id = s.tenant_id
         LEFT JOIN role_permissions rp ON rp.role_id = r.id AND rp.tenant_id = r.tenant_id
@@ -283,6 +344,7 @@ export class SessionRepository {
     tenantId: string,
     branchId: string,
     warehouseId: string,
+    cashRegisterId: string | undefined,
   ): Promise<SessionIdentity['context'] | null> {
     return this.dataSource.transaction('READ COMMITTED', async (manager) => {
       const [row] = await manager.query<
@@ -303,13 +365,31 @@ export class SessionRepository {
          FROM branches b
          INNER JOIN warehouses w ON w.id = ? AND w.tenant_id = b.tenant_id
            AND w.branch_id = b.id AND w.active = TRUE
-         LEFT JOIN cash_registers cr ON cr.id = (
+         LEFT JOIN cash_registers cr ON cr.id = COALESCE(?, (
            SELECT candidate.id FROM cash_registers candidate
            WHERE candidate.tenant_id = b.tenant_id AND candidate.branch_id = b.id
-           ORDER BY (candidate.onboarding_key = 'INITIAL') DESC, candidate.created_at, candidate.id
-           LIMIT 1
-         )
+             AND (
+               EXISTS (
+                 SELECT 1 FROM user_roles candidate_admin_ur
+                 INNER JOIN roles candidate_admin_role
+                   ON candidate_admin_role.id = candidate_admin_ur.role_id
+                   AND candidate_admin_role.tenant_id = candidate_admin_ur.tenant_id
+                 WHERE candidate_admin_ur.user_id = ?
+                   AND candidate_admin_ur.tenant_id = ?
+                   AND candidate_admin_role.code = 'ADMIN'
+               )
+               OR EXISTS (
+                 SELECT 1 FROM user_cash_register_access candidate_access
+                 WHERE candidate_access.user_id = ? AND candidate_access.tenant_id = ?
+                   AND candidate_access.branch_id = b.id
+                   AND candidate_access.cash_register_id = candidate.id
+               )
+             )
+           ORDER BY (candidate.onboarding_key = 'INITIAL') DESC,
+                    candidate.created_at, candidate.id LIMIT 1
+         )) AND cr.tenant_id = b.tenant_id AND cr.branch_id = b.id
          WHERE b.id = ? AND b.tenant_id = ? AND b.active = TRUE
+           AND (? IS NULL OR cr.id IS NOT NULL)
            AND (
              EXISTS (
                SELECT 1 FROM user_roles ur
@@ -321,8 +401,42 @@ export class SessionRepository {
                WHERE uba.user_id = ? AND uba.tenant_id = ? AND uba.branch_id = b.id
              )
            )
+           AND (
+             cr.id IS NULL
+             OR
+             EXISTS (
+               SELECT 1 FROM user_roles register_ur
+               INNER JOIN roles register_role ON register_role.id = register_ur.role_id
+                 AND register_role.tenant_id = register_ur.tenant_id
+               WHERE register_ur.user_id = ? AND register_ur.tenant_id = ?
+                 AND register_role.code = 'ADMIN'
+             )
+             OR EXISTS (
+               SELECT 1 FROM user_cash_register_access ucra
+               WHERE ucra.user_id = ? AND ucra.tenant_id = ?
+                 AND ucra.branch_id = b.id AND ucra.cash_register_id = cr.id
+             )
+           )
          LIMIT 1 FOR UPDATE`,
-        [warehouseId, branchId, tenantId, userId, tenantId, userId, tenantId],
+        [
+          warehouseId,
+          cashRegisterId,
+          userId,
+          tenantId,
+          userId,
+          tenantId,
+          branchId,
+          tenantId,
+          cashRegisterId ?? null,
+          userId,
+          tenantId,
+          userId,
+          tenantId,
+          userId,
+          tenantId,
+          userId,
+          tenantId,
+        ],
       );
       if (!row) return null;
       const result = await manager.query<{ affectedRows?: number }>(

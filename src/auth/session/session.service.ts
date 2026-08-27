@@ -121,6 +121,7 @@ export class SessionService {
       principal.tenant.id,
       dto.branchId,
       dto.warehouseId,
+      dto.cashRegisterId,
     );
     if (!context) throw new NotFoundException();
     return this.toResponse({ ...principal, context }, principal.expiresAt);

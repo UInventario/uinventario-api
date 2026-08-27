@@ -9,7 +9,7 @@ import {
   Length,
 } from 'class-validator';
 import {
-  INVENTORY_PERMISSIONS,
+  OPERATIONAL_PERMISSIONS,
   type AppPermission,
 } from '../../../auth/authorization/authorization.types';
 
@@ -23,8 +23,8 @@ export class CreateAccessRoleDto {
 
   @IsArray()
   @ArrayMinSize(1)
-  @ArrayMaxSize(INVENTORY_PERMISSIONS.length)
+  @ArrayMaxSize(OPERATIONAL_PERMISSIONS.length)
   @ArrayUnique()
-  @IsIn(INVENTORY_PERMISSIONS, { each: true })
+  @IsIn(OPERATIONAL_PERMISSIONS, { each: true })
   permissions!: AppPermission[];
 }

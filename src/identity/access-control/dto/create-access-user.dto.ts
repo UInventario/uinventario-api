@@ -5,6 +5,7 @@ import {
   ArrayUnique,
   IsArray,
   IsEmail,
+  IsOptional,
   IsString,
   IsUUID,
   Length,
@@ -41,4 +42,11 @@ export class CreateAccessUserDto {
   @ArrayUnique()
   @IsUUID('4', { each: true })
   branchIds!: string[];
+
+  @IsArray()
+  @IsOptional()
+  @ArrayMaxSize(100)
+  @ArrayUnique()
+  @IsUUID('4', { each: true })
+  cashRegisterIds?: string[];
 }

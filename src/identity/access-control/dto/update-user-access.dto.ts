@@ -3,6 +3,7 @@ import {
   ArrayMinSize,
   ArrayUnique,
   IsArray,
+  IsOptional,
   IsUUID,
 } from 'class-validator';
 
@@ -20,4 +21,11 @@ export class UpdateUserAccessDto {
   @ArrayUnique()
   @IsUUID('4', { each: true })
   branchIds!: string[];
+
+  @IsArray()
+  @IsOptional()
+  @ArrayMaxSize(100)
+  @ArrayUnique()
+  @IsUUID('4', { each: true })
+  cashRegisterIds?: string[];
 }

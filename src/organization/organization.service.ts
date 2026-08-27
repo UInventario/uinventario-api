@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { CreateBranchDto } from './dto/create-branch.dto';
+import { CreateCashRegisterDto } from './dto/create-cash-register.dto';
 import { CreateWarehouseDto } from './dto/create-warehouse.dto';
 import { UpdateBranchDto } from './dto/update-branch.dto';
 import { UpdateWarehouseDto } from './dto/update-warehouse.dto';
@@ -16,6 +17,7 @@ import {
 import { OrganizationRepository } from './organization.repository';
 import {
   OrganizationBranchResponse,
+  OrganizationCashRegisterResponse,
   OrganizationListResponse,
   OrganizationRetirementResponse,
   OrganizationWarehouseResponse,
@@ -68,6 +70,17 @@ export class OrganizationService {
     }));
   }
 
+  async createCashRegister(
+    tenantId: string,
+    branchId: string,
+    dto: CreateCashRegisterDto,
+  ): Promise<OrganizationCashRegisterResponse> {
+    return this.mapErrors(async () => ({
+      data: await this.organization.createCashRegister(tenantId, branchId, dto),
+      meta: { apiVersion: '1' },
+    }));
+  }
+
   async updateWarehouse(
     tenantId: string,
     warehouseId: string,
@@ -114,7 +127,7 @@ export class OrganizationService {
       if (error instanceof OrganizationNameConflictError) {
         throw new ConflictException({
           code: 'ORGANIZATION_NAME_CONFLICT',
-          message: 'Ya existe una sucursal o bodega con ese nombre.',
+          message: 'Ya existe una sucursal, bodega o caja con esos datos.',
         });
       }
       if (error instanceof OrganizationInUseError) {

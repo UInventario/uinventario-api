@@ -14,6 +14,7 @@ import { AuditService } from '../audit/audit.service';
 import { SessionGuard } from '../auth/session/session.guard';
 import type { AuthenticatedRequest } from '../auth/session/session.types';
 import { CreateBranchDto } from './dto/create-branch.dto';
+import { CreateCashRegisterDto } from './dto/create-cash-register.dto';
 import { CreateWarehouseDto } from './dto/create-warehouse.dto';
 import { UpdateBranchDto } from './dto/update-branch.dto';
 import { UpdateWarehouseDto } from './dto/update-warehouse.dto';
@@ -97,6 +98,27 @@ export class OrganizationController {
       request,
       'WAREHOUSE_CREATED',
       'WAREHOUSE',
+      result.data.id,
+    );
+    return result;
+  }
+
+  @Post('branches/:branchId/cash-registers')
+  @UseGuards(OrganizationAccessGuard)
+  async createCashRegister(
+    @Req() request: AuthenticatedRequest,
+    @Param('branchId', new ParseUUIDPipe()) branchId: string,
+    @Body() dto: CreateCashRegisterDto,
+  ) {
+    const result = await this.organization.createCashRegister(
+      request.principal.tenant.id,
+      branchId,
+      dto,
+    );
+    await this.record(
+      request,
+      'CASH_REGISTER_CREATED',
+      'CASH_REGISTER',
       result.data.id,
     );
     return result;
