@@ -38,6 +38,7 @@ describe('UInventario API (e2e)', () => {
       'sale_payments',
       'sale_lines',
       'sales',
+      'cash_register_shifts',
       'inventory_movements',
       'inventory_transfer_receipt_lines',
       'inventory_transfer_receipts',
@@ -100,6 +101,19 @@ describe('UInventario API (e2e)', () => {
       ],
     );
     return `uinventario_session=${token}`;
+  }
+
+  async function openCurrentCashRegister(
+    cookie: string,
+    idempotencyKey: string,
+    openingAmount = '0.00',
+  ): Promise<void> {
+    await request(app.getHttpServer())
+      .post('/api/v1/pos/register-shifts')
+      .set('Cookie', cookie)
+      .set('Idempotency-Key', idempotencyKey)
+      .send({ openingAmount })
+      .expect(201);
   }
 
   describe('health', () => {
@@ -2008,6 +2022,7 @@ describe('UInventario API (e2e)', () => {
           ],
         },
       });
+      await openCurrentCashRegister(cookie, 'state-pos-shift');
       await request(app.getHttpServer())
         .post('/api/v1/pos/cart/quote')
         .set('Cookie', cookie)
@@ -3022,7 +3037,7 @@ describe('UInventario API (e2e)', () => {
   describe('POS cart quote', () => {
     beforeEach(resetIdentityData);
 
-    async function preparePos(): Promise<{
+    async function preparePos(openShift = true): Promise<{
       cookie: string;
       productId: string;
       locationId: string;
@@ -3084,8 +3099,99 @@ describe('UInventario API (e2e)', () => {
           reason: 'Stock para POS',
         })
         .expect(201);
+      if (openShift) {
+        await openCurrentCashRegister(cookie, 'pos-open-shift', '250.00');
+      }
       return { cookie, productId, locationId: location.id };
     }
+
+    it('opens one auditable register shift idempotently and requires it for POS operations', async () => {
+      const { cookie, productId } = await preparePos(false);
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/current')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown } }) => {
+          expect(body.data).toBeNull();
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [{ productId, quantity: '1' }] })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('CASH_REGISTER_SHIFT_REQUIRED');
+        });
+
+      const keys = ['pos-shift-concurrent-a', 'pos-shift-concurrent-b'];
+      const openings = await Promise.all(
+        keys.map((key) =>
+          request(app.getHttpServer())
+            .post('/api/v1/pos/register-shifts')
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', key)
+            .send({ openingAmount: '250.00' }),
+        ),
+      );
+      expect(openings.map(({ status }) => status).sort()).toEqual([201, 409]);
+      expect(openings.find(({ status }) => status === 409)?.body).toMatchObject(
+        { code: 'CASH_REGISTER_ALREADY_OPEN' },
+      );
+      const successfulIndex = openings.findIndex(
+        ({ status }) => status === 201,
+      );
+      const successful = openings[successfulIndex];
+      const successfulBody = successful.body as {
+        data: { id: string; openedAt: string };
+      };
+      expect(successfulBody).toMatchObject({
+        data: {
+          status: 'OPEN',
+          openingAmount: '250.00',
+          currency: 'MXN',
+          openedBy: { email: registrationPayload.email },
+          branch: { name: 'Sucursal POS' },
+          cashRegister: { name: 'Caja POS', code: 'MAIN' },
+        },
+        meta: { apiVersion: '1', idempotentReplay: false },
+      });
+      expect(successfulBody.data.openedAt).toEqual(expect.any(String));
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', keys[successfulIndex])
+        .send({ openingAmount: '250.0' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { id: successfulBody.data.id },
+            meta: { idempotentReplay: true },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', keys[successfulIndex])
+        .send({ openingAmount: '251.00' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('IDEMPOTENCY_KEY_REUSED');
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/current')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { id: successfulBody.data.id } });
+        });
+      const [audit] = await dataSource.query<Array<{ total: number | string }>>(
+        `SELECT COUNT(*) AS total FROM audit_events
+         WHERE action = 'CASH_REGISTER_SHIFT_OPENED' AND entity_id = ?`,
+        [successfulBody.data.id],
+      );
+      expect(Number(audit.total)).toBe(1);
+    });
 
     it('recalculates prices, included tax and totals from server data', async () => {
       const { cookie, productId, locationId } = await preparePos();
@@ -3210,6 +3316,7 @@ describe('UInventario API (e2e)', () => {
           line_count: number | string;
           payments: number | string;
           sale_movements: number | string;
+          sales_linked_to_open_shift: number | string;
           balance: string;
         }>
       >(
@@ -3217,6 +3324,10 @@ describe('UInventario API (e2e)', () => {
                 (SELECT COUNT(*) FROM sale_lines) AS line_count,
                 (SELECT COUNT(*) FROM sale_payments) AS payments,
                 (SELECT COUNT(*) FROM inventory_movements WHERE type = 'SALE') AS sale_movements,
+                (SELECT COUNT(*) FROM sales s
+                  INNER JOIN cash_register_shifts crs
+                    ON crs.id = s.cash_register_shift_id AND crs.tenant_id = s.tenant_id
+                  WHERE crs.status = 'OPEN') AS sales_linked_to_open_shift,
                 (SELECT quantity FROM inventory_balances
                   WHERE product_id = ? AND location_id = ?) AS balance`,
         [productId, locationId],
@@ -3226,12 +3337,14 @@ describe('UInventario API (e2e)', () => {
         lines: Number(saleCounts.line_count),
         payments: Number(saleCounts.payments),
         saleMovements: Number(saleCounts.sale_movements),
+        salesLinkedToOpenShift: Number(saleCounts.sales_linked_to_open_shift),
         balance: saleCounts.balance,
       }).toEqual({
         sales: 1,
         lines: 1,
         payments: 1,
         saleMovements: 1,
+        salesLinkedToOpenShift: 1,
         balance: '2.500',
       });
       const [trace] = await dataSource.query<
@@ -3483,6 +3596,11 @@ describe('UInventario API (e2e)', () => {
       >('SELECT id, tenant_id FROM users WHERE normalized_email = ? LIMIT 1', [
         registrationPayload.email,
       ]);
+      const [shift] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT id FROM cash_register_shifts
+         WHERE tenant_id = ? AND opened_by_user_id = ? AND status = 'OPEN'`,
+        [principal.tenant_id, principal.id],
+      );
 
       await expect(
         app.get(SalesRepository).persistCashSale({
@@ -3490,6 +3608,7 @@ describe('UInventario API (e2e)', () => {
           userId: principal.id,
           idempotencyKey: 'pos-payment-rollback',
           fingerprint: 'f'.repeat(64),
+          cashRegisterShiftId: shift.id,
           quote,
           amountReceived: '10000000000000.00',
           change: '0.00',
@@ -3643,6 +3762,7 @@ describe('UInventario API (e2e)', () => {
           reference: `MATRIX-${suffix}`,
         })
         .expect(201);
+      await openCurrentCashRegister(cookie, `tenant-matrix-shift-${suffix}`);
       const saleResponse = await request(app.getHttpServer())
         .post('/api/v1/pos/sales/cash')
         .set('Cookie', cookie)
@@ -4359,6 +4479,7 @@ describe('UInventario API (e2e)', () => {
         '/api/v1/products',
         '/api/v1/inventory/stock',
         '/api/v1/inventory/transfers',
+        '/api/v1/pos/register-shifts/current',
         '/api/v1/pos/sales',
       ]) {
         await request(app.getHttpServer()).get(path).expect(401);
@@ -4389,6 +4510,7 @@ describe('UInventario API (e2e)', () => {
         ['/api/v1/products', 'PRODUCT_ACCESS_DENIED'],
         ['/api/v1/inventory/stock', 'INVENTORY_ACCESS_DENIED'],
         ['/api/v1/inventory/transfers', 'INVENTORY_ACCESS_DENIED'],
+        ['/api/v1/pos/register-shifts/current', 'POS_ACCESS_DENIED'],
         ['/api/v1/pos/sales', 'POS_ACCESS_DENIED'],
         ['/api/v1/audit-events', 'AUDIT_ACCESS_DENIED'],
       ]) {
@@ -4586,6 +4708,7 @@ describe('UInventario API (e2e)', () => {
           reason: 'Stock auditado',
         })
         .expect(201);
+      await openCurrentCashRegister(cookie, 'audit-open-shift');
       const sale = await request(app.getHttpServer())
         .post('/api/v1/pos/sales/cash')
         .set('Cookie', cookie)
@@ -4622,7 +4745,7 @@ describe('UInventario API (e2e)', () => {
         }>;
         meta: { pagination: { total: number } };
       };
-      expect(body.meta.pagination.total).toBe(7);
+      expect(body.meta.pagination.total).toBe(8);
       expect(new Set(body.data.map(({ action }) => action))).toEqual(
         new Set([
           'REGISTRATION_CREATED',
@@ -4631,6 +4754,7 @@ describe('UInventario API (e2e)', () => {
           'PRODUCT_CREATED',
           'PRODUCT_UPDATED',
           'INVENTORY_MOVEMENT_CREATED',
+          'CASH_REGISTER_SHIFT_OPENED',
           'SALE_COMPLETED',
         ]),
       );
@@ -4765,6 +4889,7 @@ describe('UInventario API (e2e)', () => {
           reason: 'Stock de release',
         })
         .expect(201);
+      await openCurrentCashRegister(cookie, 'release-open-shift');
       await request(app.getHttpServer())
         .post('/api/v1/pos/sales/cash')
         .set('Cookie', cookie)

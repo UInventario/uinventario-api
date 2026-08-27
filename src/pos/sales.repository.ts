@@ -6,6 +6,7 @@ import {
   PosInsufficientStockError,
 } from './pos.errors';
 import { ListSalesDto } from './dto/list-sales.dto';
+import { CashRegisterShiftRequiredError } from './cash-register-shift.errors';
 import {
   CashSaleData,
   PosCartQuoteResponse,
@@ -214,6 +215,7 @@ export class SalesRepository {
     userId: string;
     idempotencyKey: string;
     fingerprint: string;
+    cashRegisterShiftId: string;
     quote: PosCartQuoteResponse['data'];
     amountReceived: string;
     change: string;
@@ -232,6 +234,20 @@ export class SalesRepository {
               throw new PosIdempotencyConflictError();
             return { sale: replay.sale, replay: true };
           }
+          const [openShift] = await manager.query<Array<{ id: string }>>(
+            `SELECT id FROM cash_register_shifts
+             WHERE id = ? AND tenant_id = ? AND branch_id = ?
+               AND cash_register_id = ? AND opened_by_user_id = ?
+               AND status = 'OPEN' LIMIT 1 FOR UPDATE`,
+            [
+              input.cashRegisterShiftId,
+              input.tenantId,
+              input.quote.context.branch.id,
+              input.quote.context.cashRegister.id,
+              input.userId,
+            ],
+          );
+          if (!openShift) throw new CashRegisterShiftRequiredError();
           const allocations = new Map<string, StockAllocation[]>();
           let insufficientProductId: string | null = null;
           for (const line of [...input.quote.lines].sort((left, right) =>
@@ -296,15 +312,16 @@ export class SalesRepository {
           await manager.query(
             `INSERT INTO sales
             (id, tenant_id, branch_id, warehouse_id, cash_register_id,
-             created_by_user_id, receipt_number, currency, tax_rate, subtotal,
+             cash_register_shift_id, created_by_user_id, receipt_number, currency, tax_rate, subtotal,
              tax_total, total, status, idempotency_key, request_fingerprint)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
             [
               saleId,
               input.tenantId,
               input.quote.context.branch.id,
               input.quote.context.warehouse.id,
               input.quote.context.cashRegister.id,
+              input.cashRegisterShiftId,
               input.userId,
               receiptNumber,
               input.quote.currency,

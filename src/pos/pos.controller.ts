@@ -19,14 +19,57 @@ import { QuoteCartDto } from './dto/quote-cart.dto';
 import { PosAccessGuard } from './pos-access.guard';
 import { PosService } from './pos.service';
 import { AuditService } from '../audit/audit.service';
+import { OpenCashRegisterShiftDto } from './dto/open-cash-register-shift.dto';
+import { CashRegisterShiftService } from './cash-register-shift.service';
 
 @Controller('pos')
 @UseGuards(SessionGuard, PosAccessGuard)
 export class PosController {
   constructor(
     private readonly pos: PosService,
+    private readonly shifts: CashRegisterShiftService,
     private readonly audit: AuditService,
   ) {}
+
+  @Get('register-shifts/current')
+  currentShift(@Req() request: AuthenticatedRequest) {
+    const { principal } = request;
+    return this.shifts.current({
+      tenantId: principal.tenant.id,
+      branchId: principal.context.branch!.id,
+      cashRegisterId: principal.context.cashRegister!.id,
+      userId: principal.user.id,
+    });
+  }
+
+  @Post('register-shifts')
+  async openShift(
+    @Req() request: AuthenticatedRequest,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: OpenCashRegisterShiftDto,
+  ) {
+    const { principal } = request;
+    const result = await this.shifts.open(
+      {
+        tenantId: principal.tenant.id,
+        branchId: principal.context.branch!.id,
+        cashRegisterId: principal.context.cashRegister!.id,
+        userId: principal.user.id,
+      },
+      dto.openingAmount,
+      idempotencyKey,
+    );
+    await this.audit.record({
+      tenantId: principal.tenant.id,
+      actorUserId: principal.user.id,
+      action: 'CASH_REGISTER_SHIFT_OPENED',
+      entityType: 'CASH_REGISTER_SHIFT',
+      entityId: result.data.id,
+      correlationId: request.requestId!,
+      deduplicate: true,
+    });
+    return result;
+  }
 
   @Get('sales')
   listSales(
@@ -63,6 +106,7 @@ export class PosController {
       branchId: principal.context.branch!.id,
       warehouseId: principal.context.warehouse!.id,
       cashRegisterId: principal.context.cashRegister!.id,
+      userId: principal.user.id,
       dto,
     });
   }

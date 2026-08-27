@@ -20,12 +20,15 @@ import {
 import { PosRepository } from './pos.repository';
 import { SalesRepository } from './sales.repository';
 import { CashSaleResponse, PosCartQuoteResponse } from './pos.types';
+import { CashRegisterShiftService } from './cash-register-shift.service';
+import { CashRegisterShiftRequiredError } from './cash-register-shift.errors';
 
 @Injectable()
 export class PosService {
   constructor(
     private readonly pos: PosRepository,
     private readonly sales: SalesRepository,
+    private readonly shifts: CashRegisterShiftService,
     @Inject(posConfig.KEY)
     private readonly config: ConfigType<typeof posConfig>,
   ) {}
@@ -87,7 +90,14 @@ export class PosService {
         branchId: input.branchId,
         warehouseId: input.warehouseId,
         cashRegisterId: input.cashRegisterId,
+        userId: input.userId,
         dto: { lines: input.dto.lines },
+      });
+      const shift = await this.shifts.requireCurrent({
+        tenantId: input.tenantId,
+        branchId: input.branchId,
+        cashRegisterId: input.cashRegisterId,
+        userId: input.userId,
       });
       const receivedCents = this.toMoneyCents(input.dto.cashReceived);
       const totalCents = this.toMoneyCents(quote.data.totals.total);
@@ -102,6 +112,7 @@ export class PosService {
         userId: input.userId,
         idempotencyKey: input.idempotencyKey!,
         fingerprint,
+        cashRegisterShiftId: shift.id,
         quote: quote.data,
         amountReceived: this.fromMoneyCents(receivedCents),
         change: this.fromMoneyCents(receivedCents - totalCents),
@@ -123,6 +134,12 @@ export class PosService {
           productId: error.productId,
         });
       }
+      if (error instanceof CashRegisterShiftRequiredError) {
+        throw new ConflictException({
+          code: 'CASH_REGISTER_SHIFT_REQUIRED',
+          message: 'Abre un turno en la caja activa antes de registrar ventas.',
+        });
+      }
       throw error;
     }
   }
@@ -132,9 +149,16 @@ export class PosService {
     branchId: string;
     warehouseId: string;
     cashRegisterId: string;
+    userId: string;
     dto: QuoteCartDto;
   }): Promise<PosCartQuoteResponse> {
     try {
+      await this.shifts.requireCurrent({
+        tenantId: input.tenantId,
+        branchId: input.branchId,
+        cashRegisterId: input.cashRegisterId,
+        userId: input.userId,
+      });
       const context = await this.pos.getContext(input);
       const requested = new Map<string, bigint>();
       for (const line of input.dto.lines) {
