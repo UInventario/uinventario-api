@@ -20,6 +20,12 @@ export type UserInventoryMovementType = Exclude<
 export type InventoryStockState =
   'AVAILABLE' | 'RESERVED' | 'DAMAGED' | 'IN_TRANSIT';
 
+export const INVENTORY_STOCK_POLICY = {
+  negativeStock: 'DENY',
+} as const;
+
+export type InventoryStockPolicy = typeof INVENTORY_STOCK_POLICY;
+
 export interface InventoryStateQuantity {
   code: InventoryStockState;
   quantity: string;
@@ -61,7 +67,7 @@ export interface InventoryLocationsResponse {
 
 export interface InventoryBalanceResponse {
   data: InventoryBalanceData;
-  meta: { apiVersion: '1' };
+  meta: { apiVersion: '1'; policy: InventoryStockPolicy };
 }
 
 export interface InventoryMovementResponse {
@@ -123,6 +129,7 @@ export interface InventoryStockListResponse {
   data: InventoryStockItem[];
   meta: {
     apiVersion: '1';
+    policy: InventoryStockPolicy;
     scope: {
       branch: { id: string; name: string };
       warehouse: { id: string; name: string };
