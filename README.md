@@ -102,11 +102,19 @@ credenciales reales; los secretos pertenecen al gestor seguro del ambiente.
 ## Gates
 
 ```bash
-npm run lint
-npm test
-npm run test:e2e
+npm ci
+npm run format:check
+npm run lint:check
+npm run typecheck
+npm run test:ci
 npm run build
+npm run migration:run
+npm run test:e2e:ci
 ```
+
+El workflow `CI` ejecuta esta secuencia en cada PR y push a `develop` o `master`
+con MySQL 8.4 efímero. El job se llama `verify`; cualquier paso fallido detiene el
+job y, por contrato, el pipeline de despliegue debe ejecutar este gate antes de publicar.
 
 ## Ramas
 
