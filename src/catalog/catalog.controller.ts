@@ -19,6 +19,7 @@ import { ListProductsDto } from './dto/list-products.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { ProductAccessGuard } from './product-access.guard';
 import { AuditService } from '../audit/audit.service';
+import { ResolveProductCodeDto } from './dto/resolve-product-code.dto';
 
 @Controller('products')
 @UseGuards(SessionGuard, ProductAccessGuard)
@@ -39,6 +40,14 @@ export class CatalogController {
     @Query() query: ListProductsDto,
   ) {
     return this.catalog.listProducts(request.principal.tenant.id, query);
+  }
+
+  @Get('resolve-code')
+  resolveCode(
+    @Req() request: AuthenticatedRequest,
+    @Query() query: ResolveProductCodeDto,
+  ) {
+    return this.catalog.resolveCode(request.principal.tenant.id, query.code);
   }
 
   @Get(':id')

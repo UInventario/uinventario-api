@@ -3439,6 +3439,86 @@ describe('UInventario API (e2e)', () => {
         .send({ name: 'No visible' })
         .expect(404);
     });
+
+    it('resolves exact tenant product codes and rejects unknown or ambiguous values', async () => {
+      await registerAccount('product-code-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeOnboarding(registrationPayload.email, cookie);
+      const first = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto escaneable',
+          sku: 'SCAN-SKU-1',
+          barcode: '7500000000100',
+          cost: '1.00',
+          price: '2.00',
+        })
+        .expect(201);
+      const firstId = (first.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .get('/api/v1/products/resolve-code')
+        .set('Cookie', cookie)
+        .query({ code: ' scan-sku-1 ' })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({ data: { id: firstId } }),
+        );
+      await request(app.getHttpServer())
+        .get('/api/v1/products/resolve-code')
+        .set('Cookie', cookie)
+        .query({ code: '7500000000100' })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({ data: { id: firstId } }),
+        );
+      await request(app.getHttpServer())
+        .get('/api/v1/products/resolve-code')
+        .set('Cookie', cookie)
+        .query({ code: 'NO-EXISTE' })
+        .expect(404)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({ code: 'PRODUCT_CODE_NOT_FOUND' }),
+        );
+
+      await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'SKU ambiguo',
+          sku: '7500000000100',
+          barcode: '7500000000200',
+          cost: '1.00',
+          price: '2.00',
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .get('/api/v1/products/resolve-code')
+        .set('Cookie', cookie)
+        .query({ code: '7500000000100' })
+        .expect(409)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({ code: 'PRODUCT_CODE_AMBIGUOUS' }),
+        );
+
+      const secondary = {
+        organizationName: 'Escaneo aislado',
+        email: 'scan-other@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'product-code-secondary-registration')
+        .send(secondary)
+        .expect(201);
+      const secondaryCookie = await createPersistedSession(secondary.email);
+      await completeOnboarding(secondary.email, secondaryCookie);
+      await request(app.getHttpServer())
+        .get('/api/v1/products/resolve-code')
+        .set('Cookie', secondaryCookie)
+        .query({ code: 'SCAN-SKU-1' })
+        .expect(404);
+    });
   });
 
   describe('inventory stock', () => {

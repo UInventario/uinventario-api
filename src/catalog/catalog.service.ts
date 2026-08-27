@@ -7,6 +7,7 @@ import {
 import { CatalogRepository } from './catalog.repository';
 import {
   CatalogClassificationConflictError,
+  ProductCodeAmbiguousError,
   ProductIdentifierConflictError,
   ProductVersionConflictError,
 } from './catalog.errors';
@@ -113,6 +114,28 @@ export class CatalogService {
     const product = await this.catalog.getProduct(tenantId, id);
     if (!product) throw new NotFoundException();
     return { data: product, meta: { apiVersion: '1' } };
+  }
+
+  async resolveCode(tenantId: string, code: string): Promise<ProductResponse> {
+    try {
+      const product = await this.catalog.resolveCode(tenantId, code);
+      if (!product) {
+        throw new NotFoundException({
+          code: 'PRODUCT_CODE_NOT_FOUND',
+          message: 'No existe un producto con ese SKU, código de barras o QR.',
+        });
+      }
+      return { data: product, meta: { apiVersion: '1' } };
+    } catch (error) {
+      if (error instanceof ProductCodeAmbiguousError) {
+        throw new ConflictException({
+          code: 'PRODUCT_CODE_AMBIGUOUS',
+          message:
+            'El código coincide con más de un producto. Corrige los identificadores.',
+        });
+      }
+      throw error;
+    }
   }
 
   async retireProduct(
