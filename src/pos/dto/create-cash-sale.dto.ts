@@ -3,13 +3,19 @@ import {
   ArrayMaxSize,
   ArrayMinSize,
   IsArray,
+  IsOptional,
   IsString,
+  IsUUID,
   Matches,
   ValidateNested,
 } from 'class-validator';
 import { QuoteCartLineDto } from './quote-cart.dto';
 
 export class CreateCashSaleDto {
+  @IsOptional()
+  @IsUUID()
+  customerId?: string;
+
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(100)

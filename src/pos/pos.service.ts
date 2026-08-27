@@ -14,6 +14,7 @@ import { QuoteCartDto } from './dto/quote-cart.dto';
 import { VoidSaleDto } from './dto/void-sale.dto';
 import {
   PosContextNotFoundError,
+  PosCustomerNotAvailableError,
   PosIdempotencyConflictError,
   PosInsufficientStockError,
   PosProductNotAvailableError,
@@ -180,6 +181,7 @@ export class PosService {
         fingerprint,
         cashRegisterShiftId: shift.id,
         quote: quote.data,
+        customerId: input.dto.customerId ?? null,
         amountReceived: this.fromMoneyCents(receivedCents),
         change: this.fromMoneyCents(receivedCents - totalCents),
       });
@@ -198,6 +200,12 @@ export class PosService {
         throw new ConflictException({
           code: 'INSUFFICIENT_STOCK',
           productId: error.productId,
+        });
+      }
+      if (error instanceof PosCustomerNotAvailableError) {
+        throw new BadRequestException({
+          code: 'POS_CUSTOMER_NOT_AVAILABLE',
+          message: 'El cliente no existe o está inactivo.',
         });
       }
       if (error instanceof CashRegisterShiftRequiredError) {
@@ -355,6 +363,7 @@ export class PosService {
           quantity: this.fromQuantityUnits(quantity),
         })),
       cashReceived: this.fromMoneyCents(this.toMoneyCents(dto.cashReceived)),
+      customerId: dto.customerId ?? null,
     };
     return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
   }

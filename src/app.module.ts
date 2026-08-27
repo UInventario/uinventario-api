@@ -24,6 +24,7 @@ import { OrganizationModule } from './organization/organization.module';
 import { AccessControlModule } from './identity/access-control/access-control.module';
 import { SupplierModule } from './suppliers/supplier.module';
 import { ProcurementModule } from './procurement/procurement.module';
+import { CustomerModule } from './customers/customer.module';
 
 @Module({
   imports: [
@@ -65,6 +66,7 @@ import { ProcurementModule } from './procurement/procurement.module';
     CatalogModule,
     SupplierModule,
     ProcurementModule,
+    CustomerModule,
     InventoryModule,
     PosModule,
   ],

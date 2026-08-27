@@ -36,6 +36,7 @@ export interface CashSaleData {
   status: 'COMPLETED' | 'VOIDED';
   context: PosCartQuoteResponse['data']['context'];
   userId: string;
+  customer: { id: string; name: string; identifier: string | null } | null;
   currency: string;
   taxRate: string;
   lines: Array<{
@@ -72,6 +73,7 @@ export interface SaleSummaryData {
   receiptNumber: string;
   status: 'COMPLETED' | 'VOIDED';
   user: { id: string; email: string };
+  customer: { id: string; name: string; identifier: string | null } | null;
   cashRegister: { id: string; name: string; code: string };
   currency: string;
   total: string;
