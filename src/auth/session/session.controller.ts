@@ -32,7 +32,7 @@ export class SessionController {
 
   @Post()
   @HttpCode(200)
-  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
   async login(
     @Req() request: RequestContext,
     @Body() dto: CreateSessionDto,
