@@ -58,6 +58,10 @@ compuestas impiden relacionar recursos de tenants distintos.
 
 MySQL 8.4 local corre en Docker con volumen persistente. Dev y Prod reciben una `DATABASE_URL` independiente mediante secretos; el repositorio no contiene credenciales productivas.
 
+El mapeo verificado de nombres, IDs y números de proyecto para Dev/Prod está en
+[`docs/operations/gcp-projects.md`](docs/operations/gcp-projects.md). Todo comando
+de despliegue debe indicar el Project ID explícitamente.
+
 ## Aislamiento multiempresa
 
 El tenant y el contexto operativo siempre se derivan de la sesión; los IDs enviados
