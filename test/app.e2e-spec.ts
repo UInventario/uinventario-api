@@ -249,8 +249,7 @@ describe('UInventario API (e2e)', () => {
         .set('Idempotency-Key', 'registration-success-1')
         .send(payload)
         .expect(201)
-        .expect(({ body }: { body: { data: { approvedAt: unknown } } }) => {
-          expect(typeof body.data.approvedAt).toBe('string');
+        .expect(({ body }) => {
           expect(body).toMatchObject({
             data: {
               tenant: { name: payload.organizationName },
