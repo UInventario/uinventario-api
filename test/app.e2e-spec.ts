@@ -849,6 +849,17 @@ describe('UInventario API (e2e)', () => {
         .set('Cookie', primaryCookie)
         .send({ name: 'Café', sku: 'CAFE-1', cost: '10.00', price: '15.00' })
         .expect(403);
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${randomUUID()}`)
+        .set('Cookie', primaryCookie)
+        .send({
+          name: 'Café',
+          sku: 'CAFE-1',
+          cost: '10.00',
+          price: '15.00',
+          version: 1,
+        })
+        .expect(403);
       await completeOnboarding(registrationPayload.email, primaryCookie);
 
       const product = {
@@ -1003,6 +1014,65 @@ describe('UInventario API (e2e)', () => {
             },
           });
         });
+
+      const current = await request(app.getHttpServer())
+        .get(`/api/v1/products/${primaryProduct.id}`)
+        .set('Cookie', primaryCookie)
+        .expect(200);
+      const currentVersion = (current.body as { data: { version: number } })
+        .data.version;
+      const update = {
+        ...product,
+        name: 'Café molido premium 500 g',
+        sku: 'CAFE-PREMIUM-500',
+        barcode: '7501234567899',
+        cost: '90.00',
+        price: '129.90',
+        version: currentVersion,
+      };
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${primaryProduct.id}`)
+        .set('Cookie', primaryCookie)
+        .send(update)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              id: primaryProduct.id,
+              name: update.name,
+              sku: update.sku,
+              cost: update.cost,
+              price: update.price,
+              version: currentVersion + 1,
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${primaryProduct.id}`)
+        .set('Cookie', primaryCookie)
+        .send({ ...update, name: 'Edición obsoleta' })
+        .expect(409)
+        .expect(
+          ({ body }: { body: { code?: string; currentVersion?: number } }) => {
+            expect(body).toMatchObject({
+              code: 'PRODUCT_VERSION_CONFLICT',
+              currentVersion: currentVersion + 1,
+            });
+          },
+        );
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${primaryProduct.id}`)
+        .set('Cookie', primaryCookie)
+        .send({ ...update, sku: 'TE-1', version: currentVersion + 1 })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SKU_ALREADY_EXISTS');
+        });
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${secondaryProduct.id}`)
+        .set('Cookie', primaryCookie)
+        .send({ ...update, version: 1 })
+        .expect(404);
     });
   });
 
@@ -1592,6 +1662,36 @@ describe('UInventario API (e2e)', () => {
                   reference: saleBodies[0].data.receiptNumber,
                 },
               ],
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/products/${productId}`)
+        .set('Cookie', cookie)
+        .send({
+          name: 'Café POS actualizado',
+          sku: 'CAFE-POS-NUEVO',
+          barcode: '7501234500001',
+          cost: '90.00',
+          price: '140.00',
+          version: 1,
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${saleBodies[0].data.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  product: { name: 'Café POS', sku: 'CAFE-POS' },
+                  unitPrice: '119.90',
+                },
+              ],
+              totals: { total: '299.75' },
             },
           });
         });

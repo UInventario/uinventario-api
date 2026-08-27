@@ -3,3 +3,9 @@ export class ProductIdentifierConflictError extends Error {
     super('PRODUCT_IDENTIFIER_CONFLICT');
   }
 }
+
+export class ProductVersionConflictError extends Error {
+  constructor(readonly currentVersion: number) {
+    super('PRODUCT_VERSION_CONFLICT');
+  }
+}

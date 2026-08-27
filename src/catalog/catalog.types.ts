@@ -8,6 +8,7 @@ export interface ProductData {
   cost: string;
   price: string;
   active: boolean;
+  version: number;
 }
 
 export interface ProductResponse {

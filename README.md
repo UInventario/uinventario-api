@@ -37,6 +37,7 @@ el usuario, sus roles y el tenant de esa sesión.
 - `GET /api/v1/products/options`: recupera categorías y marcas disponibles para el tenant autenticado.
 - `GET /api/v1/products`: lista y busca productos con paginación tenant-scoped.
 - `GET /api/v1/products/:id`: consulta el detalle sólo dentro del tenant autenticado.
+- `PATCH /api/v1/products/:id`: actualiza datos comerciales con versión optimista y rechaza ediciones obsoletas.
 
 - `GET /api/v1/inventory/locations`: lista ubicaciones de la bodega activa.
 - `GET /api/v1/inventory/stock`: lista existencias reales por sucursal, bodega y producto.

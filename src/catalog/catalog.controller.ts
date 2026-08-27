@@ -4,6 +4,7 @@ import {
   Get,
   Param,
   ParseUUIDPipe,
+  Patch,
   Post,
   Query,
   Req,
@@ -14,6 +15,7 @@ import type { AuthenticatedRequest } from '../auth/session/session.types';
 import { CatalogService } from './catalog.service';
 import { CreateProductDto } from './dto/create-product.dto';
 import { ListProductsDto } from './dto/list-products.dto';
+import { UpdateProductDto } from './dto/update-product.dto';
 import { ProductAccessGuard } from './product-access.guard';
 
 @Controller('products')
@@ -48,5 +50,14 @@ export class CatalogController {
     @Body() dto: CreateProductDto,
   ) {
     return this.catalog.createProduct(request.principal.tenant.id, dto);
+  }
+
+  @Patch(':id')
+  updateProduct(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Body() dto: UpdateProductDto,
+  ) {
+    return this.catalog.updateProduct(request.principal.tenant.id, id, dto);
   }
 }
