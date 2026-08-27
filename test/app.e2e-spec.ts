@@ -970,8 +970,11 @@ describe('UInventario API (e2e)', () => {
         .expect(201);
       const productId = (productResponse.body as { data: { id: string } }).data
         .id;
-      const [location] = await dataSource.query<Array<{ id: string }>>(
-        `SELECT l.id FROM locations l
+      const [location] = await dataSource.query<
+        Array<{ id: string; warehouse_id: string; branch_id: string }>
+      >(
+        `SELECT l.id, l.warehouse_id, w.branch_id FROM locations l
+         INNER JOIN warehouses w ON w.id = l.warehouse_id AND w.tenant_id = l.tenant_id
          INNER JOIN users u ON u.tenant_id = l.tenant_id
          WHERE u.normalized_email = ? LIMIT 1`,
         [registrationPayload.email],
@@ -1095,6 +1098,45 @@ describe('UInventario API (e2e)', () => {
             },
           });
         });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .query({
+          branchId: location.branch_id,
+          warehouseId: location.warehouse_id,
+          productId,
+          q: ' cafe-stock ',
+          page: 1,
+          pageSize: 1,
+        })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              {
+                product: { id: productId, sku: 'CAFE-STOCK', active: true },
+                availableQuantity: '14.500',
+                totalQuantity: '14.500',
+                states: [{ code: 'AVAILABLE', quantity: '14.500' }],
+              },
+            ],
+            meta: {
+              scope: {
+                branch: { id: location.branch_id },
+                warehouse: { id: location.warehouse_id },
+              },
+              pagination: { page: 1, pageSize: 1, total: 1, totalPages: 1 },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .query({ q: 'sin-resultados' })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toEqual([]);
+        });
       const [counts] = await dataSource.query<
         Array<{ movements: number | string }>
       >('SELECT COUNT(*) AS movements FROM inventory_movements');
@@ -1130,8 +1172,11 @@ describe('UInventario API (e2e)', () => {
         .expect(201);
       const secondaryCookie = await createPersistedSession(secondary.email);
       await completeInventoryOnboarding(secondary.email, secondaryCookie);
-      const [foreignLocation] = await dataSource.query<Array<{ id: string }>>(
-        `SELECT l.id FROM locations l
+      const [foreignLocation] = await dataSource.query<
+        Array<{ id: string; warehouse_id: string; branch_id: string }>
+      >(
+        `SELECT l.id, l.warehouse_id, w.branch_id FROM locations l
+         INNER JOIN warehouses w ON w.id = l.warehouse_id AND w.tenant_id = l.tenant_id
          INNER JOIN users u ON u.tenant_id = l.tenant_id
          WHERE u.normalized_email = ? LIMIT 1`,
         [secondary.email],
@@ -1148,6 +1193,14 @@ describe('UInventario API (e2e)', () => {
           quantity: '1',
           reason: 'No autorizado',
         })
+        .expect(404);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .query({
+          branchId: foreignLocation.branch_id,
+          warehouseId: foreignLocation.warehouse_id,
+        })
+        .set('Cookie', primaryCookie)
         .expect(404);
     });
   });

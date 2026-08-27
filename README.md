@@ -36,6 +36,7 @@ el usuario, sus roles y el tenant de esa sesión.
 - `GET /api/v1/products/:id`: consulta el detalle sólo dentro del tenant autenticado.
 
 - `GET /api/v1/inventory/locations`: lista ubicaciones de la bodega activa.
+- `GET /api/v1/inventory/stock`: lista existencias reales por sucursal, bodega y producto.
 - `GET /api/v1/inventory/products/:productId/balance?locationId=...`: consulta el saldo persistido.
 - `POST /api/v1/inventory/movements`: registra stock inicial, entrada o ajuste con `Idempotency-Key`.
 
