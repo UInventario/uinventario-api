@@ -14,6 +14,7 @@ import { SessionGuard } from '../auth/session/session.guard';
 import type { AuthenticatedRequest } from '../auth/session/session.types';
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
 import { GetInventoryBalanceDto } from './dto/get-inventory-balance.dto';
+import { ListInventoryStockDto } from './dto/list-inventory-stock.dto';
 import { InventoryAccessGuard } from './inventory-access.guard';
 import { InventoryService } from './inventory.service';
 
@@ -21,6 +22,19 @@ import { InventoryService } from './inventory.service';
 @UseGuards(SessionGuard, InventoryAccessGuard)
 export class InventoryController {
   constructor(private readonly inventory: InventoryService) {}
+
+  @Get('stock')
+  listStock(
+    @Req() request: AuthenticatedRequest,
+    @Query() query: ListInventoryStockDto,
+  ) {
+    return this.inventory.listStock(
+      request.principal.tenant.id,
+      query.branchId ?? request.principal.context.branch!.id,
+      query.warehouseId ?? request.principal.context.warehouse!.id,
+      query,
+    );
+  }
 
   @Get('locations')
   listLocations(@Req() request: AuthenticatedRequest) {

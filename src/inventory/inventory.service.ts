@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
+import { ListInventoryStockDto } from './dto/list-inventory-stock.dto';
 import {
   IdempotencyConflictError,
   InitialStockAlreadyExistsError,
@@ -16,6 +17,7 @@ import {
   InventoryBalanceResponse,
   InventoryLocationsResponse,
   InventoryMovementResponse,
+  InventoryStockListResponse,
 } from './inventory.types';
 
 @Injectable()
@@ -30,6 +32,39 @@ export class InventoryService {
       data: await this.inventory.listLocations(tenantId, warehouseId),
       meta: { apiVersion: '1' },
     };
+  }
+
+  async listStock(
+    tenantId: string,
+    branchId: string,
+    warehouseId: string,
+    query: ListInventoryStockDto,
+  ): Promise<InventoryStockListResponse> {
+    try {
+      const result = await this.inventory.listStock(
+        tenantId,
+        branchId,
+        warehouseId,
+        query,
+      );
+      return {
+        data: result.items,
+        meta: {
+          apiVersion: '1',
+          scope: result.scope,
+          pagination: {
+            page: query.page,
+            pageSize: query.pageSize,
+            total: result.total,
+            totalPages: Math.ceil(result.total / query.pageSize),
+          },
+        },
+      };
+    } catch (error) {
+      if (error instanceof InventoryTargetNotFoundError)
+        throw new NotFoundException();
+      throw error;
+    }
   }
 
   async getBalance(

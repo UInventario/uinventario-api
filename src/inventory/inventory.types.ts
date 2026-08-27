@@ -35,3 +35,27 @@ export interface InventoryMovementResponse {
   data: InventoryMovementData;
   meta: { apiVersion: '1'; idempotentReplay: boolean };
 }
+
+export interface InventoryStockItem {
+  product: { id: string; name: string; sku: string; active: boolean };
+  availableQuantity: string;
+  totalQuantity: string;
+  states: Array<{ code: 'AVAILABLE'; quantity: string }>;
+}
+
+export interface InventoryStockListResponse {
+  data: InventoryStockItem[];
+  meta: {
+    apiVersion: '1';
+    scope: {
+      branch: { id: string; name: string };
+      warehouse: { id: string; name: string };
+    };
+    pagination: {
+      page: number;
+      pageSize: number;
+      total: number;
+      totalPages: number;
+    };
+  };
+}
