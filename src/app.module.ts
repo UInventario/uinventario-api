@@ -20,6 +20,7 @@ import { OnboardingModule } from './onboarding/onboarding.module';
 import { PosModule } from './pos/pos.module';
 import { PasswordResetModule } from './auth/password-reset/password-reset.module';
 import { AuditModule } from './audit/audit.module';
+import { OrganizationModule } from './organization/organization.module';
 
 @Module({
   imports: [
@@ -56,6 +57,7 @@ import { AuditModule } from './audit/audit.module';
     PasswordResetModule,
     AuditModule,
     OnboardingModule,
+    OrganizationModule,
     CatalogModule,
     InventoryModule,
     PosModule,

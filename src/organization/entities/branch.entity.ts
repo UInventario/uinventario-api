@@ -6,6 +6,7 @@ export class BranchEntity {
   @Column({ name: 'tenant_id', type: 'char', length: 36 }) tenantId!: string;
   @Column({ type: 'varchar', length: 120 }) name!: string;
   @Column({ type: 'varchar', length: 64 }) timezone!: string;
+  @Column({ type: 'boolean', default: true }) active!: boolean;
   @Column({
     name: 'onboarding_key',
     type: 'varchar',

@@ -56,8 +56,8 @@ export class SessionRepository {
           GROUP_CONCAT(r.code ORDER BY r.code) AS roles
         FROM users u
         INNER JOIN tenants t ON t.id = u.tenant_id
-        LEFT JOIN branches b ON b.tenant_id = t.id AND b.onboarding_key = 'INITIAL'
-        LEFT JOIN warehouses w ON w.tenant_id = t.id AND w.branch_id = b.id AND w.onboarding_key = 'INITIAL'
+        LEFT JOIN branches b ON b.tenant_id = t.id AND b.onboarding_key = 'INITIAL' AND b.active = TRUE
+        LEFT JOIN warehouses w ON w.tenant_id = t.id AND w.branch_id = b.id AND w.onboarding_key = 'INITIAL' AND w.active = TRUE
         LEFT JOIN cash_registers cr ON cr.tenant_id = t.id AND cr.branch_id = b.id AND cr.onboarding_key = 'INITIAL'
         LEFT JOIN user_roles ur ON ur.user_id = u.id
         LEFT JOIN roles r ON r.id = ur.role_id
@@ -139,12 +139,12 @@ export class SessionRepository {
           s.active_branch_id,
           (SELECT initial_branch.id FROM branches initial_branch
            WHERE initial_branch.tenant_id = s.tenant_id AND initial_branch.onboarding_key = 'INITIAL' LIMIT 1)
-        ) AND b.tenant_id = s.tenant_id
+        ) AND b.tenant_id = s.tenant_id AND b.active = TRUE
         LEFT JOIN warehouses w ON w.id = COALESCE(
           s.active_warehouse_id,
           (SELECT initial_warehouse.id FROM warehouses initial_warehouse
            WHERE initial_warehouse.tenant_id = s.tenant_id AND initial_warehouse.onboarding_key = 'INITIAL' LIMIT 1)
-        ) AND w.tenant_id = s.tenant_id AND w.branch_id = b.id
+        ) AND w.tenant_id = s.tenant_id AND w.branch_id = b.id AND w.active = TRUE
         LEFT JOIN cash_registers cr ON cr.id = COALESCE(
           s.active_cash_register_id,
           (SELECT initial_register.id FROM cash_registers initial_register
@@ -206,6 +206,74 @@ export class SessionRepository {
       .where('id = :sessionId', { sessionId })
       .andWhere('revoked_at IS NULL')
       .execute();
+  }
+
+  async changeContext(
+    sessionId: string,
+    tenantId: string,
+    branchId: string,
+    warehouseId: string,
+  ): Promise<SessionIdentity['context'] | null> {
+    return this.dataSource.transaction('READ COMMITTED', async (manager) => {
+      const [row] = await manager.query<
+        Array<{
+          branch_id: string;
+          branch_name: string;
+          warehouse_id: string;
+          warehouse_name: string;
+          cash_register_id: string | null;
+          cash_register_name: string | null;
+          cash_register_code: string | null;
+        }>
+      >(
+        `SELECT b.id AS branch_id, b.name AS branch_name,
+                w.id AS warehouse_id, w.name AS warehouse_name,
+                cr.id AS cash_register_id, cr.name AS cash_register_name,
+                cr.code AS cash_register_code
+         FROM branches b
+         INNER JOIN warehouses w ON w.id = ? AND w.tenant_id = b.tenant_id
+           AND w.branch_id = b.id AND w.active = TRUE
+         LEFT JOIN cash_registers cr ON cr.id = (
+           SELECT candidate.id FROM cash_registers candidate
+           WHERE candidate.tenant_id = b.tenant_id AND candidate.branch_id = b.id
+           ORDER BY (candidate.onboarding_key = 'INITIAL') DESC, candidate.created_at, candidate.id
+           LIMIT 1
+         )
+         WHERE b.id = ? AND b.tenant_id = ? AND b.active = TRUE
+         LIMIT 1 FOR UPDATE`,
+        [warehouseId, branchId, tenantId],
+      );
+      if (!row) return null;
+      const result = await manager.query<{ affectedRows?: number }>(
+        `UPDATE sessions
+         SET active_branch_id = ?, active_warehouse_id = ?, active_cash_register_id = ?
+         WHERE id = ? AND tenant_id = ? AND revoked_at IS NULL
+           AND expires_at > ?`,
+        [
+          row.branch_id,
+          row.warehouse_id,
+          row.cash_register_id,
+          sessionId,
+          tenantId,
+          new Date(),
+        ],
+      );
+      if (Number(result.affectedRows ?? 0) !== 1) return null;
+      return {
+        branch: { id: row.branch_id, name: row.branch_name },
+        warehouse: { id: row.warehouse_id, name: row.warehouse_name },
+        cashRegister:
+          row.cash_register_id &&
+          row.cash_register_name &&
+          row.cash_register_code
+            ? {
+                id: row.cash_register_id,
+                name: row.cash_register_name,
+                code: row.cash_register_code,
+              }
+            : null,
+      };
+    });
   }
 
   private parseRoles(roles: string | null): string[] {
