@@ -35,6 +35,10 @@ el usuario, sus roles y el tenant de esa sesión.
 - `GET /api/v1/products`: lista y busca productos con paginación tenant-scoped.
 - `GET /api/v1/products/:id`: consulta el detalle sólo dentro del tenant autenticado.
 
+- `GET /api/v1/inventory/locations`: lista ubicaciones de la bodega activa.
+- `GET /api/v1/inventory/products/:productId/balance?locationId=...`: consulta el saldo persistido.
+- `POST /api/v1/inventory/movements`: registra stock inicial, entrada o ajuste con `Idempotency-Key`.
+
 Cada login crea una sesión independiente por dispositivo. Las pestañas de un mismo
 navegador comparten la cookie; una rotación invalida el token anterior y logout no
 revoca las sesiones de otros dispositivos.
