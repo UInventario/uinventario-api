@@ -5,10 +5,19 @@ import { PosController } from './pos.controller';
 import { PosRepository } from './pos.repository';
 import { PosService } from './pos.service';
 import { SalesRepository } from './sales.repository';
+import { CashRegisterShiftRepository } from './cash-register-shift.repository';
+import { CashRegisterShiftService } from './cash-register-shift.service';
 
 @Module({
   imports: [SessionModule],
   controllers: [PosController],
-  providers: [PosRepository, SalesRepository, PosService, PosAccessGuard],
+  providers: [
+    PosRepository,
+    SalesRepository,
+    CashRegisterShiftRepository,
+    CashRegisterShiftService,
+    PosService,
+    PosAccessGuard,
+  ],
 })
 export class PosModule {}
