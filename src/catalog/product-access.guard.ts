@@ -14,7 +14,8 @@ export class ProductAccessGuard implements CanActivate {
     const canReadForOperations =
       request.method === 'GET' &&
       (permissions.includes('INVENTORY_VIEW') ||
-        permissions.includes('SUPPLIERS_MANAGE'));
+        permissions.includes('SUPPLIERS_MANAGE') ||
+        permissions.includes('SALES_MANAGE'));
     if (
       request.principal.nextStep !== 'APPLICATION' ||
       (!permissions.includes('PRODUCTS_MANAGE') && !canReadForOperations)

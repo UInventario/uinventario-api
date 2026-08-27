@@ -7,6 +7,7 @@ import {
   Max,
   MaxLength,
   Min,
+  IsUUID,
 } from 'class-validator';
 
 export enum ProductStatusFilter {
@@ -34,6 +35,14 @@ export class ListProductsDto {
   @IsEnum(ProductStatusFilter)
   @IsOptional()
   status = ProductStatusFilter.ACTIVE;
+
+  @IsOptional()
+  @IsUUID()
+  categoryId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  brandId?: string;
 
   @Type(() => Number)
   @IsInt()

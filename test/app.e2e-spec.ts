@@ -3282,6 +3282,163 @@ describe('UInventario API (e2e)', () => {
       );
       expect(Number(history.total)).toBe(1);
     });
+
+    it('manages tenant categories and brands without orphaning product references', async () => {
+      await registerAccount('classification-primary-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeOnboarding(registrationPayload.email, cookie);
+
+      const createClassification = async (
+        kind: 'categories' | 'brands',
+        name: string,
+      ) => {
+        const response = await request(app.getHttpServer())
+          .post(`/api/v1/catalog/${kind}`)
+          .set('Cookie', cookie)
+          .send({ name })
+          .expect(201);
+        return (response.body as { data: { id: string } }).data.id;
+      };
+      const beveragesId = await createClassification('categories', 'Bebidas');
+      const pantryId = await createClassification('categories', 'Despensa');
+      const brandId = await createClassification('brands', 'Casa Norte');
+      await request(app.getHttpServer())
+        .post('/api/v1/catalog/categories')
+        .set('Cookie', cookie)
+        .send({ name: ' bebidas ' })
+        .expect(409);
+
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Agua mineral',
+          sku: 'AGUA-1',
+          categoryName: 'Bebidas',
+          brandName: 'Casa Norte',
+          cost: '5.00',
+          price: '9.00',
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+
+      const classificationList = await request(app.getHttpServer())
+        .get('/api/v1/catalog/categories')
+        .set('Cookie', cookie)
+        .expect(200);
+      const classificationData = classificationList.body as {
+        data: Array<{
+          id: string;
+          name: string;
+          active: boolean;
+          productCount: number;
+        }>;
+      };
+      expect(
+        classificationData.data.find(({ id }) => id === beveragesId),
+      ).toEqual({
+        id: beveragesId,
+        name: 'Bebidas',
+        active: true,
+        productCount: 1,
+      });
+      expect(classificationData.data.find(({ id }) => id === pantryId)).toEqual(
+        {
+          id: pantryId,
+          name: 'Despensa',
+          active: true,
+          productCount: 0,
+        },
+      );
+      for (const filter of [
+        { categoryId: beveragesId },
+        { brandId },
+        { categoryId: beveragesId, brandId },
+      ]) {
+        await request(app.getHttpServer())
+          .get('/api/v1/products')
+          .set('Cookie', cookie)
+          .query(filter)
+          .expect(200)
+          .expect(({ body }: { body: unknown }) =>
+            expect(body).toMatchObject({ data: [{ id: productId }] }),
+          );
+      }
+
+      await request(app.getHttpServer())
+        .patch(`/api/v1/catalog/categories/${pantryId}`)
+        .set('Cookie', cookie)
+        .send({ name: 'Despensa seca' })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({ data: { name: 'Despensa seca' } }),
+        );
+      await request(app.getHttpServer())
+        .delete(`/api/v1/catalog/categories/${beveragesId}`)
+        .set('Cookie', cookie)
+        .query({ replacementId: pantryId })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: {
+              classification: { id: beveragesId, active: false },
+              reassignedProducts: 1,
+            },
+          }),
+        );
+      await request(app.getHttpServer())
+        .delete(`/api/v1/catalog/brands/${brandId}`)
+        .set('Cookie', cookie)
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/products/${productId}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: {
+              category: { id: pantryId, name: 'Despensa seca' },
+              brand: null,
+            },
+          }),
+        );
+      await request(app.getHttpServer())
+        .get('/api/v1/products/options')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: {
+              categories: [{ id: pantryId }],
+              brands: [],
+            },
+          }),
+        );
+
+      const secondary = {
+        organizationName: 'Clasificaciones aisladas',
+        email: 'classification-other@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'classification-secondary-registration')
+        .send(secondary)
+        .expect(201);
+      const secondaryCookie = await createPersistedSession(secondary.email);
+      await completeOnboarding(secondary.email, secondaryCookie);
+      await request(app.getHttpServer())
+        .post('/api/v1/catalog/categories')
+        .set('Cookie', secondaryCookie)
+        .send({ name: 'Bebidas' })
+        .expect(201);
+      await request(app.getHttpServer())
+        .patch(`/api/v1/catalog/categories/${pantryId}`)
+        .set('Cookie', secondaryCookie)
+        .send({ name: 'No visible' })
+        .expect(404);
+    });
   });
 
   describe('inventory stock', () => {
