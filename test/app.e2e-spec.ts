@@ -46,6 +46,8 @@ describe('UInventario API (e2e)', () => {
       'sales',
       'cash_register_movements',
       'cash_register_shifts',
+      'product_reservation_lines',
+      'product_reservations',
       'customers',
       'inventory_movements',
       'inventory_import_rows',
@@ -5509,6 +5511,204 @@ describe('UInventario API (e2e)', () => {
         .expect(({ body }: { body: { data: unknown[] } }) => {
           expect(body.data).toEqual([]);
         });
+    });
+
+    it('creates customer reservations atomically, idempotently and without over-reserving', async () => {
+      const { cookie, productId, locationId } = await preparePos(false);
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({ name: 'Cliente reserva', dataProcessingConsent: false })
+        .expect(201);
+      const customerId = (customerResponse.body as { data: { id: string } })
+        .data.id;
+      const input = {
+        customerId,
+        locationId,
+        expiresInHours: 24,
+        lines: [{ productId, quantity: '1' }],
+      };
+      const created = await request(app.getHttpServer())
+        .post('/api/v1/reservations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reservation-create-one')
+        .send(input)
+        .expect(201);
+      const createdData = (
+        created.body as {
+          data: { id: string; reservationNumber: string; expiresAt: string };
+        }
+      ).data;
+      expect(createdData.reservationNumber).toMatch(/^R-[A-F0-9]{12}$/);
+      expect(created.body).toMatchObject({
+        data: {
+          status: 'ACTIVE',
+          customer: { id: customerId, name: 'Cliente reserva' },
+          context: {
+            branch: { name: 'Sucursal POS' },
+            warehouse: { name: 'Bodega POS' },
+            location: { id: locationId, name: 'General POS' },
+          },
+          responsible: { email: registrationPayload.email },
+          lines: [
+            { product: { id: productId, sku: 'CAFE-POS' }, quantity: '1.000' },
+          ],
+        },
+        meta: { idempotentReplay: false },
+      });
+      const expiresAt = new Date(createdData.expiresAt).getTime();
+      expect(expiresAt - Date.now()).toBeGreaterThan(23 * 60 * 60_000);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/reservations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reservation-create-one')
+        .send(input)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { id: createdData.id },
+            meta: { idempotentReplay: true },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/reservations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reservation-create-one')
+        .send({ ...input, expiresInHours: 48 })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('IDEMPOTENCY_KEY_REUSED');
+        });
+
+      const concurrent = await Promise.all(
+        ['reservation-concurrent-a', 'reservation-concurrent-b'].map((key) =>
+          request(app.getHttpServer())
+            .post('/api/v1/reservations')
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', key)
+            .send({ ...input, lines: [{ productId, quantity: '3' }] }),
+        ),
+      );
+      expect(concurrent.map(({ status }) => status).sort()).toEqual([201, 409]);
+      expect(
+        concurrent.find(({ status }) => status === 409)?.body,
+      ).toMatchObject({
+        code: 'PRODUCT_RESERVATION_INSUFFICIENT_STOCK',
+        productId,
+      });
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/balance`)
+        .query({ locationId })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              totalQuantity: '5.000',
+              availableQuantity: '1.000',
+              states: [
+                { code: 'AVAILABLE', quantity: '1.000' },
+                { code: 'RESERVED', quantity: '4.000' },
+                { code: 'DAMAGED', quantity: '0.000' },
+                { code: 'IN_TRANSIT', quantity: '0.000' },
+              ],
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/reservations')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toHaveLength(2);
+        });
+      const [[trace], [audit]] = await Promise.all([
+        dataSource.query<Array<{ total: number | string }>>(
+          `SELECT COUNT(*) AS total FROM inventory_movements
+           WHERE reservation_id = ?`,
+          [createdData.id],
+        ),
+        dataSource.query<Array<{ total: number | string }>>(
+          `SELECT COUNT(*) AS total FROM audit_events
+           WHERE entity_type = 'PRODUCT_RESERVATION' AND entity_id = ?`,
+          [createdData.id],
+        ),
+      ]);
+      expect(Number(trace.total)).toBe(1);
+      expect(Number(audit.total)).toBe(1);
+
+      const other = {
+        organizationName: 'Otra empresa reservas',
+        email: 'other-reservations@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'other-reservations-registration')
+        .send(other)
+        .expect(201);
+      const otherCookie = await createPersistedSession(other.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Otra empresa reservas Legal',
+          tradeName: 'Otra empresa reservas',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Sucursal reservas',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega reservas',
+          locationName: 'General reservas',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Caja reservas' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/reservations')
+        .set('Cookie', otherCookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toEqual([]);
+        });
+
+      await request(app.getHttpServer())
+        .delete(`/api/v1/customers/${customerId}`)
+        .set('Cookie', cookie)
+        .expect(200);
+      await request(app.getHttpServer())
+        .post('/api/v1/reservations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reservation-inactive-customer')
+        .send({ ...input, lines: [{ productId, quantity: '0.500' }] })
+        .expect(404);
+
+      const [admin] = await dataSource.query<
+        Array<{ role_id: string; tenant_id: string }>
+      >(
+        `SELECT ur.role_id, u.tenant_id FROM users u
+         INNER JOIN user_roles ur ON ur.user_id = u.id AND ur.tenant_id = u.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'SALES_MANAGE'`,
+        [admin.role_id, admin.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/reservations')
+        .set('Cookie', cookie)
+        .expect(403);
     });
 
     it('opens one auditable register shift idempotently and requires it for POS operations', async () => {
