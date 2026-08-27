@@ -25,9 +25,13 @@ import {
 export class OrganizationService {
   constructor(private readonly organization: OrganizationRepository) {}
 
-  async list(tenantId: string): Promise<OrganizationListResponse> {
+  async list(
+    tenantId: string,
+    userId: string,
+    administrator: boolean,
+  ): Promise<OrganizationListResponse> {
     return {
-      data: await this.organization.list(tenantId),
+      data: await this.organization.list(tenantId, userId, administrator),
       meta: { apiVersion: '1' },
     };
   }

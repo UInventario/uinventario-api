@@ -1,6 +1,6 @@
 import { Module } from '@nestjs/common';
 import { SessionModule } from '../auth/session/session.module';
-import { InventoryAccessGuard } from './inventory-access.guard';
+import { PermissionGuard } from '../auth/authorization/permission.guard';
 import { InventoryController } from './inventory.controller';
 import { InventoryRepository } from './inventory.repository';
 import { InventoryService } from './inventory.service';
@@ -16,7 +16,7 @@ import { InventoryTransferService } from './inventory-transfer.service';
     InventoryService,
     InventoryTransferRepository,
     InventoryTransferService,
-    InventoryAccessGuard,
+    PermissionGuard,
   ],
 })
 export class InventoryModule {}

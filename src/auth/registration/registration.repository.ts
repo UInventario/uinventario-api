@@ -77,7 +77,17 @@ export class RegistrationRepository {
     await manager.insert(UserRoleEntity, {
       userId: user.id,
       roleId: role.id,
+      tenantId: tenant.id,
     });
+    await manager.query(
+      `INSERT INTO role_permissions (role_id, tenant_id, permission) VALUES
+        (?, ?, 'TENANT_MANAGE'), (?, ?, 'PRODUCTS_MANAGE'),
+        (?, ?, 'SALES_MANAGE'), (?, ?, 'ACCESS_MANAGE'),
+        (?, ?, 'INVENTORY_VIEW'), (?, ?, 'INVENTORY_ADJUST'),
+        (?, ?, 'INVENTORY_TRANSFER'), (?, ?, 'INVENTORY_COUNT'),
+        (?, ?, 'INVENTORY_APPROVE')`,
+      Array.from({ length: 9 }, () => [role.id, tenant.id]).flat(),
+    );
     await manager.update(
       RegistrationRequestEntity,
       { idempotencyKey: input.idempotencyKey },

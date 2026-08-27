@@ -10,9 +10,12 @@ import type { AuthenticatedRequest } from '../auth/session/session.types';
 export class ProductAccessGuard implements CanActivate {
   canActivate(context: ExecutionContext): boolean {
     const request = context.switchToHttp().getRequest<AuthenticatedRequest>();
+    const permissions = request.principal.user.permissions;
+    const canReadForInventory =
+      request.method === 'GET' && permissions.includes('INVENTORY_VIEW');
     if (
       request.principal.nextStep !== 'APPLICATION' ||
-      !request.principal.user.permissions.includes('PRODUCTS_MANAGE')
+      (!permissions.includes('PRODUCTS_MANAGE') && !canReadForInventory)
     ) {
       throw new ForbiddenException({
         code: 'PRODUCT_ACCESS_DENIED',

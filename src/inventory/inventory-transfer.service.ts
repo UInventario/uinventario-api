@@ -27,19 +27,30 @@ import {
 export class InventoryTransferService {
   constructor(private readonly transfers: InventoryTransferRepository) {}
 
-  async list(tenantId: string): Promise<InventoryTransferListResponse> {
+  async list(
+    tenantId: string,
+    branchId: string,
+  ): Promise<InventoryTransferListResponse> {
     return {
-      data: await this.transfers.list(tenantId),
+      data: await this.transfers.list(tenantId, branchId),
       meta: { apiVersion: '1' },
     };
   }
 
   async get(
     tenantId: string,
+    branchId: string,
     transferId: string,
   ): Promise<InventoryTransferResponse> {
     const transfer = await this.transfers.findById(tenantId, transferId);
-    if (!transfer) throw new NotFoundException();
+    if (
+      !transfer ||
+      ![
+        transfer.originWarehouse.branch.id,
+        transfer.destinationWarehouse.branch.id,
+      ].includes(branchId)
+    )
+      throw new NotFoundException();
     return { data: transfer, meta: { apiVersion: '1' } };
   }
 
@@ -66,6 +77,7 @@ export class InventoryTransferService {
   async dispatch(input: {
     tenantId: string;
     transferId: string;
+    originWarehouseId: string;
     userId: string;
     idempotencyKey: string | undefined;
   }): Promise<InventoryTransferResponse> {
@@ -85,10 +97,16 @@ export class InventoryTransferService {
   async cancel(
     tenantId: string,
     transferId: string,
+    originWarehouseId: string,
     userId: string,
   ): Promise<InventoryTransferResponse> {
     return this.mapErrors(async () => ({
-      data: await this.transfers.cancel(tenantId, transferId, userId),
+      data: await this.transfers.cancel(
+        tenantId,
+        transferId,
+        originWarehouseId,
+        userId,
+      ),
       meta: { apiVersion: '1' },
     }));
   }
