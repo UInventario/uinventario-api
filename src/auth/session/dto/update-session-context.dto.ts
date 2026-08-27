@@ -1,0 +1,9 @@
+import { IsUUID } from 'class-validator';
+
+export class UpdateSessionContextDto {
+  @IsUUID()
+  branchId!: string;
+
+  @IsUUID()
+  warehouseId!: string;
+}

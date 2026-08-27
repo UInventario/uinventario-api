@@ -54,7 +54,7 @@ export class InventoryRepository {
   ): Promise<InventoryLocationData[]> {
     return this.dataSource.query<InventoryLocationData[]>(
       `SELECT id, name, code FROM locations
-       WHERE tenant_id = ? AND warehouse_id = ? ORDER BY name, id`,
+       WHERE tenant_id = ? AND warehouse_id = ? AND active = TRUE ORDER BY name, id`,
       [tenantId, warehouseId],
     );
   }
@@ -70,10 +70,10 @@ export class InventoryRepository {
   }> {
     const [branch] = await this.dataSource.query<
       Array<{ id: string; name: string }>
-    >('SELECT id, name FROM branches WHERE id = ? AND tenant_id = ? LIMIT 1', [
-      branchId,
-      tenantId,
-    ]);
+    >(
+      'SELECT id, name FROM branches WHERE id = ? AND tenant_id = ? AND active = TRUE LIMIT 1',
+      [branchId, tenantId],
+    );
     if (!branch) throw new InventoryTargetNotFoundError();
 
     const filters = ['im.tenant_id = ?', 'b.id = ?'];
@@ -216,7 +216,8 @@ export class InventoryRepository {
               w.id AS warehouse_id, w.name AS warehouse_name
        FROM branches b
        INNER JOIN warehouses w ON w.branch_id = b.id AND w.tenant_id = b.tenant_id
-       WHERE b.id = ? AND w.id = ? AND b.tenant_id = ? LIMIT 1`,
+       WHERE b.id = ? AND w.id = ? AND b.tenant_id = ?
+         AND b.active = TRUE AND w.active = TRUE LIMIT 1`,
       [branchId, warehouseId, tenantId],
     );
     const scope = scopeRows[0];
@@ -337,7 +338,8 @@ export class InventoryRepository {
               ib.quantity, ib.available_quantity, ib.reserved_quantity,
               ib.damaged_quantity, ib.in_transit_quantity
        FROM products p
-       INNER JOIN locations l ON l.id = ? AND l.tenant_id = p.tenant_id AND l.warehouse_id = ?
+       INNER JOIN locations l ON l.id = ? AND l.tenant_id = p.tenant_id
+         AND l.warehouse_id = ? AND l.active = TRUE
        LEFT JOIN inventory_balances ib ON ib.tenant_id = p.tenant_id
          AND ib.product_id = p.id AND ib.location_id = l.id
        WHERE p.id = ? AND p.tenant_id = ? AND p.active = TRUE LIMIT 1`,
@@ -649,7 +651,8 @@ export class InventoryRepository {
   ): Promise<void> {
     const rows = await manager.query<Array<{ product_id: string }>>(
       `SELECT p.id AS product_id FROM products p
-       INNER JOIN locations l ON l.id = ? AND l.tenant_id = p.tenant_id AND l.warehouse_id = ?
+       INNER JOIN locations l ON l.id = ? AND l.tenant_id = p.tenant_id
+         AND l.warehouse_id = ? AND l.active = TRUE
        WHERE p.id = ? AND p.tenant_id = ? AND p.active = TRUE LIMIT 1`,
       [locationId, warehouseId, productId, tenantId],
     );

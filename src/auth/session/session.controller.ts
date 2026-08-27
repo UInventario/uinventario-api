@@ -5,6 +5,7 @@ import {
   Get,
   HttpCode,
   Inject,
+  Patch,
   Post,
   Req,
   Res,
@@ -15,6 +16,7 @@ import { Throttle } from '@nestjs/throttler';
 import type { Response } from 'express';
 import { sessionConfig } from '../../config/session.config';
 import { CreateSessionDto } from './dto/create-session.dto';
+import { UpdateSessionContextDto } from './dto/update-session-context.dto';
 import { SessionGuard } from './session.guard';
 import { SessionService } from './session.service';
 import type { AuthenticatedRequest } from './session.types';
@@ -73,6 +75,24 @@ export class SessionController {
       request.principal,
       request.principal.expiresAt,
     );
+  }
+
+  @Patch('current/context')
+  @UseGuards(SessionGuard)
+  async changeContext(
+    @Req() request: AuthenticatedRequest,
+    @Body() dto: UpdateSessionContextDto,
+  ) {
+    const result = await this.sessions.changeContext(request.principal, dto);
+    await this.audit.record({
+      tenantId: request.principal.tenant.id,
+      actorUserId: request.principal.user.id,
+      action: 'SESSION_CONTEXT_CHANGED',
+      entityType: 'SESSION',
+      entityId: request.principal.sessionId,
+      correlationId: request.requestId!,
+    });
+    return result;
   }
 
   @Delete('current')

@@ -1,9 +1,15 @@
-import { Inject, Injectable, UnauthorizedException } from '@nestjs/common';
+import {
+  Inject,
+  Injectable,
+  NotFoundException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import type { ConfigType } from '@nestjs/config';
 import { argon2id, hash, verify } from 'argon2';
 import { createHash, randomBytes } from 'node:crypto';
 import { sessionConfig } from '../../config/session.config';
 import { CreateSessionDto } from './dto/create-session.dto';
+import { UpdateSessionContextDto } from './dto/update-session-context.dto';
 import { SessionRepository } from './session.repository';
 import { SessionIdentity, SessionResponse } from './session.types';
 
@@ -103,6 +109,20 @@ export class SessionService {
 
   async logout(sessionId: string): Promise<void> {
     await this.sessions.revokeSession(sessionId, new Date());
+  }
+
+  async changeContext(
+    principal: SessionIdentity,
+    dto: UpdateSessionContextDto,
+  ): Promise<SessionResponse> {
+    const context = await this.sessions.changeContext(
+      principal.sessionId,
+      principal.tenant.id,
+      dto.branchId,
+      dto.warehouseId,
+    );
+    if (!context) throw new NotFoundException();
+    return this.toResponse({ ...principal, context }, principal.expiresAt);
   }
 
   toResponse(

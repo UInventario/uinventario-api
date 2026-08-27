@@ -1995,6 +1995,216 @@ describe('UInventario API (e2e)', () => {
       expect(Number(invariant.movements)).toBe(4);
     });
 
+    it('keeps stock independent while switching between tenant branches and warehouses', async () => {
+      await registerAccount('multi-location-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeInventoryOnboarding(registrationPayload.email, cookie);
+      const initialOrganization = await request(app.getHttpServer())
+        .get('/api/v1/organization/branches')
+        .set('Cookie', cookie)
+        .expect(200);
+      const initialBranch = (
+        initialOrganization.body as {
+          data: Array<{
+            id: string;
+            warehouses: Array<{
+              id: string;
+              locations: Array<{ id: string }>;
+            }>;
+          }>;
+        }
+      ).data[0];
+      const initialWarehouse = initialBranch.warehouses[0];
+      const product = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto multisucursal',
+          sku: 'MULTI-1',
+          cost: '3.00',
+          price: '5.00',
+        })
+        .expect(201);
+      const productId = (product.body as { data: { id: string } }).data.id;
+
+      const createdBranch = await request(app.getHttpServer())
+        .post('/api/v1/organization/branches')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Sucursal Norte',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Norte',
+          locationName: 'Piso Norte',
+          locationCode: 'NORTE',
+        })
+        .expect(201);
+      const secondary = (
+        createdBranch.body as {
+          data: {
+            id: string;
+            warehouses: Array<{
+              id: string;
+              locations: Array<{ id: string }>;
+            }>;
+          };
+        }
+      ).data;
+      const secondaryWarehouse = secondary.warehouses[0];
+      const extraWarehouse = await request(app.getHttpServer())
+        .post(`/api/v1/organization/branches/${secondary.id}/warehouses`)
+        .set('Cookie', cookie)
+        .send({
+          name: 'Bodega Temporal',
+          locationName: 'Temporal',
+          locationCode: 'TEMP',
+        })
+        .expect(201);
+      const extraWarehouseId = (extraWarehouse.body as { data: { id: string } })
+        .data.id;
+      await request(app.getHttpServer())
+        .patch(`/api/v1/organization/branches/${secondary.id}`)
+        .set('Cookie', cookie)
+        .send({
+          name: 'Sucursal Norte Actualizada',
+          timezone: 'America/Monterrey',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .patch(`/api/v1/organization/warehouses/${secondaryWarehouse.id}`)
+        .set('Cookie', cookie)
+        .send({ name: 'Bodega Norte Actualizada' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .delete(`/api/v1/organization/warehouses/${extraWarehouseId}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { id: extraWarehouseId, active: false },
+          });
+        });
+
+      const temporaryBranch = await request(app.getHttpServer())
+        .post('/api/v1/organization/branches')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Sucursal Temporal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Temporal Independiente',
+          locationName: 'General Temporal',
+          locationCode: 'BRANCH-TEMP',
+        })
+        .expect(201);
+      const temporaryBranchId = (
+        temporaryBranch.body as { data: { id: string } }
+      ).data.id;
+      await request(app.getHttpServer())
+        .delete(`/api/v1/organization/branches/${temporaryBranchId}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { id: temporaryBranchId, active: false },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .patch('/api/v1/auth/sessions/current/context')
+        .set('Cookie', cookie)
+        .send({ branchId: secondary.id, warehouseId: secondaryWarehouse.id })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              context: {
+                branch: {
+                  id: secondary.id,
+                  name: 'Sucursal Norte Actualizada',
+                },
+                warehouse: {
+                  id: secondaryWarehouse.id,
+                  name: 'Bodega Norte Actualizada',
+                },
+                cashRegister: null,
+              },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'multi-location-north-stock')
+        .send({
+          productId,
+          locationId: secondaryWarehouse.locations[0].id,
+          type: 'INITIAL',
+          quantity: '7',
+          reason: 'Stock sucursal norte',
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [{ product: { id: productId }, totalQuantity: '7.000' }],
+            meta: { scope: { branch: { id: secondary.id } } },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .patch('/api/v1/auth/sessions/current/context')
+        .set('Cookie', cookie)
+        .send({ branchId: initialBranch.id, warehouseId: initialWarehouse.id })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'multi-location-primary-stock')
+        .send({
+          productId,
+          locationId: initialWarehouse.locations[0].id,
+          type: 'INITIAL',
+          quantity: '3',
+          reason: 'Stock sucursal principal',
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [{ product: { id: productId }, totalQuantity: '3.000' }],
+            meta: { scope: { branch: { id: initialBranch.id } } },
+          });
+        });
+
+      const balances = await dataSource.query<
+        Array<{ location_id: string; quantity: string }>
+      >(
+        `SELECT location_id, quantity FROM inventory_balances
+         WHERE product_id = ? ORDER BY quantity`,
+        [productId],
+      );
+      expect(balances.map(({ quantity }) => Number(quantity))).toEqual([3, 7]);
+      await request(app.getHttpServer())
+        .delete(`/api/v1/organization/branches/${secondary.id}`)
+        .set('Cookie', cookie)
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('ORGANIZATION_IN_USE');
+        });
+      await request(app.getHttpServer())
+        .delete(`/api/v1/organization/branches/${initialBranch.id}`)
+        .set('Cookie', cookie)
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INITIAL_ORGANIZATION_TARGET');
+        });
+    });
+
     it('rejects products and locations outside the active tenant', async () => {
       await registerAccount('inventory-isolation-primary');
       const primaryCookie = await createPersistedSession(
@@ -2033,6 +2243,31 @@ describe('UInventario API (e2e)', () => {
          WHERE u.normalized_email = ? LIMIT 1`,
         [secondary.email],
       );
+
+      const foreignContext = await request(app.getHttpServer())
+        .patch('/api/v1/auth/sessions/current/context')
+        .set('Cookie', primaryCookie)
+        .send({
+          branchId: foreignLocation.branch_id,
+          warehouseId: foreignLocation.warehouse_id,
+        })
+        .expect(404);
+      const missingContext = await request(app.getHttpServer())
+        .patch('/api/v1/auth/sessions/current/context')
+        .set('Cookie', primaryCookie)
+        .send({ branchId: randomUUID(), warehouseId: randomUUID() })
+        .expect(404);
+      expect(foreignContext.body).toEqual(missingContext.body);
+
+      const organizations = await request(app.getHttpServer())
+        .get('/api/v1/organization/branches')
+        .set('Cookie', primaryCookie)
+        .expect(200);
+      expect(
+        (organizations.body as { data: Array<{ id: string }> }).data.map(
+          ({ id }) => id,
+        ),
+      ).not.toContain(foreignLocation.branch_id);
 
       await request(app.getHttpServer())
         .post('/api/v1/inventory/movements')
@@ -3061,6 +3296,21 @@ describe('UInventario API (e2e)', () => {
         .expect(403)
         .expect(({ body }: { body: { code?: string } }) => {
           expect(body.code).toBe('INVENTORY_ACCESS_DENIED');
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/organization/branches')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Sucursal no autorizada',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega no autorizada',
+          locationName: 'General',
+          locationCode: 'DENIED',
+        })
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('ORGANIZATION_ACCESS_DENIED');
         });
 
       await request(app.getHttpServer())
