@@ -1,10 +1,20 @@
-import { Controller, Get, Query, Req, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Post,
+  Query,
+  Req,
+  UseGuards,
+} from '@nestjs/common';
 import { SessionGuard } from '../auth/session/session.guard';
 import type { AuthenticatedRequest } from '../auth/session/session.types';
 import { OfflineBootstrapQueryDto } from './dto/offline-bootstrap-query.dto';
 import { OfflineBootstrapService } from './offline-bootstrap.service';
 import { OfflineChangesQueryDto } from './dto/offline-changes-query.dto';
 import { OfflineChangesService } from './offline-changes.service';
+import { OfflineCommandBatchDto } from './dto/offline-command-batch.dto';
+import { OfflineCommandService } from './offline-command.service';
 
 @Controller('offline')
 @UseGuards(SessionGuard)
@@ -12,6 +22,7 @@ export class OfflineBootstrapController {
   constructor(
     private readonly bootstrapService: OfflineBootstrapService,
     private readonly changesService: OfflineChangesService,
+    private readonly commandService: OfflineCommandService,
   ) {}
 
   @Get('bootstrap')
@@ -32,5 +43,17 @@ export class OfflineBootstrapController {
     return {
       data: await this.changesService.changes(request.principal, query),
     };
+  }
+
+  @Post('commands/batch')
+  commands(
+    @Req() request: AuthenticatedRequest,
+    @Body() dto: OfflineCommandBatchDto,
+  ) {
+    return this.commandService.executeBatch(
+      request.principal,
+      dto,
+      request.requestId!,
+    );
   }
 }
