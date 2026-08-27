@@ -18,3 +18,7 @@ Cada entidad contiene un ID global, `tenantId`, `version` creciente y `updatedAt
 - Ante versión incompatible, migración local fallida o duda de identidad, el cliente descarta el almacén incompatible y conserva el modo online seguro.
 
 Los fixtures versionados prueban compatibilidad, aislamiento estructural, reanudación y ausencia de campos secretos antes de implementar persistencia o comandos offline.
+
+## Bootstrap HTTP
+
+`GET /api/v1/offline/bootstrap` requiere la cookie de sesión vigente, un `deviceId` UUID y acepta `pageSize` (1 a 500) y `cursor`. La primera respuesta fija una instantánea; `nextCursor` reanuda la página siguiente y `initialSyncCursor` conserva el punto desde el que comenzará la sincronización incremental. Los cursores están firmados y quedan invalidados al cambiar sesión, tenant, usuario o dispositivo.

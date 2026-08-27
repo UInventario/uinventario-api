@@ -29,6 +29,7 @@ export const OFFLINE_BOOTSTRAP_RESPONSE_V1_FIXTURE = {
     },
   },
   page: {
+    initialSyncCursor: 'sync-v1:2026-08-27T20:00:00.000Z',
     cursor: 'bootstrap-v1:0',
     nextCursor: 'bootstrap-v1:100',
     complete: false,
