@@ -90,10 +90,11 @@ export class RegistrationRepository {
         (?, ?, 'AUDIT_VIEW'), (?, ?, 'AUDIT_EXPORT'),
         (?, ?, 'SUPPLIERS_MANAGE'),
         (?, ?, 'PURCHASE_ORDERS_MANAGE'),
+        (?, ?, 'PURCHASE_ORDERS_APPROVE'),
         (?, ?, 'INVENTORY_VIEW'), (?, ?, 'INVENTORY_ADJUST'),
         (?, ?, 'INVENTORY_TRANSFER'), (?, ?, 'INVENTORY_COUNT'),
         (?, ?, 'INVENTORY_APPROVE')`,
-      Array.from({ length: 19 }, () => [role.id, tenant.id]).flat(),
+      Array.from({ length: 20 }, () => [role.id, tenant.id]).flat(),
     );
     await manager.update(
       RegistrationRequestEntity,

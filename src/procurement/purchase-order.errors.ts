@@ -23,3 +23,15 @@ export class PurchaseOrderStateError extends Error {
     super('PURCHASE_ORDER_STATE_CONFLICT');
   }
 }
+
+export class PurchaseOrderIdempotencyConflictError extends Error {
+  constructor() {
+    super('PURCHASE_ORDER_IDEMPOTENCY_CONFLICT');
+  }
+}
+
+export class PurchaseOrderNotFoundError extends Error {
+  constructor() {
+    super('PURCHASE_ORDER_NOT_FOUND');
+  }
+}

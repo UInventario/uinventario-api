@@ -13,7 +13,8 @@ export class SupplierAccessGuard implements CanActivate {
     const permissions = request.principal.user.permissions;
     const canReadForPurchases =
       request.method === 'GET' &&
-      permissions.includes('PURCHASE_ORDERS_MANAGE');
+      (permissions.includes('PURCHASE_ORDERS_MANAGE') ||
+        permissions.includes('PURCHASE_ORDERS_APPROVE'));
     if (
       request.principal.nextStep !== 'APPLICATION' ||
       !request.principal.context.branch ||

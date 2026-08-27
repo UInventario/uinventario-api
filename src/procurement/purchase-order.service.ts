@@ -4,16 +4,20 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { createHash } from 'node:crypto';
 import { ListPurchaseOrdersDto } from './dto/list-purchase-orders.dto';
 import { SavePurchaseOrderDto } from './dto/save-purchase-order.dto';
 import { UpdatePurchaseOrderDto } from './dto/update-purchase-order.dto';
 import {
   PurchaseOrderDuplicateLineError,
+  PurchaseOrderIdempotencyConflictError,
+  PurchaseOrderNotFoundError,
   PurchaseOrderReferenceError,
   PurchaseOrderStateError,
   PurchaseOrderVersionConflictError,
 } from './purchase-order.errors';
 import { PurchaseOrderRepository } from './purchase-order.repository';
+import { PurchaseOrderDelivery } from './purchase-order.delivery';
 import {
   PurchaseOrderListResponse,
   PurchaseOrderResponse,
@@ -21,7 +25,10 @@ import {
 
 @Injectable()
 export class PurchaseOrderService {
-  constructor(private readonly orders: PurchaseOrderRepository) {}
+  constructor(
+    private readonly orders: PurchaseOrderRepository,
+    private readonly delivery: PurchaseOrderDelivery,
+  ) {}
 
   async create(
     tenantId: string,
@@ -79,6 +86,105 @@ export class PurchaseOrderService {
     return { data: order, meta: { apiVersion: '1' } };
   }
 
+  approve(input: {
+    tenantId: string;
+    orderId: string;
+    actorUserId: string;
+    version: number;
+    reason?: string;
+    idempotencyKey: string | undefined;
+  }): Promise<PurchaseOrderResponse> {
+    return this.changeStatus({ ...input, from: ['DRAFT'], to: 'APPROVED' });
+  }
+
+  async send(input: {
+    tenantId: string;
+    orderId: string;
+    actorUserId: string;
+    version: number;
+    idempotencyKey: string | undefined;
+  }): Promise<PurchaseOrderResponse> {
+    this.idempotencyKey(input.idempotencyKey);
+    const current = await this.get(input.tenantId, input.orderId);
+    const recipient = await this.orders.findSupplierEmail(
+      input.tenantId,
+      input.orderId,
+    );
+    const delivery = await this.delivery.send({
+      folio: current.data.folio,
+      recipient,
+    });
+    return this.changeStatus({
+      ...input,
+      from: ['APPROVED'],
+      to: 'SENT',
+      delivery,
+    });
+  }
+
+  cancel(input: {
+    tenantId: string;
+    orderId: string;
+    actorUserId: string;
+    version: number;
+    reason: string;
+    idempotencyKey: string | undefined;
+  }): Promise<PurchaseOrderResponse> {
+    return this.changeStatus({
+      ...input,
+      from: ['DRAFT', 'APPROVED', 'SENT'],
+      to: 'CANCELLED',
+    });
+  }
+
+  private async changeStatus(input: {
+    tenantId: string;
+    orderId: string;
+    actorUserId: string;
+    version: number;
+    from: Array<'DRAFT' | 'APPROVED' | 'SENT'>;
+    to: 'APPROVED' | 'SENT' | 'CANCELLED';
+    reason?: string;
+    delivery?: { mode: 'SIMULATED'; recipient: string | null };
+    idempotencyKey: string | undefined;
+  }): Promise<PurchaseOrderResponse> {
+    const idempotencyKey = this.idempotencyKey(input.idempotencyKey);
+    const fingerprint = createHash('sha256')
+      .update(
+        JSON.stringify({
+          orderId: input.orderId,
+          to: input.to,
+          version: input.version,
+          reason: input.reason ?? null,
+        }),
+      )
+      .digest('hex');
+    try {
+      const result = await this.orders.transition({
+        ...input,
+        idempotencyKey,
+        fingerprint,
+      });
+      return {
+        data: result.order,
+        meta: { apiVersion: '1', idempotentReplay: result.replay },
+      };
+    } catch (error) {
+      this.rethrow(error);
+    }
+  }
+
+  private idempotencyKey(value: string | undefined): string {
+    if (!value || !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(value)) {
+      throw new BadRequestException({
+        code: 'INVALID_IDEMPOTENCY_KEY',
+        message:
+          'Idempotency-Key es obligatorio y debe tener entre 8 y 128 caracteres.',
+      });
+    }
+    return value;
+  }
+
   private validate(dto: SavePurchaseOrderDto): void {
     if (
       new Set(dto.lines.map((line) => line.supplierProductId)).size !==
@@ -107,6 +213,14 @@ export class PurchaseOrderService {
         },
       }[error.reference];
       throw new BadRequestException(responses);
+    }
+    if (error instanceof PurchaseOrderNotFoundError)
+      throw new NotFoundException();
+    if (error instanceof PurchaseOrderIdempotencyConflictError) {
+      throw new ConflictException({
+        code: 'IDEMPOTENCY_KEY_REUSED',
+        message: 'La clave de idempotencia ya fue usada con otros datos.',
+      });
     }
     if (error instanceof PurchaseOrderDuplicateLineError) {
       throw new BadRequestException({

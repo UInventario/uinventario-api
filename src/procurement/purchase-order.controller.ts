@@ -2,6 +2,8 @@ import {
   Body,
   Controller,
   Get,
+  Headers,
+  HttpCode,
   Param,
   ParseUUIDPipe,
   Patch,
@@ -13,16 +15,21 @@ import {
 import { AuditService } from '../audit/audit.service';
 import { PermissionGuard } from '../auth/authorization/permission.guard';
 import { RequirePermissions } from '../auth/authorization/require-permissions.decorator';
+import { RequireAnyPermission } from '../auth/authorization/require-any-permission.decorator';
 import { SessionGuard } from '../auth/session/session.guard';
 import type { AuthenticatedRequest } from '../auth/session/session.types';
 import { ListPurchaseOrdersDto } from './dto/list-purchase-orders.dto';
 import { SavePurchaseOrderDto } from './dto/save-purchase-order.dto';
 import { UpdatePurchaseOrderDto } from './dto/update-purchase-order.dto';
+import {
+  ApprovePurchaseOrderDto,
+  CancelPurchaseOrderDto,
+  TransitionPurchaseOrderDto,
+} from './dto/transition-purchase-order.dto';
 import { PurchaseOrderService } from './purchase-order.service';
 
 @Controller('purchase-orders')
 @UseGuards(SessionGuard, PermissionGuard)
-@RequirePermissions('PURCHASE_ORDERS_MANAGE')
 export class PurchaseOrderController {
   constructor(
     private readonly orders: PurchaseOrderService,
@@ -30,6 +37,7 @@ export class PurchaseOrderController {
   ) {}
 
   @Get()
+  @RequireAnyPermission('PURCHASE_ORDERS_MANAGE', 'PURCHASE_ORDERS_APPROVE')
   list(
     @Req() request: AuthenticatedRequest,
     @Query() query: ListPurchaseOrdersDto,
@@ -38,6 +46,7 @@ export class PurchaseOrderController {
   }
 
   @Get(':id')
+  @RequireAnyPermission('PURCHASE_ORDERS_MANAGE', 'PURCHASE_ORDERS_APPROVE')
   get(
     @Req() request: AuthenticatedRequest,
     @Param('id', new ParseUUIDPipe()) id: string,
@@ -46,6 +55,7 @@ export class PurchaseOrderController {
   }
 
   @Post()
+  @RequirePermissions('PURCHASE_ORDERS_MANAGE')
   async create(
     @Req() request: AuthenticatedRequest,
     @Body() dto: SavePurchaseOrderDto,
@@ -73,6 +83,7 @@ export class PurchaseOrderController {
   }
 
   @Patch(':id')
+  @RequirePermissions('PURCHASE_ORDERS_MANAGE')
   async update(
     @Req() request: AuthenticatedRequest,
     @Param('id', new ParseUUIDPipe()) id: string,
@@ -101,5 +112,90 @@ export class PurchaseOrderController {
       },
     });
     return result;
+  }
+
+  @Post(':id/approve')
+  @RequirePermissions('PURCHASE_ORDERS_APPROVE')
+  @HttpCode(200)
+  async approve(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: ApprovePurchaseOrderDto,
+  ) {
+    const result = await this.orders.approve({
+      tenantId: request.principal.tenant.id,
+      orderId: id,
+      actorUserId: request.principal.user.id,
+      version: dto.version,
+      reason: dto.reason,
+      idempotencyKey,
+    });
+    await this.recordTransition(request, result, 'PURCHASE_ORDER_APPROVED');
+    return result;
+  }
+
+  @Post(':id/send')
+  @RequirePermissions('PURCHASE_ORDERS_MANAGE')
+  @HttpCode(200)
+  async send(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: TransitionPurchaseOrderDto,
+  ) {
+    const result = await this.orders.send({
+      tenantId: request.principal.tenant.id,
+      orderId: id,
+      actorUserId: request.principal.user.id,
+      version: dto.version,
+      idempotencyKey,
+    });
+    await this.recordTransition(request, result, 'PURCHASE_ORDER_SENT');
+    return result;
+  }
+
+  @Post(':id/cancel')
+  @RequirePermissions('PURCHASE_ORDERS_APPROVE')
+  @HttpCode(200)
+  async cancel(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: CancelPurchaseOrderDto,
+  ) {
+    const result = await this.orders.cancel({
+      tenantId: request.principal.tenant.id,
+      orderId: id,
+      actorUserId: request.principal.user.id,
+      version: dto.version,
+      reason: dto.reason,
+      idempotencyKey,
+    });
+    await this.recordTransition(request, result, 'PURCHASE_ORDER_CANCELLED');
+    return result;
+  }
+
+  private async recordTransition(
+    request: AuthenticatedRequest,
+    result: Awaited<ReturnType<PurchaseOrderService['approve']>>,
+    action: string,
+  ): Promise<void> {
+    if (result.meta.idempotentReplay) return;
+    const latest = result.data.transitions.at(-1)!;
+    await this.audit.record({
+      tenantId: request.principal.tenant.id,
+      actorUserId: request.principal.user.id,
+      action,
+      entityType: 'PURCHASE_ORDER',
+      entityId: result.data.id,
+      correlationId: request.requestId!,
+      before: { status: latest.fromStatus },
+      after: {
+        status: latest.toStatus,
+        reason: latest.reason,
+        deliveryMode: latest.delivery?.mode ?? null,
+      },
+    });
   }
 }

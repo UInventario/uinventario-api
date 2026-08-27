@@ -7,6 +7,7 @@ import {
 import { Reflector } from '@nestjs/core';
 import type { AuthenticatedRequest } from '../session/session.types';
 import type { AppPermission } from './authorization.types';
+import { REQUIRED_ANY_PERMISSION } from './require-any-permission.decorator';
 import { REQUIRED_PERMISSIONS } from './require-permissions.decorator';
 
 @Injectable()
@@ -19,6 +20,20 @@ export class PermissionGuard implements CanActivate {
       REQUIRED_PERMISSIONS,
       [context.getHandler(), context.getClass()],
     );
+    const requiredAny = this.reflector.getAllAndOverride<AppPermission[]>(
+      REQUIRED_ANY_PERMISSION,
+      [context.getHandler(), context.getClass()],
+    );
+    const hasAll =
+      !required?.length ||
+      required.every((permission) =>
+        request.principal.user.permissions.includes(permission),
+      );
+    const hasAny =
+      !requiredAny?.length ||
+      requiredAny.some((permission) =>
+        request.principal.user.permissions.includes(permission),
+      );
     const auditOnly =
       required?.length &&
       required.every((permission) => permission.startsWith('AUDIT_'));
@@ -27,14 +42,14 @@ export class PermissionGuard implements CanActivate {
       (!auditOnly &&
         (!request.principal.context.branch ||
           !request.principal.context.warehouse)) ||
-      !required?.every((permission) =>
-        request.principal.user.permissions.includes(permission),
-      )
+      !hasAll ||
+      !hasAny
     ) {
-      const inventory = required?.some((permission) =>
+      const evaluated = [...(required ?? []), ...(requiredAny ?? [])];
+      const inventory = evaluated.some((permission) =>
         permission.startsWith('INVENTORY_'),
       );
-      const audit = required?.some((permission) =>
+      const audit = evaluated.some((permission) =>
         permission.startsWith('AUDIT_'),
       );
       throw new ForbiddenException({

@@ -29,14 +29,28 @@ export interface PurchaseOrderData {
   subtotal: string;
   total: string;
   version: number;
+  approvedAt: string | null;
+  sentAt: string | null;
+  cancelledAt: string | null;
+  cancellationReason: string | null;
+  transitions: PurchaseOrderTransitionData[];
   lines: PurchaseOrderLineData[];
   createdAt: string;
   updatedAt: string;
 }
 
+export interface PurchaseOrderTransitionData {
+  id: string;
+  fromStatus: PurchaseOrderStatus;
+  toStatus: PurchaseOrderStatus;
+  reason: string | null;
+  delivery: { mode: 'SIMULATED'; recipient: string | null } | null;
+  createdAt: string;
+}
+
 export interface PurchaseOrderResponse {
   data: PurchaseOrderData;
-  meta: { apiVersion: '1' };
+  meta: { apiVersion: '1'; idempotentReplay?: boolean };
 }
 
 export interface PurchaseOrderListResponse {
