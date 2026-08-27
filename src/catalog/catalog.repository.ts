@@ -1,10 +1,15 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
+import type { ResultSetHeader } from 'mysql2';
 import { CreateProductDto } from './dto/create-product.dto';
-import { ProductIdentifierConflictError } from './catalog.errors';
+import {
+  ProductIdentifierConflictError,
+  ProductVersionConflictError,
+} from './catalog.errors';
 import { CatalogOptionsResponse, ProductData } from './catalog.types';
 import { ListProductsDto } from './dto/list-products.dto';
+import { UpdateProductDto } from './dto/update-product.dto';
 
 interface ProductRow {
   id: string;
@@ -14,6 +19,7 @@ interface ProductRow {
   cost: string;
   price: string;
   active: number | boolean;
+  version: number;
   category_id: string | null;
   category_name: string | null;
   brand_id: string | null;
@@ -94,6 +100,67 @@ export class CatalogRepository {
     return { categories, brands };
   }
 
+  async updateProduct(
+    tenantId: string,
+    id: string,
+    dto: UpdateProductDto,
+  ): Promise<ProductData | null> {
+    try {
+      return await this.dataSource.transaction(async (manager) => {
+        const categoryId = dto.categoryName
+          ? await this.findOrCreateClassification(
+              manager,
+              'categories',
+              tenantId,
+              dto.categoryName,
+            )
+          : null;
+        const brandId = dto.brandName
+          ? await this.findOrCreateClassification(
+              manager,
+              'brands',
+              tenantId,
+              dto.brandName,
+            )
+          : null;
+        const result = await manager.query<ResultSetHeader>(
+          `UPDATE products
+           SET name = ?, sku = ?, normalized_sku = ?, barcode = ?,
+               category_id = ?, brand_id = ?, cost = ?, price = ?, version = version + 1
+           WHERE id = ? AND tenant_id = ? AND version = ?`,
+          [
+            dto.name,
+            dto.sku,
+            this.normalize(dto.sku),
+            dto.barcode ?? null,
+            categoryId,
+            brandId,
+            dto.cost,
+            dto.price,
+            id,
+            tenantId,
+            dto.version,
+          ],
+        );
+        if (result.affectedRows === 0) {
+          const current = await this.findProduct(manager, tenantId, id);
+          if (!current) return null;
+          throw new ProductVersionConflictError(current.version);
+        }
+        return this.findProduct(manager, tenantId, id);
+      });
+    } catch (error) {
+      const constraint = this.duplicateConstraint(error);
+      if (constraint?.includes('uq_products_tenant_sku')) {
+        throw new ProductIdentifierConflictError('sku');
+      }
+      if (constraint?.includes('uq_products_tenant_barcode')) {
+        throw new ProductIdentifierConflictError('barcode');
+      }
+      throw error;
+    }
+  }
+
   async listProducts(
     tenantId: string,
     query: ListProductsDto,
@@ -166,7 +233,7 @@ export class CatalogRepository {
   }
 
   private productSelect(): string {
-    return `SELECT p.id, p.name, p.sku, p.barcode, p.cost, p.price, p.active,
+    return `SELECT p.id, p.name, p.sku, p.barcode, p.cost, p.price, p.active, p.version,
                    c.id AS category_id, c.name AS category_name,
                    b.id AS brand_id, b.name AS brand_name
             FROM products p
@@ -191,6 +258,7 @@ export class CatalogRepository {
       cost: row.cost,
       price: row.price,
       active: Boolean(row.active),
+      version: Number(row.version),
     };
   }
 

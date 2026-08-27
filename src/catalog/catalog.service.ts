@@ -4,7 +4,10 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { CatalogRepository } from './catalog.repository';
-import { ProductIdentifierConflictError } from './catalog.errors';
+import {
+  ProductIdentifierConflictError,
+  ProductVersionConflictError,
+} from './catalog.errors';
 import {
   CatalogOptionsResponse,
   ProductListResponse,
@@ -12,6 +15,7 @@ import {
 } from './catalog.types';
 import { CreateProductDto } from './dto/create-product.dto';
 import { ListProductsDto } from './dto/list-products.dto';
+import { UpdateProductDto } from './dto/update-product.dto';
 
 @Injectable()
 export class CatalogService {
@@ -51,6 +55,31 @@ export class CatalogService {
     };
   }
 
+  async updateProduct(
+    tenantId: string,
+    id: string,
+    dto: UpdateProductDto,
+  ): Promise<ProductResponse> {
+    try {
+      const product = await this.catalog.updateProduct(tenantId, id, dto);
+      if (!product) throw new NotFoundException();
+      return { data: product, meta: { apiVersion: '1' } };
+    } catch (error) {
+      if (error instanceof ProductIdentifierConflictError) {
+        this.throwIdentifierConflict(error);
+      }
+      if (error instanceof ProductVersionConflictError) {
+        throw new ConflictException({
+          code: 'PRODUCT_VERSION_CONFLICT',
+          currentVersion: error.currentVersion,
+          message:
+            'El producto cambió desde que lo abriste. Recarga antes de guardar.',
+        });
+      }
+      throw error;
+    }
+  }
+
   async listProducts(
     tenantId: string,
     query: ListProductsDto,
@@ -77,5 +106,19 @@ export class CatalogService {
     const product = await this.catalog.getProduct(tenantId, id);
     if (!product) throw new NotFoundException();
     return { data: product, meta: { apiVersion: '1' } };
+  }
+
+  private throwIdentifierConflict(
+    error: ProductIdentifierConflictError,
+  ): never {
+    throw new ConflictException({
+      code:
+        error.field === 'sku' ? 'SKU_ALREADY_EXISTS' : 'BARCODE_ALREADY_EXISTS',
+      field: error.field,
+      message:
+        error.field === 'sku'
+          ? 'Ya existe un producto con ese SKU en la empresa.'
+          : 'Ya existe un producto con ese código de barras en la empresa.',
+    });
   }
 }

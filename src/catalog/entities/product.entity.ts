@@ -35,6 +35,9 @@ export class ProductEntity {
   @Column({ type: 'boolean', default: true })
   active!: boolean;
 
+  @Column({ type: 'int', unsigned: true, default: 1 })
+  version!: number;
+
   @CreateDateColumn({ name: 'created_at', type: 'datetime', precision: 6 })
   createdAt!: Date;
 }
