@@ -61,7 +61,7 @@ export class SuspendedSaleService {
     try {
       const quote = await this.pos.quoteCart({
         ...context,
-        dto: { lines: dto.lines },
+        dto: { lines: dto.lines, customerId: dto.customerId },
       });
       const result = await this.repository.create({
         tenantId: context.tenantId,
@@ -108,7 +108,10 @@ export class SuspendedSaleService {
         : {}),
     }));
     try {
-      const quote = await this.pos.quoteCart({ ...context, dto: { lines } });
+      const quote = await this.pos.quoteCart({
+        ...context,
+        dto: { lines, customerId: suspended.customer?.id },
+      });
       const conflicts: SuspendedSaleConflict[] = [];
       for (const line of suspended.lines) {
         const current = quote.data.lines.find(

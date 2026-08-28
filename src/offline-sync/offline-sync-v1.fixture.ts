@@ -152,6 +152,28 @@ export const OFFLINE_BOOTSTRAP_RESPONSE_V1_FIXTURE = {
         locationId: '42000000-0000-4000-8000-000000000001',
         availableQuantity: '12.000',
       },
+      {
+        kind: 'PRICE_LIST',
+        id: '63000000-0000-4000-8000-000000000001',
+        tenantId: '20000000-0000-4000-8000-000000000001',
+        version: 1,
+        updatedAt: '2026-08-27T19:35:00.000Z',
+        name: 'POS general',
+        currency: 'MXN',
+        branchId: null,
+        customerId: null,
+        channel: 'POS',
+        priority: 10,
+        validFrom: '2026-08-01T00:00:00.000Z',
+        validTo: null,
+        active: true,
+        items: [
+          {
+            productId: '60000000-0000-4000-8000-000000000001',
+            price: '109.90',
+          },
+        ],
+      },
     ],
   },
 } satisfies OfflineBootstrapResponseV1;

@@ -187,6 +187,67 @@ export class OfflineBootstrapRepository {
         active: true,
       })),
     );
+    if (input.permissions.includes('SALES_MANAGE')) {
+      const priceLists = await this.dataSource.query<
+        Array<{
+          id: string;
+          name: string;
+          currency: string;
+          branch_id: string | null;
+          customer_id: string | null;
+          channel: 'POS' | 'WEB' | 'MOBILE' | 'DESKTOP' | null;
+          priority: number | string;
+          valid_from: Date | string;
+          valid_to: Date | string | null;
+          active: number | boolean;
+          version: number | string;
+          updated_at: Date | string;
+        }>
+      >(
+        `SELECT id, name, currency, branch_id, customer_id, channel, priority,
+                valid_from, valid_to, active, version, updated_at
+         FROM price_lists WHERE tenant_id = ? AND updated_at <= ? ORDER BY id`,
+        [input.scope.tenantId, input.snapshotAt],
+      );
+      const priceItems = priceLists.length
+        ? await this.dataSource.query<
+            Array<{
+              price_list_id: string;
+              product_id: string;
+              price: string;
+            }>
+          >(
+            `SELECT price_list_id, product_id, price FROM price_list_items
+             WHERE tenant_id = ? AND price_list_id IN (${priceLists.map(() => '?').join(', ')})
+             ORDER BY price_list_id, product_id`,
+            [input.scope.tenantId, ...priceLists.map(({ id }) => id)],
+          )
+        : [];
+      entities.push(
+        ...priceLists.map((list) => ({
+          kind: 'PRICE_LIST' as const,
+          id: list.id,
+          tenantId: input.scope.tenantId,
+          version: Number(list.version),
+          updatedAt: this.iso(list.updated_at),
+          name: list.name,
+          currency: list.currency,
+          branchId: list.branch_id,
+          customerId: list.customer_id,
+          channel: list.channel,
+          priority: Number(list.priority),
+          validFrom: this.iso(list.valid_from),
+          validTo: list.valid_to ? this.iso(list.valid_to) : null,
+          active: Boolean(list.active),
+          items: priceItems
+            .filter(({ price_list_id }) => price_list_id === list.id)
+            .map((item) => ({
+              productId: item.product_id,
+              price: this.decimal(item.price, 2),
+            })),
+        })),
+      );
+    }
     if (
       locationRows.length &&
       input.permissions.some((permission) =>

@@ -3,6 +3,7 @@ import {
   ArrayMaxSize,
   ArrayMinSize,
   IsArray,
+  IsIn,
   IsOptional,
   IsString,
   IsUUID,
@@ -10,8 +11,14 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { QuoteCartLineDto } from './quote-cart.dto';
+import { PRICE_CHANNELS } from '../../pricing/price-list.types';
+import type { PriceChannel } from '../../pricing/price-list.types';
 
 export class CreateCashSaleDto {
+  @IsOptional()
+  @IsIn(PRICE_CHANNELS)
+  channel?: PriceChannel;
+
   @IsOptional()
   @IsUUID()
   customerId?: string;

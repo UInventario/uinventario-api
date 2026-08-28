@@ -25,6 +25,8 @@ export interface PosCartQuoteResponse {
       serialNumbers: string[];
       availableQuantity: string;
       unitPrice: string;
+      priceSource: 'BASE' | 'PRICE_LIST';
+      priceList: { id: string; name: string } | null;
       subtotal: string;
       tax: string;
       total: string;
@@ -84,6 +86,8 @@ export interface CashSaleData {
     product: { id: string; name: string; sku: string };
     quantity: string;
     unitPrice: string;
+    priceSource: 'BASE' | 'PRICE_LIST';
+    priceList: { id: string; name: string } | null;
     subtotal: string;
     tax: string;
     total: string;

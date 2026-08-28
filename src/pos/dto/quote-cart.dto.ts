@@ -4,12 +4,15 @@ import {
   ArrayMinSize,
   ArrayUnique,
   IsArray,
+  IsIn,
   IsOptional,
   IsString,
   IsUUID,
   Matches,
   ValidateNested,
 } from 'class-validator';
+import { PRICE_CHANNELS } from '../../pricing/price-list.types';
+import type { PriceChannel } from '../../pricing/price-list.types';
 
 export class QuoteCartLineDto {
   @IsUUID()
@@ -32,6 +35,14 @@ export class QuoteCartLineDto {
 }
 
 export class QuoteCartDto {
+  @IsUUID()
+  @IsOptional()
+  customerId?: string;
+
+  @IsOptional()
+  @IsIn(PRICE_CHANNELS)
+  channel?: PriceChannel;
+
   @IsUUID()
   @IsOptional()
   reservationId?: string;

@@ -60,6 +60,7 @@ describe('UInventario API (e2e)', () => {
       'password_reset_tokens',
       'pos_peripheral_operations',
       'pos_peripheral_profiles',
+      'price_list_items',
       'sale_receipt_snapshots',
       'customer_credit_ledger',
       'sale_return_settlements',
@@ -70,6 +71,7 @@ describe('UInventario API (e2e)', () => {
       'sale_payments',
       'sale_lines',
       'sales',
+      'price_lists',
       'cash_register_movements',
       'cash_register_shifts',
       'product_reservation_lines',
@@ -6886,6 +6888,165 @@ describe('UInventario API (e2e)', () => {
       }
       return { cookie, productId, locationId: location.id };
     }
+
+    it('resolves scoped price lists deterministically and snapshots the sale price', async () => {
+      const { cookie, productId } = await preparePos();
+      const [branch] = await dataSource.query<Array<{ id: string }>>(
+        'SELECT id FROM branches LIMIT 1',
+      );
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Cliente preferente',
+          identifier: 'PREFERENTE-1',
+          dataProcessingConsent: false,
+        })
+        .expect(201);
+      const customerId = (customerResponse.body as { data: { id: string } })
+        .data.id;
+      const validFrom = new Date(Date.now() - 60_000).toISOString();
+      const validTo = new Date(Date.now() + 86_400_000).toISOString();
+      const createList = (body: Record<string, unknown>) =>
+        request(app.getHttpServer())
+          .post('/api/v1/price-lists')
+          .set('Cookie', cookie)
+          .send({
+            currency: 'MXN',
+            priority: 10,
+            validFrom,
+            validTo,
+            active: true,
+            items: [{ productId, price: '109.00' }],
+            ...body,
+          });
+      await createList({ name: 'General POS' }).expect(201);
+      await createList({
+        name: 'Sucursal POS',
+        branchId: branch.id,
+        items: [{ productId, price: '108.00' }],
+      }).expect(201);
+      const preferredResponse = await createList({
+        name: 'Preferentes',
+        customerId,
+        channel: 'POS',
+        priority: 20,
+        items: [{ productId, price: '99.99' }],
+      }).expect(201);
+      const preferred = preferredResponse.body as {
+        data: { id: string; version: number };
+      };
+      await createList({
+        name: 'Expirada',
+        priority: 100,
+        validFrom: new Date(Date.now() - 172_800_000).toISOString(),
+        validTo: new Date(Date.now() - 86_400_000).toISOString(),
+        items: [{ productId, price: '1.00' }],
+      }).expect(201);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/offline/bootstrap')
+        .set('Cookie', cookie)
+        .query({ deviceId: randomUUID(), pageSize: 500 })
+        .expect(200)
+        .expect(({ body }: { body: { data: OfflineBootstrapResponseV1 } }) => {
+          expect(body.data.page.entities).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                kind: 'PRICE_LIST',
+                id: preferred.data.id,
+                customerId,
+                items: [{ productId, price: '99.99' }],
+              }),
+            ]),
+          );
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ channel: 'POS', lines: [{ productId, quantity: '1' }] })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                { unitPrice: '108.00', priceList: { name: 'Sucursal POS' } },
+              ],
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({
+          channel: 'POS',
+          customerId,
+          lines: [{ productId, quantity: '1.5' }],
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  unitPrice: '99.99',
+                  total: '149.99',
+                  priceSource: 'PRICE_LIST',
+                  priceList: { id: preferred.data.id },
+                },
+              ],
+            },
+          });
+        });
+      const saleResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'price-list-sale-001')
+        .send({
+          channel: 'POS',
+          customerId,
+          lines: [{ productId, quantity: '1' }],
+          payments: [
+            { method: 'CASH', amount: '99.99', amountReceived: '100.00' },
+          ],
+        })
+        .expect(201);
+      const sale = saleResponse.body as { data: { id: string } };
+      await request(app.getHttpServer())
+        .put(`/api/v1/price-lists/${preferred.data.id}`)
+        .set('Cookie', cookie)
+        .send({
+          name: 'Preferentes',
+          currency: 'MXN',
+          customerId,
+          channel: 'POS',
+          priority: 20,
+          validFrom,
+          validTo,
+          active: true,
+          version: preferred.data.version,
+          items: [{ productId, price: '89.99' }],
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${sale.data.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  unitPrice: '99.99',
+                  priceSource: 'PRICE_LIST',
+                  priceList: { id: preferred.data.id, name: 'Preferentes' },
+                },
+              ],
+            },
+          });
+        });
+    });
 
     it('accepts the unified sale contract with one cash payment', async () => {
       const { cookie, productId } = await preparePos();

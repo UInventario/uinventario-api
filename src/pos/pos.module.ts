@@ -37,9 +37,10 @@ import {
   POS_PERIPHERAL_ADAPTER,
   SimulatorPosPeripheralAdapter,
 } from './pos-peripheral.adapter';
+import { PriceListModule } from '../pricing/price-list.module';
 
 @Module({
-  imports: [SessionModule],
+  imports: [SessionModule, PriceListModule],
   controllers: [
     PosController,
     SaleReceiptController,
