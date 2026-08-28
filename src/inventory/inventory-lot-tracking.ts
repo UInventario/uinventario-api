@@ -23,6 +23,7 @@ interface MovementLotRow {
   purchase_return_line_id: string | null;
   sale_id: string | null;
   sale_line_id: string | null;
+  source_sale_movement_id: string | null;
   transfer_line_id: string | null;
   track_lots: number | boolean;
   unit_cost: string | null;
@@ -245,8 +246,11 @@ async function restoreAllocations(
   sourceType: 'SALE' | 'TRANSFER_OUT',
   mode: 'RESTORE' | 'TRANSFER',
 ): Promise<void> {
-  const parameters =
-    sourceType === 'SALE'
+  const isPartialSaleReturn =
+    sourceType === 'SALE' && movement.type === 'SALE_RETURN';
+  const parameters = isPartialSaleReturn
+    ? [movement.tenant_id, movement.source_sale_movement_id]
+    : sourceType === 'SALE'
       ? [
           movement.tenant_id,
           movement.sale_id,
@@ -254,19 +258,22 @@ async function restoreAllocations(
           movement.location_id,
         ]
       : [movement.tenant_id, movement.transfer_line_id];
-  const filter =
-    sourceType === 'SALE'
+  const filter = isPartialSaleReturn
+    ? 'im.id = ?'
+    : sourceType === 'SALE'
       ? `im.sale_id = ? AND im.sale_line_id = ? AND im.location_id = ?`
       : `im.transfer_line_id = ?`;
   const allocations = await manager.query<
     Array<{
+      source_movement_id: string;
       lot_id: string;
       quantity_change: string;
       unit_cost: string;
       currency: string;
     }>
   >(
-    `SELECT iml.lot_id, iml.quantity_change, iml.unit_cost, iml.currency
+    `SELECT im.id AS source_movement_id, iml.lot_id, iml.quantity_change,
+            iml.unit_cost, iml.currency
      FROM inventory_movement_lots iml
      INNER JOIN inventory_movements im
        ON im.id = iml.movement_id AND im.tenant_id = iml.tenant_id
@@ -278,8 +285,29 @@ async function restoreAllocations(
     throw new Error('INVENTORY_LOT_SOURCE_NOT_FOUND');
   const expected = units(movement.quantity_change);
   let restored = 0n;
+  let remaining = expected;
   for (const allocation of allocations) {
-    const quantity = -units(allocation.quantity_change);
+    if (remaining === 0n) break;
+    const original = -units(allocation.quantity_change);
+    let alreadyRestored = 0n;
+    if (isPartialSaleReturn) {
+      const [prior] = await manager.query<Array<{ quantity: string }>>(
+        `SELECT COALESCE(SUM(return_lot.quantity_change), 0) AS quantity
+         FROM inventory_movement_lots return_lot
+         INNER JOIN inventory_movements return_movement
+           ON return_movement.id = return_lot.movement_id
+          AND return_movement.tenant_id = return_lot.tenant_id
+         WHERE return_movement.tenant_id = ?
+           AND return_movement.type = 'SALE_RETURN'
+           AND return_movement.source_sale_movement_id = ?
+           AND return_lot.lot_id = ?`,
+        [movement.tenant_id, allocation.source_movement_id, allocation.lot_id],
+      );
+      alreadyRestored = units(prior.quantity);
+    }
+    const available = original - alreadyRestored;
+    const quantity = available < remaining ? available : remaining;
+    if (quantity <= 0n) continue;
     await changeLotBalance(
       manager,
       movement,
@@ -293,6 +321,7 @@ async function restoreAllocations(
       },
     );
     restored += quantity;
+    remaining -= quantity;
   }
   if (restored !== expected) throw new Error('INVENTORY_LOT_RESTORE_MISMATCH');
 }
@@ -365,7 +394,8 @@ export async function applyInventoryLotTracking(
     `SELECT im.id, im.tenant_id, im.product_id, im.location_id, im.type,
             im.quantity_change, im.created_by_user_id,
             im.purchase_receipt_line_id, im.purchase_return_line_id,
-            im.sale_id, im.sale_line_id, im.transfer_line_id, p.track_lots,
+            im.sale_id, im.sale_line_id, im.source_sale_movement_id,
+            im.transfer_line_id, p.track_lots,
             im.unit_cost, t.country_code
      FROM inventory_movements im
      INNER JOIN products p ON p.id = im.product_id AND p.tenant_id = im.tenant_id
@@ -443,6 +473,11 @@ export async function applyInventoryLotTracking(
   }
 
   if (movement.type === 'SALE_VOID') {
+    await restoreAllocations(manager, movement, 'SALE', 'RESTORE');
+    await finalizeSpecificLotMovementValuation(manager, movementId);
+    return;
+  }
+  if (movement.type === 'SALE_RETURN') {
     await restoreAllocations(manager, movement, 'SALE', 'RESTORE');
     await finalizeSpecificLotMovementValuation(manager, movementId);
     return;

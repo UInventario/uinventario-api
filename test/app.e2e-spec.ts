@@ -59,6 +59,8 @@ describe('UInventario API (e2e)', () => {
       'offline_sync_tombstones',
       'password_reset_tokens',
       'sale_receipt_snapshots',
+      'sale_return_lines',
+      'sale_returns',
       'sale_payments',
       'sale_lines',
       'sales',
@@ -954,6 +956,7 @@ describe('UInventario API (e2e)', () => {
                   'SALE_REPRINT',
                   'SALES_DISCOUNT',
                   'SALES_MANAGE',
+                  'SALES_RETURN',
                   'SALES_VOID',
                   'SUPPLIERS_MANAGE',
                   'TENANT_MANAGE',
@@ -9577,6 +9580,218 @@ describe('UInventario API (e2e)', () => {
       expect(JSON.stringify(sendData)).not.toContain(recipient);
     });
 
+    it('returns sale quantities once, restores the right stock state and links an exchange', async () => {
+      const { cookie, productId, locationId } = await preparePos();
+      const original = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-return-original')
+        .send({
+          lines: [{ productId, quantity: '4' }],
+          cashReceived: '500.00',
+        })
+        .expect(201);
+      const originalData = original.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+      const exchange = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-return-exchange')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: '150.00',
+        })
+        .expect(201);
+      const exchangeId = (exchange.body as { data: { id: string } }).data.id;
+      const saleId = originalData.data.id;
+      const saleLineId = originalData.data.lines[0].id;
+      const [principal] = await dataSource.query<
+        Array<{ tenant_id: string; role_id: string }>
+      >(
+        `SELECT u.tenant_id, ur.role_id FROM users u
+         INNER JOIN user_roles ur
+           ON ur.user_id = u.id AND ur.tenant_id = u.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'SALES_RETURN'`,
+        [principal.role_id, principal.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-return-no-permission')
+        .send({
+          reason: 'Cliente solicita cambio',
+          lines: [{ saleLineId, quantity: '1', condition: 'SELLABLE' }],
+        })
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'SALES_RETURN')`,
+        [principal.role_id, principal.tenant_id],
+      );
+
+      const firstPayload = {
+        reason: 'Cliente solicita cambio de presentación',
+        exchangeSaleId: exchangeId,
+        lines: [{ saleLineId, quantity: '1', condition: 'SELLABLE' }],
+      };
+      const first = await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/returns`)
+        .set('Cookie', cookie)
+        .set('X-Request-Id', 'sale-return-first-audit')
+        .set('Idempotency-Key', 'sale-return-first')
+        .send(firstPayload)
+        .expect(201);
+      expect(first.body).toMatchObject({
+        data: {
+          saleId,
+          exchangeSale: { id: exchangeId },
+          settlementStatus: 'PENDING',
+          reason: firstPayload.reason,
+          lines: [
+            {
+              saleLineId,
+              quantity: '1.000',
+              condition: 'SELLABLE',
+            },
+          ],
+        },
+        meta: { idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-return-first')
+        .send(firstPayload)
+        .expect(201)
+        .expect(
+          ({ body }: { body: { meta: { idempotentReplay: boolean } } }) => {
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+
+      const concurrent = await Promise.all(
+        ['sale-return-concurrent-a', 'sale-return-concurrent-b'].map((key) =>
+          request(app.getHttpServer())
+            .post(`/api/v1/pos/sales/${saleId}/returns`)
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', key)
+            .send({
+              reason: 'Producto abierto y dañado',
+              lines: [{ saleLineId, quantity: '2', condition: 'DAMAGED' }],
+            }),
+        ),
+      );
+      expect(concurrent.map(({ status }) => status).sort()).toEqual([201, 409]);
+      expect(
+        concurrent.find(({ status }) => status === 409)?.body,
+      ).toMatchObject({
+        code: 'SALE_RETURN_QUANTITY_EXCEEDED',
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-return-over-limit')
+        .send({
+          reason: 'Intento por encima del remanente',
+          lines: [{ saleLineId, quantity: '2', condition: 'SELLABLE' }],
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SALE_RETURN_QUANTITY_EXCEEDED');
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-void-after-return')
+        .send({ reason: 'No debe anular tras devolver' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SALE_VOID_NOT_ALLOWED');
+        });
+
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${saleId}/returns`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toHaveLength(2);
+        });
+      const [state] = await dataSource.query<
+        Array<{
+          returns: number | string;
+          return_lines: number | string;
+          return_movements: number | string;
+          available_quantity: string;
+          damaged_quantity: string;
+          quantity: string;
+          valuation_quantity: string;
+          fifo_quantity: string;
+          audits: number | string;
+        }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM sale_returns WHERE sale_id = ?) AS returns,
+           (SELECT COUNT(*) FROM sale_return_lines srl
+             INNER JOIN sale_returns sr ON sr.id = srl.sale_return_id
+             WHERE sr.sale_id = ?) AS return_lines,
+           (SELECT COUNT(*) FROM inventory_movements
+             WHERE sale_id = ? AND type = 'SALE_RETURN') AS return_movements,
+           ib.available_quantity, ib.damaged_quantity, ib.quantity,
+           iv.quantity AS valuation_quantity,
+           (SELECT COALESCE(SUM(remaining_quantity), 0)
+              FROM inventory_fifo_layers WHERE product_id = ?) AS fifo_quantity,
+           (SELECT COUNT(*) FROM audit_events
+              WHERE action = 'SALE_RETURNED') AS audits
+         FROM inventory_balances ib
+         INNER JOIN inventory_valuations iv
+           ON iv.tenant_id = ib.tenant_id AND iv.product_id = ib.product_id
+         WHERE ib.product_id = ? AND ib.location_id = ?`,
+        [saleId, saleId, saleId, productId, productId, locationId],
+      );
+      expect({
+        returns: Number(state.returns),
+        returnLines: Number(state.return_lines),
+        returnMovements: Number(state.return_movements),
+        available: state.available_quantity,
+        damaged: state.damaged_quantity,
+        quantity: state.quantity,
+        valuation: state.valuation_quantity,
+        fifo: state.fifo_quantity,
+        audits: Number(state.audits),
+      }).toEqual({
+        returns: 2,
+        returnLines: 2,
+        returnMovements: 2,
+        available: '1.000',
+        damaged: '2.000',
+        quantity: '3.000',
+        valuation: '3.000',
+        fifo: '3.000',
+        audits: 2,
+      });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .query({ productId, type: 'SALE_RETURN' })
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toHaveLength(2);
+          expect(body.data[0]).toMatchObject({
+            type: 'SALE_RETURN',
+            direction: 'IN',
+            responsible: { email: registrationPayload.email },
+            document: { type: 'SALE_RETURN' },
+          });
+        });
+    });
+
     it('voids a sale once with payment, stock, cash and audit compensation', async () => {
       const { cookie, productId, locationId } = await preparePos();
       const sale = await request(app.getHttpServer())
@@ -9887,6 +10102,21 @@ describe('UInventario API (e2e)', () => {
         .set('Cookie', cookie)
         .set('Idempotency-Key', 'pos-void-branch-scope')
         .send({ reason: 'No debe revelar la venta' })
+        .expect(404);
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${saleId}/returns`)
+        .set('Cookie', cookie)
+        .expect(404);
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'pos-return-branch-scope')
+        .send({
+          reason: 'No debe revelar la venta',
+          lines: [
+            { saleLineId: randomUUID(), quantity: '1', condition: 'SELLABLE' },
+          ],
+        })
         .expect(404);
     });
 
@@ -13092,6 +13322,47 @@ describe('UInventario API (e2e)', () => {
           },
         );
 
+      const partialLotSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-partial-return-sale')
+        .send({
+          lines: [{ productId, lotId: lotB.id, quantity: '2' }],
+          payment: { method: 'CASH', amountReceived: '20.00' },
+        })
+        .expect(201);
+      const partialLotSaleData = partialLotSale.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${partialLotSaleData.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-partial-return')
+        .send({
+          reason: 'Una unidad regresa en buen estado',
+          lines: [
+            {
+              saleLineId: partialLotSaleData.data.lines[0].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/lots`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [
+              { code: 'LOT-A', quantity: '3.000' },
+              { code: 'LOT-B', quantity: '3.000' },
+            ],
+            meta: { totalQuantity: '6.000', reconciled: true },
+          }),
+        );
+
       const isolated = {
         organizationName: 'Otro tenant lotes',
         email: 'otro-lotes@example.com',
@@ -13331,6 +13602,68 @@ describe('UInventario API (e2e)', () => {
               { type: 'STATE_TRANSITION', toStatus: 'AVAILABLE' },
               { type: 'SALE', toStatus: 'SOLD' },
               { type: 'SALE_VOID', toStatus: 'AVAILABLE' },
+            ]);
+          },
+        );
+
+      const returnableSerialSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-return-sale')
+        .send({
+          lines: [
+            {
+              productId,
+              quantity: '1',
+              serialNumbers: ['SN-0001'],
+            },
+          ],
+          payment: { method: 'CASH', amountReceived: '150.00' },
+        })
+        .expect(201);
+      const returnableSerialSaleData = returnableSerialSale.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${returnableSerialSaleData.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-return')
+        .send({
+          reason: 'Equipo devuelto con serie verificada',
+          lines: [
+            {
+              saleLineId: returnableSerialSaleData.data.lines[0].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+              serialNumbers: ['sn-0001'],
+            },
+          ],
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/serials/${serialId}/history`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: {
+                serial: { status: string };
+                events: Array<{ movement: { type: string }; toStatus: string }>;
+              };
+            };
+          }) => {
+            expect(body.data.serial.status).toBe('AVAILABLE');
+            expect(
+              body.data.events.slice(-2).map(({ movement, toStatus }) => ({
+                type: movement.type,
+                toStatus,
+              })),
+            ).toEqual([
+              { type: 'SALE', toStatus: 'SOLD' },
+              { type: 'SALE_RETURN', toStatus: 'AVAILABLE' },
             ]);
           },
         );

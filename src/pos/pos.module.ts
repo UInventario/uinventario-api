@@ -22,10 +22,13 @@ import {
   SALE_RECEIPT_EMAIL_ADAPTER,
   SimulatorSaleReceiptEmailAdapter,
 } from './sale-receipt-email.adapter';
+import { SaleReturnController } from './sale-return.controller';
+import { SaleReturnRepository } from './sale-return.repository';
+import { SaleReturnService } from './sale-return.service';
 
 @Module({
   imports: [SessionModule],
-  controllers: [PosController, SaleReceiptController],
+  controllers: [PosController, SaleReceiptController, SaleReturnController],
   providers: [
     PosRepository,
     SalesRepository,
@@ -41,6 +44,8 @@ import {
     SalesCashReportService,
     SaleReceiptRepository,
     SaleReceiptService,
+    SaleReturnRepository,
+    SaleReturnService,
     SimulatorSaleReceiptEmailAdapter,
     {
       provide: SALE_RECEIPT_EMAIL_ADAPTER,

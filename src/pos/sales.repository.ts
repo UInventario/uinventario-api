@@ -190,7 +190,7 @@ export class SalesRepository {
     const movements = await this.dataSource.query<
       Array<{
         id: string;
-        type: 'SALE' | 'SALE_VOID';
+        type: 'SALE' | 'SALE_VOID' | 'SALE_RETURN';
         sale_line_id: string;
         product_id: string;
         product_name: string;
@@ -211,7 +211,8 @@ export class SalesRepository {
        FROM inventory_movements im
        INNER JOIN products p ON p.id = im.product_id AND p.tenant_id = im.tenant_id
        INNER JOIN locations l ON l.id = im.location_id AND l.tenant_id = im.tenant_id
-       WHERE im.tenant_id = ? AND im.sale_id = ? AND im.type IN ('SALE', 'SALE_VOID')
+       WHERE im.tenant_id = ? AND im.sale_id = ?
+         AND im.type IN ('SALE', 'SALE_VOID', 'SALE_RETURN')
        ORDER BY im.created_at, im.id`,
       [tenantId, saleId],
     );
@@ -314,6 +315,12 @@ export class SalesRepository {
             }
             throw new SaleAlreadyVoidedError();
           }
+          const [saleReturn] = await manager.query<Array<{ id: string }>>(
+            `SELECT id FROM sale_returns
+             WHERE tenant_id = ? AND sale_id = ? LIMIT 1 FOR UPDATE`,
+            [input.tenantId, sale.id],
+          );
+          if (saleReturn) throw new SaleVoidNotAllowedError();
 
           const [shift] = await manager.query<
             Array<{ status: 'OPEN' | 'CLOSED' }>
@@ -951,6 +958,7 @@ export class SalesRepository {
     const row = rows[0];
     const lines = await manager.query<
       Array<{
+        id: string;
         product_id: string;
         product_name: string;
         product_sku: string;
@@ -961,7 +969,7 @@ export class SalesRepository {
         total: string;
       }>
     >(
-      `SELECT product_id, product_name, product_sku, quantity, unit_price,
+      `SELECT id, product_id, product_name, product_sku, quantity, unit_price,
               subtotal, tax, total
        FROM sale_lines WHERE tenant_id = ? AND sale_id = ? ORDER BY line_number`,
       [tenantId, row.id],
@@ -1020,6 +1028,7 @@ export class SalesRepository {
         currency: row.currency,
         taxRate: this.decimal(row.tax_rate, 4),
         lines: lines.map((line) => ({
+          id: line.id,
           product: {
             id: line.product_id,
             name: line.product_name,
