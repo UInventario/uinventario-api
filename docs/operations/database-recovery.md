@@ -6,10 +6,10 @@ job conoce el secret, bucket o Project ID del otro ambiente.
 
 ## Objetivos y alcance
 
-| Ambiente | RPO objetivo | RTO objetivo | Retención | Restore drill |
-| --- | --- | --- | --- | --- |
-| Dev | 24 horas | 4 horas | 14 días | semanal, domingo 05:00 UTC |
-| Prod | 24 horas | 4 horas | 35 días | semanal, domingo 05:00 UTC |
+| Ambiente | RPO objetivo | RTO objetivo | Retención | Restore drill              |
+| -------- | ------------ | ------------ | --------- | -------------------------- |
+| Dev      | 24 horas     | 4 horas      | 14 días   | semanal, domingo 05:00 UTC |
+| Prod     | 24 horas     | 4 horas      | 35 días   | semanal, domingo 05:00 UTC |
 
 El backup incluye esquema, datos, triggers, eventos y rutinas de la base configurada en
 `DATABASE_URL`. Los binarios de aplicación se conservan en Artifact Registry, la
@@ -55,8 +55,16 @@ crea una base temporal cuyo nombre debe cumplir
 
 - tablas presentes;
 - versión y cantidad de migraciones;
-- conteos exactos de tablas críticas de tenant, usuarios, catálogo, stock, ventas y
-  auditoría.
+- conteos exactos de tablas críticas de tenant, usuarios, catálogo, stock, ventas,
+  auditoría, políticas, bloqueos legales y solicitudes de privacidad.
+
+Una restauración que pudiera volver a producción no debe atender tráfico hasta
+reaplicar las solicitudes de privacidad y anonimizaciones confirmadas después del
+instante del backup. El operador compara `privacy_requests` con la evidencia de
+auditoría posterior al RPO, reproduce primero esos cambios en la base aislada y sólo
+entonces autoriza el cambio de servicio. Los datos anonimizados no se reidentifican
+manualmente: permanecen inaccesibles hasta que el ciclo de vida de 14/35 días elimine
+las copias antiguas.
 
 La base temporal se elimina en `finally`. El código rechaza cualquier nombre fuera del
 prefijo o igual a la base fuente, por lo que nunca importa ni elimina Dev/Prod.

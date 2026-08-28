@@ -22,6 +22,9 @@ CRITICAL_TABLES = (
     "sales",
     "sale_lines",
     "audit_events",
+    "privacy_policies",
+    "privacy_legal_holds",
+    "privacy_requests",
 )
 SAFE_ENVIRONMENTS = {"dev", "prod"}
 SAFE_RESTORE_PREFIX = re.compile(r"^uinventario_restore_drill_(dev|prod)_[0-9]{14}_[a-z0-9]{1,24}$")

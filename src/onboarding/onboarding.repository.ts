@@ -57,15 +57,41 @@ export class OnboardingRepository {
     tenantId: string,
     input: { legalName: string; tradeName: string; countryCode: string },
   ): Promise<void> {
-    await this.dataSource.manager.update(
-      TenantEntity,
-      { id: tenantId },
-      {
-        legalName: input.legalName,
-        name: input.tradeName,
-        countryCode: input.countryCode,
-      },
-    );
+    await this.dataSource.transaction(async (manager) => {
+      await manager.update(
+        TenantEntity,
+        { id: tenantId },
+        {
+          legalName: input.legalName,
+          name: input.tradeName,
+          countryCode: input.countryCode,
+        },
+      );
+      const mexican = input.countryCode === 'MX';
+      const minimumDays = mexican ? 1825 : 365;
+      const policyCode = mexican ? 'MX_CFF_ARTICLE_30' : 'DEFAULT_CONSERVATIVE';
+      await manager.query(
+        `INSERT INTO privacy_policies
+          (tenant_id, country_code, minimum_transaction_retention_days,
+           transaction_retention_days, policy_code, version)
+         VALUES (?, ?, ?, ?, ?, 1)
+         ON DUPLICATE KEY UPDATE
+           version = IF(
+             country_code <> VALUES(country_code)
+             OR minimum_transaction_retention_days <> VALUES(minimum_transaction_retention_days),
+             version + 1,
+             version
+           ),
+           country_code = VALUES(country_code),
+           minimum_transaction_retention_days = VALUES(minimum_transaction_retention_days),
+           transaction_retention_days = GREATEST(
+             transaction_retention_days,
+             VALUES(minimum_transaction_retention_days)
+           ),
+           policy_code = VALUES(policy_code)`,
+        [tenantId, input.countryCode, minimumDays, minimumDays, policyCode],
+      );
+    });
   }
 
   async findInitialLocation(

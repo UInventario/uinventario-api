@@ -1,12 +1,12 @@
 import {
   BadRequestException,
   Injectable,
-  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { AuditService } from '../audit/audit.service';
+import { StructuredTelemetryService } from '../observability/structured-telemetry.service';
 import type {
   InventoryReconciliationFindingData,
   InventoryReconciliationRunData,
@@ -42,11 +42,10 @@ interface QuantityMismatchRow {
 
 @Injectable()
 export class InventoryReconciliationService {
-  private readonly logger = new Logger(InventoryReconciliationService.name);
-
   constructor(
     private readonly dataSource: DataSource,
     private readonly audit: AuditService,
+    private readonly telemetry: StructuredTelemetryService,
   ) {}
 
   async run(input: {
@@ -839,15 +838,14 @@ export class InventoryReconciliationService {
     tenantId: string,
     run: InventoryReconciliationRunData,
   ): void {
-    this.logger.log(
-      JSON.stringify({
-        event: 'inventory_reconciliation_completed',
-        tenantId,
-        runId: run.id,
-        status: run.overallStatus,
-        ...run.summary,
-        operationsBlocked: run.policy.operationsBlocked,
-      }),
-    );
+    this.telemetry.emit({
+      severity: 'INFO',
+      event: 'inventory_reconciliation_completed',
+      tenantRef: this.telemetry.tenantRef(tenantId),
+      runId: run.id,
+      status: run.overallStatus,
+      ...run.summary,
+      operationsBlocked: run.policy.operationsBlocked,
+    });
   }
 }

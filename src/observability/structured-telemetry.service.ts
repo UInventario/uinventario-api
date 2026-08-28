@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { pseudonymizeTenant } from './telemetry-context';
 
 export type TelemetrySeverity = 'INFO' | 'WARNING' | 'ERROR';
 
@@ -39,5 +40,9 @@ export class StructuredTelemetryService {
       payload['logging.googleapis.com/spanId'] = event.spanId;
     }
     process.stdout.write(`${JSON.stringify(payload)}\n`);
+  }
+
+  tenantRef(tenantId: string | undefined): string | undefined {
+    return pseudonymizeTenant(tenantId, this.deploymentEnvironment);
   }
 }

@@ -3,13 +3,13 @@ import {
   ForbiddenException,
   GoneException,
   Injectable,
-  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { Workbook } from 'exceljs';
 import { DataSource } from 'typeorm';
 import type { AppPermission } from '../auth/authorization/authorization.types';
+import { StructuredTelemetryService } from '../observability/structured-telemetry.service';
 import type {
   CreateDataExportDto,
   DataExportDataset,
@@ -59,9 +59,10 @@ const COST_PERMISSIONS: AppPermission[] = ['TENANT_MANAGE', 'PRODUCTS_MANAGE'];
 
 @Injectable()
 export class DataExportService {
-  private readonly logger = new Logger(DataExportService.name);
-
-  constructor(private readonly dataSource: DataSource) {}
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly telemetry: StructuredTelemetryService,
+  ) {}
 
   async create(input: {
     tenantId: string;
@@ -241,14 +242,13 @@ export class DataExportService {
         error instanceof Error && error.message === 'EXPORT_ROW_LIMIT_EXCEEDED'
           ? error.message
           : 'EXPORT_GENERATION_FAILED';
-      this.logger.error(
-        JSON.stringify({
-          event: 'data_export_failed',
-          exportId: id,
-          tenantId,
-          errorType: error instanceof Error ? error.name : 'UnknownError',
-        }),
-      );
+      this.telemetry.emit({
+        severity: 'ERROR',
+        event: 'data_export_failed',
+        exportId: id,
+        tenantRef: this.telemetry.tenantRef(tenantId),
+        errorType: error instanceof Error ? error.name : 'UnknownError',
+      });
       try {
         await this.dataSource.query(
           `UPDATE data_exports SET status = 'FAILED', error_code = ?, file_content = NULL
@@ -256,13 +256,12 @@ export class DataExportService {
           [code, id, tenantId],
         );
       } catch {
-        this.logger.error(
-          JSON.stringify({
-            event: 'data_export_failure_state_write_failed',
-            exportId: id,
-            tenantId,
-          }),
-        );
+        this.telemetry.emit({
+          severity: 'ERROR',
+          event: 'data_export_failure_state_write_failed',
+          exportId: id,
+          tenantRef: this.telemetry.tenantRef(tenantId),
+        });
       }
     }
   }
