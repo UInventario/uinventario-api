@@ -36,11 +36,37 @@ revision_for_service() {
     --format='value(metadata.name)'
 }
 
-current_revision() {
-  gcloud run services describe "$1" \
+current_traffic_target() {
+  service="$1"
+  latest="$(gcloud run services describe "$service" \
+    --project="$project_id" \
+    --region="$region" \
+    --format='value(status.traffic[0].latestRevision)')"
+  case "$latest" in
+    true|True) printf 'LATEST\n'; return ;;
+  esac
+  gcloud run services describe "$service" \
     --project="$project_id" \
     --region="$region" \
     --format='value(status.traffic[0].revisionName)'
+}
+
+route_traffic() {
+  service="$1"
+  target="$2"
+  if [ "$target" = "LATEST" ]; then
+    gcloud run services update-traffic "$service" \
+      --to-latest \
+      --project="$project_id" \
+      --region="$region" \
+      --quiet >/dev/null
+    return
+  fi
+  gcloud run services update-traffic "$service" \
+    --to-revisions="$target=100" \
+    --project="$project_id" \
+    --region="$region" \
+    --quiet >/dev/null
 }
 
 [ "$(revision_for_service uinventario-api "$api_target")" = "$api_target" ] || {
@@ -52,8 +78,8 @@ current_revision() {
   exit 3
 }
 
-api_original="$(current_revision uinventario-api)"
-web_original="$(current_revision uinventario-web)"
+api_original="$(current_traffic_target uinventario-api)"
+web_original="$(current_traffic_target uinventario-web)"
 [ -n "$api_original" ] && [ -n "$web_original" ] || {
   echo "Both services must have one active revision before rollback." >&2
   exit 4
@@ -62,17 +88,9 @@ web_original="$(current_revision uinventario-web)"
 restore_required=false
 
 restore_original() {
-  echo "Restoring original revisions: API=$api_original Web=$web_original" >&2
-  gcloud run services update-traffic uinventario-api \
-    --to-revisions="$api_original=100" \
-    --project="$project_id" \
-    --region="$region" \
-    --quiet >/dev/null
-  gcloud run services update-traffic uinventario-web \
-    --to-revisions="$web_original=100" \
-    --project="$project_id" \
-    --region="$region" \
-    --quiet >/dev/null
+  echo "Restoring original traffic: API=$api_original Web=$web_original" >&2
+  route_traffic uinventario-api "$api_original"
+  route_traffic uinventario-web "$web_original"
 }
 
 cleanup() {
