@@ -39,6 +39,10 @@ template = service.get("spec", {}).get("template", {})
 service_annotations = service.get("metadata", {}).get("annotations", {})
 template_annotations = template.get("metadata", {}).get("annotations", {})
 container_concurrency = template.get("spec", {}).get("containerConcurrency")
+labels = {
+    **service.get("metadata", {}).get("labels", {}),
+    **template.get("metadata", {}).get("labels", {}),
+}
 
 min_scale = service_annotations.get(
     "run.googleapis.com/minScale",
@@ -54,6 +58,8 @@ if max_scale != "3":
     fail(f"Cloud Run maximum instances must be 3; got {max_scale!r}.")
 if container_concurrency != 40:
     fail(f"Cloud Run containerConcurrency must be 40; got {container_concurrency!r}.")
+if labels.get("owner") != "uinventario":
+    fail("Cloud Run owner label must be uinventario.")
 
 print(
     json.dumps(
@@ -62,6 +68,7 @@ print(
             "minInstances": 0,
             "maxInstances": 3,
             "containerConcurrency": 40,
+            "owner": "uinventario",
             "status": "passed",
         }
     )

@@ -73,7 +73,7 @@ gcloud run jobs deploy "$migration_job" \
   --task-timeout=10m \
   --cpu=1 \
   --memory=512Mi \
-  --labels="app=uinventario,environment=${environment},component=migrations" \
+  --labels="app=uinventario,environment=${environment},component=migrations,owner=uinventario" \
   --quiet
 
 gcloud run jobs execute "$migration_job" \
@@ -98,7 +98,7 @@ gcloud run deploy "$service_name" \
   --min=0 \
   --max=3 \
   --timeout=60s \
-  --labels="app=uinventario,environment=${environment},component=api" \
+  --labels="app=uinventario,environment=${environment},component=api,owner=uinventario" \
   --startup-probe=httpGet.path=/health/live,initialDelaySeconds=0,timeoutSeconds=3,periodSeconds=3,failureThreshold=10 \
   --liveness-probe=httpGet.path=/health/live,initialDelaySeconds=10,timeoutSeconds=3,periodSeconds=30,failureThreshold=3 \
   --readiness-probe=httpGet.path=/health/ready,timeoutSeconds=3,periodSeconds=5,failureThreshold=3 \

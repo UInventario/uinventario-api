@@ -1,0 +1,12 @@
+[
+  {
+    "name": "delete-older-than-180-days",
+    "action": { "type": "Delete" },
+    "condition": { "tagState": "any", "olderThan": "180d" }
+  },
+  {
+    "name": "keep-30-recent-versions",
+    "action": { "type": "Keep" },
+    "mostRecentVersions": { "keepCount": 30 }
+  }
+]

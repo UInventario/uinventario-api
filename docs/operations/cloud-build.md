@@ -1,5 +1,7 @@
 # CI/CD con Cloud Build
 
+Los límites de costo, retención y alertas están documentados en [cost-guardrails.md](./cost-guardrails.md).
+
 UIN-24 usa una conexión GitHub regional de segunda generación y cuatro triggers:
 
 | Proyecto | Rama | Trigger API | Trigger Web |
