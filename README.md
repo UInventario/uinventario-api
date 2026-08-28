@@ -74,6 +74,8 @@ El checklist de release, smoke, rollback coordinado y contactos operativos está
 La política versionada de API/offline, ventana de clientes y migraciones
 expand/contract está en
 [`docs/compatibility-policy.md`](docs/compatibility-policy.md).
+El threat model, los límites de confianza, gates adversariales y riesgos residuales
+están en [`docs/security/threat-model-v1.md`](docs/security/threat-model-v1.md).
 
 ## Aislamiento multiempresa
 

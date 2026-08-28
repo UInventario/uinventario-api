@@ -1,0 +1,36 @@
+rules:
+  - id: javascript-dynamic-code-execution
+    message: Dynamic code execution is forbidden in application code.
+    severity: ERROR
+    languages: [javascript, typescript]
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: new Function(...)
+      - pattern: Function(...)
+
+  - id: node-child-process-exec
+    message: Shell command execution requires an explicit security review.
+    severity: ERROR
+    languages: [javascript, typescript]
+    patterns:
+      - pattern-either:
+          - pattern: exec(...)
+          - pattern: execSync(...)
+      - pattern-inside: |
+          import { ..., $EXEC, ... } from 'node:child_process';
+          ...
+
+  - id: unsafe-dom-html-assignment
+    message: Direct HTML assignment bypasses framework escaping.
+    severity: ERROR
+    languages: [javascript, typescript]
+    pattern: $ELEMENT.innerHTML = $VALUE
+
+  - id: angular-sanitizer-bypass
+    message: Angular trust bypass APIs require an explicit security review.
+    severity: ERROR
+    languages: [typescript]
+    pattern-either:
+      - pattern: $SANITIZER.bypassSecurityTrustHtml(...)
+      - pattern: $SANITIZER.bypassSecurityTrustScript(...)
+      - pattern: $SANITIZER.bypassSecurityTrustResourceUrl(...)
