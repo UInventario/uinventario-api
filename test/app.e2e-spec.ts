@@ -2822,6 +2822,9 @@ describe('UInventario API (e2e)', () => {
               {
                 code: 'LOT-PROVEEDOR-100',
                 selectionMode: 'MANUAL',
+                unitCost: '80.0000',
+                currency: 'MXN',
+                valueChange: '-240.0000',
               },
             ],
           });
@@ -2833,12 +2836,276 @@ describe('UInventario API (e2e)', () => {
         .expect(200)
         .expect(({ body }: { body: unknown }) =>
           expect(body).toMatchObject({
-            data: [{ code: 'LOT-PROVEEDOR-100', quantity: '0.000' }],
+            data: [
+              {
+                code: 'LOT-PROVEEDOR-100',
+                quantity: '0.000',
+                unitCost: '80.0000',
+                currency: 'MXN',
+                inventoryValue: '0.0000',
+                origins: [
+                  {
+                    purchaseReceiptLineId: receipt.lines[0].id,
+                    quantity: '5.000',
+                    unitCost: '80.0000',
+                    currency: 'MXN',
+                    receipt: {
+                      id: receipt.id,
+                      documentReference: 'REM-DEV-100',
+                    },
+                    purchaseOrder: { id: order.id },
+                  },
+                ],
+              },
+            ],
             meta: {
               totalQuantity: '0.000',
               lotQuantity: '0.000',
               reconciled: true,
+              currency: 'MXN',
+              inventoryValue: '0.0000',
             },
+          }),
+        );
+    });
+
+    it('values the lot actually sold and preserves its receipt cost on void and return', async () => {
+      await registerAccount('lot-cost-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      const setup = await setupProcurement(
+        registrationPayload.email,
+        cookie,
+        'LotCost',
+        true,
+      );
+
+      const receiveLot = async (
+        suffix: string,
+        quantity: string,
+        unitCost: string,
+      ): Promise<{
+        orderId: string;
+        receiptId: string;
+        receiptLineId: string;
+      }> => {
+        let order!: { id: string; lines: Array<{ id: string }> };
+        await request(app.getHttpServer())
+          .post('/api/v1/purchase-orders')
+          .set('Cookie', cookie)
+          .send({
+            supplierId: setup.supplierId,
+            currency: 'MXN',
+            lines: [
+              {
+                supplierProductId: setup.supplierProductId,
+                quantity,
+                unitCost,
+              },
+            ],
+          })
+          .expect(201)
+          .expect(({ body }: { body: { data: typeof order } }) => {
+            order = body.data;
+          });
+        await request(app.getHttpServer())
+          .post(`/api/v1/purchase-orders/${order.id}/approve`)
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', `lot-cost-approve-${suffix}`)
+          .send({ version: 1 })
+          .expect(200);
+        let receipt!: { id: string; lines: Array<{ id: string }> };
+        await request(app.getHttpServer())
+          .post(`/api/v1/purchase-orders/${order.id}/receipts`)
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', `lot-cost-receive-${suffix}`)
+          .send({
+            version: 2,
+            locationId: setup.locationId,
+            documentReference: `REM-LOT-${suffix}`,
+            lines: [
+              {
+                purchaseOrderLineId: order.lines[0].id,
+                receivedQuantity: quantity,
+                lotCode: `LOT-${suffix}`,
+              },
+            ],
+          })
+          .expect(201)
+          .expect(
+            ({
+              body,
+            }: {
+              body: { data: { receipts: Array<typeof receipt> } };
+            }) => {
+              receipt = body.data.receipts[0];
+            },
+          );
+        return {
+          orderId: order.id,
+          receiptId: receipt.id,
+          receiptLineId: receipt.lines[0].id,
+        };
+      };
+
+      await receiveLot('A', '3.000', '80.00');
+      const lotBReceipt = await receiveLot('B', '4.000', '120.00');
+      const lotResponse = await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${setup.productId}/lots`)
+        .set('Cookie', cookie)
+        .expect(200);
+      const lots = (
+        lotResponse.body as { data: Array<{ id: string; code: string }> }
+      ).data;
+      const lotB = lots.find(({ code }) => code === 'LOT-B')!;
+      expect(lotResponse.body).toMatchObject({
+        data: [
+          {
+            code: 'LOT-A',
+            quantity: '3.000',
+            unitCost: '80.0000',
+            currency: 'MXN',
+            inventoryValue: '240.0000',
+          },
+          {
+            code: 'LOT-B',
+            quantity: '4.000',
+            unitCost: '120.0000',
+            currency: 'MXN',
+            inventoryValue: '480.0000',
+            origins: [
+              {
+                purchaseReceiptLineId: lotBReceipt.receiptLineId,
+                quantity: '4.000',
+                unitCost: '120.0000',
+                currency: 'MXN',
+              },
+            ],
+          },
+        ],
+        meta: {
+          totalQuantity: '7.000',
+          lotQuantity: '7.000',
+          reconciled: true,
+          currency: 'MXN',
+          inventoryValue: '720.0000',
+        },
+      });
+
+      await openCurrentCashRegister(cookie, 'lot-cost-open-shift');
+      const sale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-cost-sale')
+        .send({
+          lines: [
+            { productId: setup.productId, lotId: lotB.id, quantity: '2' },
+          ],
+          payment: { method: 'CASH', amountReceived: '240.00' },
+        })
+        .expect(201);
+      const saleId = (sale.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .query({ productId: setup.productId, type: 'SALE' })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [
+              {
+                lots: [
+                  {
+                    id: lotB.id,
+                    unitCost: '120.0000',
+                    currency: 'MXN',
+                    valueChange: '-240.0000',
+                  },
+                ],
+              },
+            ],
+          }),
+        );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-cost-sale-void')
+        .send({ reason: 'Restaurar el costo específico del lote' })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${lotBReceipt.orderId}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-cost-supplier-return')
+        .send({
+          purchaseReceiptId: lotBReceipt.receiptId,
+          documentReference: 'DEV-LOT-B',
+          reason: 'Devolución parcial del lote B',
+          lines: [
+            {
+              purchaseReceiptLineId: lotBReceipt.receiptLineId,
+              returnedQuantity: '1.000',
+            },
+          ],
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .query({ productId: setup.productId, type: 'SUPPLIER_RETURN' })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [
+              {
+                lots: [
+                  {
+                    id: lotB.id,
+                    unitCost: '120.0000',
+                    currency: 'MXN',
+                    valueChange: '-120.0000',
+                  },
+                ],
+              },
+            ],
+          }),
+        );
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${setup.productId}/lots`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [
+              { code: 'LOT-A', quantity: '3.000', inventoryValue: '240.0000' },
+              { code: 'LOT-B', quantity: '3.000', inventoryValue: '360.0000' },
+            ],
+            meta: {
+              totalQuantity: '6.000',
+              lotQuantity: '6.000',
+              inventoryValue: '600.0000',
+              reconciled: true,
+            },
+          }),
+        );
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .set('Cookie', cookie)
+        .query({ productId: setup.productId })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [
+              {
+                product: { id: setup.productId },
+                totalQuantity: '6.000',
+                lotTracking: {
+                  lotQuantity: '6.000',
+                  reconciled: true,
+                  currency: 'MXN',
+                  inventoryValue: '600.0000',
+                },
+              },
+            ],
           }),
         );
     });
@@ -5093,6 +5360,9 @@ describe('UInventario API (e2e)', () => {
               expect.objectContaining({
                 code: 'LOT-TRANSFER-1',
                 quantityChange: '6.000',
+                unitCost: '4.0000',
+                currency: 'MXN',
+                valueChange: '24.0000',
                 selectionMode: 'TRANSFER',
               }),
             ]);
@@ -5103,6 +5373,9 @@ describe('UInventario API (e2e)', () => {
               expect.objectContaining({
                 code: 'LOT-TRANSFER-1',
                 quantityChange: '-1.000',
+                unitCost: '4.0000',
+                currency: 'MXN',
+                valueChange: '-4.0000',
                 selectionMode: 'AUTOMATIC',
               }),
             ]);
@@ -11352,7 +11625,14 @@ describe('UInventario API (e2e)', () => {
         .expect(200);
       const lots = (
         lotsBeforeSale.body as {
-          data: Array<{ id: string; code: string; quantity: string }>;
+          data: Array<{
+            id: string;
+            code: string;
+            quantity: string;
+            unitCost: string;
+            currency: string;
+            inventoryValue: string;
+          }>;
         }
       ).data;
       expect(lotsBeforeSale.body).toMatchObject({
@@ -11361,11 +11641,33 @@ describe('UInventario API (e2e)', () => {
           totalQuantity: '7.000',
           lotQuantity: '7.000',
           reconciled: true,
+          currency: 'MXN',
+          inventoryValue: '42.0000',
         },
       });
-      expect(lots.map(({ code, quantity }) => ({ code, quantity }))).toEqual([
-        { code: 'LOT-A', quantity: '3.000' },
-        { code: 'LOT-B', quantity: '4.000' },
+      expect(
+        lots.map(({ code, quantity, unitCost, currency, inventoryValue }) => ({
+          code,
+          quantity,
+          unitCost,
+          currency,
+          inventoryValue,
+        })),
+      ).toEqual([
+        {
+          code: 'LOT-A',
+          quantity: '3.000',
+          unitCost: '6.0000',
+          currency: 'MXN',
+          inventoryValue: '18.0000',
+        },
+        {
+          code: 'LOT-B',
+          quantity: '4.000',
+          unitCost: '6.0000',
+          currency: 'MXN',
+          inventoryValue: '24.0000',
+        },
       ]);
       const lotB = lots.find(({ code }) => code === 'LOT-B')!;
 
@@ -11421,6 +11723,9 @@ describe('UInventario API (e2e)', () => {
                   id: lotB.id,
                   code: 'LOT-B',
                   quantityChange: '-2.000',
+                  unitCost: '6.0000',
+                  currency: 'MXN',
+                  valueChange: '-12.0000',
                   selectionMode: 'MANUAL',
                 }),
               ],
@@ -11431,6 +11736,9 @@ describe('UInventario API (e2e)', () => {
               expect.objectContaining({
                 id: lotB.id,
                 quantityChange: '2.000',
+                unitCost: '6.0000',
+                currency: 'MXN',
+                valueChange: '12.0000',
                 selectionMode: 'RESTORE',
               }),
             ]);

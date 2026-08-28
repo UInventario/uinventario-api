@@ -3,6 +3,7 @@ import { EntityManager } from 'typeorm';
 import {
   InsufficientInventoryLotStockError,
   InvalidInventoryLotCodeError,
+  InventoryLotCurrencyMismatchError,
   InventoryLotNotFoundError,
   InventoryLotRequiredError,
 } from './inventory.errors';
@@ -23,6 +24,8 @@ interface MovementLotRow {
   sale_line_id: string | null;
   transfer_line_id: string | null;
   track_lots: number | boolean;
+  unit_cost: string | null;
+  country_code: string;
 }
 
 interface LotBalanceRow {
@@ -31,6 +34,13 @@ interface LotBalanceRow {
 }
 
 const SCALE = 1000n;
+const COST_SCALE = 10000n;
+
+interface LotCostSource {
+  unitCost: string;
+  currency: string;
+  revalue: boolean;
+}
 
 function units(value: string): bigint {
   const negative = value.startsWith('-');
@@ -44,6 +54,40 @@ function decimal(value: bigint): string {
   const negative = value < 0n;
   const absolute = negative ? -value : value;
   return `${negative ? '-' : ''}${absolute / SCALE}.${String(absolute % SCALE).padStart(3, '0')}`;
+}
+
+function costUnits(value: string): bigint {
+  const [whole = '0', fraction = ''] = String(value).trim().split('.');
+  return (
+    BigInt(whole || '0') * COST_SCALE +
+    BigInt(fraction.padEnd(4, '0').slice(0, 4))
+  );
+}
+
+function costDecimal(value: bigint): string {
+  const negative = value < 0n;
+  const absolute = negative ? -value : value;
+  return `${negative ? '-' : ''}${absolute / COST_SCALE}.${String(absolute % COST_SCALE).padStart(4, '0')}`;
+}
+
+function divideRounded(numerator: bigint, denominator: bigint): bigint {
+  if (denominator <= 0n) throw new Error('INVALID_LOT_COST_DIVISOR');
+  const negative = numerator < 0n;
+  const absolute = negative ? -numerator : numerator;
+  const quotient = absolute / denominator;
+  const remainder = absolute % denominator;
+  const rounded = remainder * 2n >= denominator ? quotient + 1n : quotient;
+  return negative ? -rounded : rounded;
+}
+
+function quantityValue(quantity: bigint, unitCost: bigint): bigint {
+  return divideRounded(quantity * unitCost, SCALE);
+}
+
+function currencyFor(countryCode: string): string {
+  if (countryCode === 'MX') return 'MXN';
+  if (countryCode === 'CL') return 'CLP';
+  return 'USD';
 }
 
 function normalizeLotCode(value: string): string {
@@ -60,7 +104,19 @@ async function changeLotBalance(
   lotId: string,
   quantityChange: bigint,
   mode: SelectionMode,
+  costSource?: LotCostSource,
 ): Promise<void> {
+  const [lot] = await manager.query<
+    Array<{ unit_cost: string; currency: string }>
+  >(
+    `SELECT unit_cost, currency FROM inventory_lots
+     WHERE id = ? AND tenant_id = ? FOR UPDATE`,
+    [lotId, movement.tenant_id],
+  );
+  if (!lot) throw new InventoryLotNotFoundError();
+  if (costSource && costSource.currency !== lot.currency) {
+    throw new InventoryLotCurrencyMismatchError();
+  }
   await manager.query(
     `INSERT INTO inventory_lot_balances
        (tenant_id, lot_id, location_id, quantity)
@@ -73,8 +129,34 @@ async function changeLotBalance(
      WHERE tenant_id = ? AND lot_id = ? AND location_id = ? FOR UPDATE`,
     [movement.tenant_id, lotId, movement.location_id],
   );
+  const balances = await manager.query<Array<{ quantity: string }>>(
+    `SELECT quantity FROM inventory_lot_balances
+     WHERE tenant_id = ? AND lot_id = ? FOR UPDATE`,
+    [movement.tenant_id, lotId],
+  );
+  const currentTotal = balances.reduce(
+    (total, item) => total + units(item.quantity),
+    0n,
+  );
   const resulting = units(balance.quantity) + quantityChange;
   if (resulting < 0n) throw new InsufficientInventoryLotStockError();
+  const currentCost = costUnits(lot.unit_cost);
+  const allocationCost = costSource
+    ? costUnits(costSource.unitCost)
+    : currentCost;
+  const newTotal = currentTotal + quantityChange;
+  if (costSource?.revalue && newTotal > 0n) {
+    const newCost = divideRounded(
+      currentTotal * currentCost + quantityChange * allocationCost,
+      newTotal,
+    );
+    if (newCost < 0n) throw new Error('NEGATIVE_INVENTORY_LOT_COST');
+    await manager.query(
+      `UPDATE inventory_lots SET unit_cost = ?
+       WHERE id = ? AND tenant_id = ?`,
+      [costDecimal(newCost), lotId, movement.tenant_id],
+    );
+  }
   await manager.query(
     `UPDATE inventory_lot_balances SET quantity = ?
      WHERE tenant_id = ? AND lot_id = ? AND location_id = ?`,
@@ -83,8 +165,8 @@ async function changeLotBalance(
   await manager.query(
     `INSERT INTO inventory_movement_lots
        (id, tenant_id, movement_id, lot_id, location_id, quantity_change,
-        selection_mode)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        unit_cost, currency, value_change, selection_mode)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       randomUUID(),
       movement.tenant_id,
@@ -92,6 +174,9 @@ async function changeLotBalance(
       lotId,
       movement.location_id,
       decimal(quantityChange),
+      costDecimal(allocationCost),
+      costSource?.currency ?? lot.currency,
+      costDecimal(quantityValue(quantityChange, allocationCost)),
       mode,
     ],
   );
@@ -101,27 +186,52 @@ async function findOrCreateLot(
   manager: EntityManager,
   movement: MovementLotRow,
   rawCode: string,
+  unitCost: string,
+  currency: string,
 ): Promise<string> {
   const code = normalizeLotCode(rawCode);
   const normalizedCode = code.toUpperCase();
-  const [existing] = await manager.query<Array<{ id: string }>>(
-    `SELECT id FROM inventory_lots
+  await manager.query(
+    `SELECT id FROM products
+     WHERE id = ? AND tenant_id = ? FOR UPDATE`,
+    [movement.product_id, movement.tenant_id],
+  );
+  const [productCurrency] = await manager.query<Array<{ currency: string }>>(
+    `SELECT currency FROM inventory_lots
+     WHERE tenant_id = ? AND product_id = ?
+     ORDER BY created_at, id LIMIT 1 FOR UPDATE`,
+    [movement.tenant_id, movement.product_id],
+  );
+  if (productCurrency && productCurrency.currency !== currency) {
+    throw new InventoryLotCurrencyMismatchError();
+  }
+  const [existing] = await manager.query<
+    Array<{ id: string; currency: string }>
+  >(
+    `SELECT id, currency FROM inventory_lots
      WHERE tenant_id = ? AND product_id = ? AND normalized_code = ?
      FOR UPDATE`,
     [movement.tenant_id, movement.product_id, normalizedCode],
   );
-  if (existing) return existing.id;
+  if (existing) {
+    if (existing.currency !== currency)
+      throw new InventoryLotCurrencyMismatchError();
+    return existing.id;
+  }
   const id = randomUUID();
   await manager.query(
     `INSERT INTO inventory_lots
-       (id, tenant_id, product_id, code, normalized_code, created_by_user_id)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+       (id, tenant_id, product_id, code, normalized_code, unit_cost, currency,
+        created_by_user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       id,
       movement.tenant_id,
       movement.product_id,
       code,
       normalizedCode,
+      unitCost,
+      currency,
       movement.created_by_user_id,
     ],
   );
@@ -148,9 +258,14 @@ async function restoreAllocations(
       ? `im.sale_id = ? AND im.sale_line_id = ? AND im.location_id = ?`
       : `im.transfer_line_id = ?`;
   const allocations = await manager.query<
-    Array<{ lot_id: string; quantity_change: string }>
+    Array<{
+      lot_id: string;
+      quantity_change: string;
+      unit_cost: string;
+      currency: string;
+    }>
   >(
-    `SELECT iml.lot_id, iml.quantity_change
+    `SELECT iml.lot_id, iml.quantity_change, iml.unit_cost, iml.currency
      FROM inventory_movement_lots iml
      INNER JOIN inventory_movements im
        ON im.id = iml.movement_id AND im.tenant_id = iml.tenant_id
@@ -170,6 +285,11 @@ async function restoreAllocations(
       allocation.lot_id,
       quantity,
       mode,
+      {
+        unitCost: allocation.unit_cost,
+        currency: allocation.currency,
+        revalue: true,
+      },
     );
     restored += quantity;
   }
@@ -182,6 +302,7 @@ async function consumeLots(
   quantity: bigint,
   preferredLotId?: string,
   preferredLotCode?: string,
+  costSource?: LotCostSource,
 ): Promise<void> {
   let balances: LotBalanceRow[];
   let mode: SelectionMode = 'AUTOMATIC';
@@ -221,7 +342,14 @@ async function consumeLots(
     const available = units(balance.quantity);
     const consumed = available < remaining ? available : remaining;
     if (consumed === 0n) continue;
-    await changeLotBalance(manager, movement, balance.lot_id, -consumed, mode);
+    await changeLotBalance(
+      manager,
+      movement,
+      balance.lot_id,
+      -consumed,
+      mode,
+      costSource,
+    );
     remaining -= consumed;
   }
   if (remaining !== 0n) throw new InsufficientInventoryLotStockError();
@@ -236,9 +364,11 @@ export async function applyInventoryLotTracking(
     `SELECT im.id, im.tenant_id, im.product_id, im.location_id, im.type,
             im.quantity_change, im.created_by_user_id,
             im.purchase_receipt_line_id, im.purchase_return_line_id,
-            im.sale_id, im.sale_line_id, im.transfer_line_id, p.track_lots
+            im.sale_id, im.sale_line_id, im.transfer_line_id, p.track_lots,
+            im.unit_cost, t.country_code
      FROM inventory_movements im
      INNER JOIN products p ON p.id = im.product_id AND p.tenant_id = im.tenant_id
+     INNER JOIN tenants t ON t.id = im.tenant_id
      WHERE im.id = ?`,
     [movementId],
   );
@@ -267,7 +397,13 @@ export async function applyInventoryLotTracking(
       [movement.purchase_receipt_line_id, movement.tenant_id],
     );
     if (!line?.lot_code) throw new InventoryLotRequiredError();
-    const lotId = await findOrCreateLot(manager, movement, line.lot_code);
+    const lotId = await findOrCreateLot(
+      manager,
+      movement,
+      line.lot_code,
+      line.unit_cost,
+      line.currency,
+    );
     await manager.query(
       `UPDATE purchase_receipt_lines SET lot_id = ?
        WHERE id = ? AND tenant_id = ?`,
@@ -286,7 +422,11 @@ export async function applyInventoryLotTracking(
         line.currency,
       ],
     );
-    await changeLotBalance(manager, movement, lotId, quantityChange, 'ORIGIN');
+    await changeLotBalance(manager, movement, lotId, quantityChange, 'ORIGIN', {
+      unitCost: line.unit_cost,
+      currency: line.currency,
+      revalue: true,
+    });
     return;
   }
 
@@ -301,24 +441,52 @@ export async function applyInventoryLotTracking(
 
   if (quantityChange > 0n) {
     if (!options.lotCode) throw new InventoryLotRequiredError();
-    const lotId = await findOrCreateLot(manager, movement, options.lotCode);
-    await changeLotBalance(manager, movement, lotId, quantityChange, 'MANUAL');
+    if (!movement.unit_cost) throw new Error('INVENTORY_LOT_COST_NOT_FOUND');
+    const currency = currencyFor(movement.country_code);
+    const lotId = await findOrCreateLot(
+      manager,
+      movement,
+      options.lotCode,
+      movement.unit_cost,
+      currency,
+    );
+    await changeLotBalance(manager, movement, lotId, quantityChange, 'MANUAL', {
+      unitCost: movement.unit_cost,
+      currency,
+      revalue: true,
+    });
     return;
   }
 
   let preferredLotId = options.preferredLotId;
+  let costSource: LotCostSource | undefined;
   if (movement.type === 'SUPPLIER_RETURN') {
-    const [source] = await manager.query<Array<{ lot_id: string | null }>>(
-      `SELECT prl.lot_id
+    const [source] = await manager.query<
+      Array<{
+        lot_id: string | null;
+        unit_cost: string;
+        currency: string;
+      }>
+    >(
+      `SELECT prl.lot_id, prl.unit_cost, po.currency
        FROM purchase_return_lines prtn
        INNER JOIN purchase_receipt_lines prl
          ON prl.id = prtn.purchase_receipt_line_id
         AND prl.tenant_id = prtn.tenant_id
+       INNER JOIN purchase_receipts pr
+         ON pr.id = prl.receipt_id AND pr.tenant_id = prl.tenant_id
+       INNER JOIN purchase_orders po
+         ON po.id = pr.purchase_order_id AND po.tenant_id = pr.tenant_id
        WHERE prtn.id = ? AND prtn.tenant_id = ?`,
       [movement.purchase_return_line_id, movement.tenant_id],
     );
     if (!source?.lot_id) throw new Error('INVENTORY_LOT_SOURCE_NOT_FOUND');
     preferredLotId = source.lot_id;
+    costSource = {
+      unitCost: source.unit_cost,
+      currency: source.currency,
+      revalue: false,
+    };
     await manager.query(
       `UPDATE purchase_return_lines SET lot_id = ?
        WHERE id = ? AND tenant_id = ?`,
@@ -331,5 +499,6 @@ export async function applyInventoryLotTracking(
     -quantityChange,
     preferredLotId,
     options.lotCode,
+    costSource,
   );
 }

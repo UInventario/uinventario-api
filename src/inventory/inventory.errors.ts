@@ -69,3 +69,9 @@ export class InsufficientInventoryLotStockError extends Error {
     super('INSUFFICIENT_INVENTORY_LOT_STOCK');
   }
 }
+
+export class InventoryLotCurrencyMismatchError extends Error {
+  constructor() {
+    super('INVENTORY_LOT_CURRENCY_MISMATCH');
+  }
+}

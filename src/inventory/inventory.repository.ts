@@ -98,6 +98,8 @@ export class InventoryRepository {
     tracked: boolean;
     totalQuantity: string;
     lotQuantity: string;
+    currency: string | null;
+    inventoryValue: string;
   }> {
     const [product] = await this.dataSource.query<
       Array<{
@@ -123,6 +125,8 @@ export class InventoryRepository {
       Array<{
         id: string;
         code: string;
+        unit_cost: string;
+        currency: string;
         created_at: Date | string;
         location_id: string | null;
         location_name: string | null;
@@ -130,7 +134,7 @@ export class InventoryRepository {
         quantity: string | null;
       }>
     >(
-      `SELECT il.id, il.code, il.created_at,
+      `SELECT il.id, il.code, il.unit_cost, il.currency, il.created_at,
               l.id AS location_id, l.name AS location_name, l.code AS location_code,
               ilb.quantity
        FROM inventory_lots il
@@ -152,7 +156,11 @@ export class InventoryRepository {
           code: row.code,
           product: { id: product.id, name: product.name, sku: product.sku },
           quantity: '0.000',
+          unitCost: this.normalizeCost(row.unit_cost),
+          currency: row.currency,
+          inventoryValue: '0.0000',
           createdAt: new Date(row.created_at).toISOString(),
+          origins: [],
           balances: [],
         };
         lots.set(row.id, lot);
@@ -173,14 +181,71 @@ export class InventoryRepository {
       }
     }
     const items = [...lots.values()];
+    if (items.length > 0) {
+      const origins = await this.dataSource.query<
+        Array<{
+          lot_id: string;
+          purchase_receipt_line_id: string;
+          quantity: string;
+          unit_cost: string;
+          currency: string;
+          receipt_id: string;
+          document_reference: string;
+          purchase_order_id: string;
+          folio: string;
+        }>
+      >(
+        `SELECT ilo.lot_id, ilo.purchase_receipt_line_id, ilo.quantity,
+                ilo.unit_cost, ilo.currency, pr.id AS receipt_id,
+                pr.document_reference, po.id AS purchase_order_id, po.folio
+         FROM inventory_lot_origins ilo
+         INNER JOIN purchase_receipt_lines prl
+           ON prl.id = ilo.purchase_receipt_line_id AND prl.tenant_id = ilo.tenant_id
+         INNER JOIN purchase_receipts pr
+           ON pr.id = prl.receipt_id AND pr.tenant_id = prl.tenant_id
+         INNER JOIN purchase_orders po
+           ON po.id = pr.purchase_order_id AND po.tenant_id = pr.tenant_id
+         WHERE ilo.tenant_id = ? AND ilo.lot_id IN (${items.map(() => '?').join(', ')})
+         ORDER BY ilo.created_at, ilo.purchase_receipt_line_id`,
+        [tenantId, ...items.map((item) => item.id)],
+      );
+      for (const origin of origins) {
+        lots.get(origin.lot_id)?.origins.push({
+          purchaseReceiptLineId: origin.purchase_receipt_line_id,
+          quantity: this.normalizeDecimal(origin.quantity),
+          unitCost: this.normalizeCost(origin.unit_cost),
+          currency: origin.currency,
+          receipt: {
+            id: origin.receipt_id,
+            documentReference: origin.document_reference,
+          },
+          purchaseOrder: {
+            id: origin.purchase_order_id,
+            folio: origin.folio,
+          },
+        });
+      }
+    }
+    for (const item of items) {
+      item.inventoryValue = this.valuationValue(item.quantity, item.unitCost);
+    }
     const lotQuantity = this.fromUnits(
       items.reduce((sum, lot) => sum + this.toUnits(lot.quantity), 0n),
+    );
+    const currencies = new Set(items.map((item) => item.currency));
+    const inventoryValue = this.fromCostUnits(
+      items.reduce(
+        (sum, item) => sum + this.toCostUnits(item.inventoryValue),
+        0n,
+      ),
     );
     return {
       items,
       tracked: Boolean(product.track_lots),
       totalQuantity: this.normalizeDecimal(product.total_quantity),
       lotQuantity,
+      currency: currencies.size === 1 ? items[0].currency : null,
+      inventoryValue,
     };
   }
 
@@ -336,11 +401,15 @@ export class InventoryRepository {
             lot_id: string;
             code: string;
             quantity_change: string;
+            unit_cost: string;
+            currency: string;
+            value_change: string;
             selection_mode: InventoryLotAllocation['selectionMode'];
           }>
         >(
           `SELECT iml.movement_id, il.id AS lot_id, il.code,
-                  iml.quantity_change, iml.selection_mode
+                  iml.quantity_change, iml.unit_cost, iml.currency,
+                  iml.value_change, iml.selection_mode
            FROM inventory_movement_lots iml
            INNER JOIN inventory_lots il
              ON il.id = iml.lot_id AND il.tenant_id = iml.tenant_id
@@ -356,6 +425,9 @@ export class InventoryRepository {
         id: allocation.lot_id,
         code: allocation.code,
         quantityChange: this.normalizeDecimal(allocation.quantity_change),
+        unitCost: this.normalizeCost(allocation.unit_cost),
+        currency: allocation.currency,
+        valueChange: this.normalizeCost(allocation.value_change),
         selectionMode: allocation.selection_mode,
       });
       allocationsByMovement.set(allocation.movement_id, values);
@@ -542,6 +614,8 @@ export class InventoryRepository {
           average_unit_cost: string;
           total_inventory_value: string;
           lot_quantity: string;
+          lot_inventory_value: string;
+          lot_currency: string | null;
         }>
       >(
         `SELECT p.id AS product_id, p.name AS product_name, p.sku AS product_sku, p.active, p.track_lots,
@@ -561,7 +635,24 @@ export class InventoryRepository {
                   INNER JOIN locations ll
                     ON ll.id = ilb.location_id AND ll.tenant_id = ilb.tenant_id
                   WHERE il.tenant_id = p.tenant_id AND il.product_id = p.id
-                    AND ll.warehouse_id = ?) AS lot_quantity
+                    AND ll.warehouse_id = ?) AS lot_quantity,
+                (SELECT COALESCE(SUM(ilb.quantity * il.unit_cost), 0)
+                  FROM inventory_lots il
+                  INNER JOIN inventory_lot_balances ilb
+                    ON ilb.lot_id = il.id AND ilb.tenant_id = il.tenant_id
+                  INNER JOIN locations ll
+                    ON ll.id = ilb.location_id AND ll.tenant_id = ilb.tenant_id
+                  WHERE il.tenant_id = p.tenant_id AND il.product_id = p.id
+                    AND ll.warehouse_id = ?) AS lot_inventory_value,
+                (SELECT CASE WHEN COUNT(DISTINCT il.currency) = 1
+                             THEN MIN(il.currency) ELSE NULL END
+                  FROM inventory_lots il
+                  INNER JOIN inventory_lot_balances ilb
+                    ON ilb.lot_id = il.id AND ilb.tenant_id = il.tenant_id
+                  INNER JOIN locations ll
+                    ON ll.id = ilb.location_id AND ll.tenant_id = ilb.tenant_id
+                  WHERE il.tenant_id = p.tenant_id AND il.product_id = p.id
+                    AND ll.warehouse_id = ? AND ilb.quantity > 0) AS lot_currency
          FROM products p
          LEFT JOIN inventory_balances ib ON ib.product_id = p.id AND ib.tenant_id = p.tenant_id
          LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
@@ -571,6 +662,8 @@ export class InventoryRepository {
                   iv.quantity, iv.average_unit_cost, iv.inventory_value
          ORDER BY p.created_at DESC, p.id DESC LIMIT ? OFFSET ?`,
         [
+          warehouseId,
+          warehouseId,
           warehouseId,
           warehouseId,
           warehouseId,
@@ -636,6 +729,8 @@ export class InventoryRepository {
                 reconciled:
                   this.toUnits(row.lot_quantity) ===
                   this.toUnits(row.total_quantity),
+                currency: row.lot_currency,
+                inventoryValue: this.normalizeCost(row.lot_inventory_value),
               }
             : null,
         };

@@ -87,6 +87,9 @@ export interface InventoryLotAllocation {
   id: string;
   code: string;
   quantityChange: string;
+  unitCost: string;
+  currency: string;
+  valueChange: string;
   selectionMode: 'ORIGIN' | 'MANUAL' | 'AUTOMATIC' | 'RESTORE' | 'TRANSFER';
 }
 
@@ -95,7 +98,18 @@ export interface InventoryLotData {
   code: string;
   product: { id: string; name: string; sku: string };
   quantity: string;
+  unitCost: string;
+  currency: string;
+  inventoryValue: string;
   createdAt: string;
+  origins: Array<{
+    purchaseReceiptLineId: string;
+    quantity: string;
+    unitCost: string;
+    currency: string;
+    receipt: { id: string; documentReference: string };
+    purchaseOrder: { id: string; folio: string };
+  }>;
   balances: Array<{
     location: InventoryLocationData;
     quantity: string;
@@ -110,6 +124,8 @@ export interface InventoryLotsResponse {
     totalQuantity: string;
     lotQuantity: string;
     reconciled: boolean;
+    currency: string | null;
+    inventoryValue: string;
   };
 }
 
@@ -236,6 +252,8 @@ export interface InventoryStockItem {
   lotTracking: {
     lotQuantity: string;
     reconciled: boolean;
+    currency: string | null;
+    inventoryValue: string;
   } | null;
 }
 
