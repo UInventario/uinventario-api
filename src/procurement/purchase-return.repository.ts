@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
+import { applyInventoryValuation } from '../inventory/inventory-valuation';
 import { ReturnPurchaseReceiptDto } from './dto/return-purchase-receipt.dto';
 import {
   InvalidPurchaseReturnError,
@@ -194,6 +195,7 @@ export class PurchaseReturnRepository {
               this.toUnits(balance.quantity) - item.returned;
             const resultingAvailable =
               this.toUnits(balance.available_quantity) - item.returned;
+            const movementId = randomUUID();
             await manager.query(
               `UPDATE inventory_balances
              SET quantity = ?, available_quantity = ?
@@ -242,7 +244,7 @@ export class PurchaseReturnRepository {
                purchase_return_line_id)
              VALUES (?, ?, ?, ?, 'SUPPLIER_RETURN', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
-                randomUUID(),
+                movementId,
                 input.tenantId,
                 item.receiptLine.product_id,
                 receipt.location_id,
@@ -257,6 +259,7 @@ export class PurchaseReturnRepository {
                 returnLineId,
               ],
             );
+            await applyInventoryValuation(manager, movementId);
           }
           return { returnId, replay: false };
         },

@@ -5,6 +5,7 @@ import {
   IdempotencyConflictError,
   InventoryTargetNotFoundError,
 } from './inventory.errors';
+import { applyInventoryValuation } from './inventory-valuation';
 import {
   InventoryCountAttemptConflictError,
   InventoryCountSessionClosedError,
@@ -398,6 +399,7 @@ export class InventoryCountRepository {
               input.userId,
             ],
           );
+          await applyInventoryValuation(manager, movementId);
         }
         await manager.query(
           `UPDATE inventory_count_session_lines

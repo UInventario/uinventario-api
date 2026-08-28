@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
+import { applyInventoryValuation } from '../inventory/inventory-valuation';
 import {
   PosIdempotencyConflictError,
   PaymentReferenceConflictError,
@@ -357,6 +358,7 @@ export class SalesRepository {
               this.toQuantityUnits(balance.quantity) + restored;
             const resultingAvailable =
               this.toQuantityUnits(balance.available_quantity) + restored;
+            const voidMovementId = randomUUID();
             await manager.query(
               `UPDATE inventory_balances
                SET quantity = ?, available_quantity = ?
@@ -386,7 +388,7 @@ export class SalesRepository {
                  request_fingerprint, created_by_user_id, sale_id, sale_line_id)
                VALUES (?, ?, ?, ?, 'SALE_VOID', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
-                randomUUID(),
+                voidMovementId,
                 input.tenantId,
                 movement.product_id,
                 movement.location_id,
@@ -401,6 +403,7 @@ export class SalesRepository {
                 movement.sale_line_id,
               ],
             );
+            await applyInventoryValuation(manager, voidMovementId);
           }
           const paymentUpdate = await manager.query<{ affectedRows?: number }>(
             `UPDATE sale_payments
@@ -723,6 +726,7 @@ export class SalesRepository {
             for (const [allocationIndex, allocation] of (
               allocations.get(line.product.id) ?? []
             ).entries()) {
+              const movementId = randomUUID();
               await manager.query(
                 `UPDATE inventory_balances
                  SET quantity = ?, available_quantity = ?, reserved_quantity = ?
@@ -756,7 +760,7 @@ export class SalesRepository {
                  reservation_id, reservation_line_id)
                VALUES (?, ?, ?, ?, 'SALE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
-                  randomUUID(),
+                  movementId,
                   input.tenantId,
                   line.product.id,
                   allocation.locationId,
@@ -773,6 +777,7 @@ export class SalesRepository {
                   allocation.reservationLineId ?? null,
                 ],
               );
+              await applyInventoryValuation(manager, movementId);
             }
           }
           for (const payment of input.payments) {
