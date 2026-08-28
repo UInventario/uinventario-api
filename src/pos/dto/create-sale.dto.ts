@@ -63,7 +63,7 @@ export class CreateSaleDto {
 
   @IsOptional()
   @IsArray()
-  @ArrayMinSize(2)
+  @ArrayMinSize(1)
   @ArrayMaxSize(4)
   @ArrayUnique((payment: SalePaymentDto) => payment.method)
   @ValidateNested({ each: true })

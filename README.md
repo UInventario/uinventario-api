@@ -69,6 +69,8 @@ El mapeo automático `develop` → Dev y `master` → Prod, sus identidades y tr
 están en [`docs/operations/cloud-build.md`](docs/operations/cloud-build.md).
 Los objetivos RPO/RTO, la retención y el procedimiento de restore aislado están en
 [`docs/operations/database-recovery.md`](docs/operations/database-recovery.md).
+El checklist de release, smoke, rollback coordinado y contactos operativos está en
+[`docs/operations/production-runbook.md`](docs/operations/production-runbook.md).
 
 ## Aislamiento multiempresa
 
