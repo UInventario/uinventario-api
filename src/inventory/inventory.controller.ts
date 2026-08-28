@@ -148,6 +148,19 @@ export class InventoryController {
     );
   }
 
+  @Get('products/:productId/lots')
+  @RequirePermissions('INVENTORY_VIEW')
+  listLots(
+    @Req() request: AuthenticatedRequest,
+    @Param('productId', new ParseUUIDPipe()) productId: string,
+  ) {
+    return this.inventory.listLots(
+      request.principal.tenant.id,
+      request.principal.context.warehouse!.id,
+      productId,
+    );
+  }
+
   @Post('movements')
   @RequirePermissions('INVENTORY_ADJUST')
   async createMovement(

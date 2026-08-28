@@ -25,8 +25,11 @@ import {
   InventoryMovementHistoryItem,
   InventoryMovementData,
   InventoryStockItem,
+  InventoryLotData,
+  InventoryLotAllocation,
 } from './inventory.types';
 import { applyInventoryValuation } from './inventory-valuation';
+import { applyInventoryLotTracking } from './inventory-lot-tracking';
 
 interface MovementRow {
   id: string;
@@ -84,6 +87,101 @@ export class InventoryRepository {
        WHERE tenant_id = ? AND warehouse_id = ? AND active = TRUE ORDER BY name, id`,
       [tenantId, warehouseId],
     );
+  }
+
+  async listLots(
+    tenantId: string,
+    warehouseId: string,
+    productId: string,
+  ): Promise<{
+    items: InventoryLotData[];
+    tracked: boolean;
+    totalQuantity: string;
+    lotQuantity: string;
+  }> {
+    const [product] = await this.dataSource.query<
+      Array<{
+        id: string;
+        name: string;
+        sku: string;
+        track_lots: number | boolean;
+        total_quantity: string;
+      }>
+    >(
+      `SELECT p.id, p.name, p.sku, p.track_lots,
+              COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.quantity ELSE 0 END), 0) AS total_quantity
+       FROM products p
+       LEFT JOIN inventory_balances ib
+         ON ib.product_id = p.id AND ib.tenant_id = p.tenant_id
+       LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
+       WHERE p.id = ? AND p.tenant_id = ?
+       GROUP BY p.id, p.name, p.sku, p.track_lots`,
+      [warehouseId, productId, tenantId],
+    );
+    if (!product) throw new InventoryTargetNotFoundError();
+    const rows = await this.dataSource.query<
+      Array<{
+        id: string;
+        code: string;
+        created_at: Date | string;
+        location_id: string | null;
+        location_name: string | null;
+        location_code: string | null;
+        quantity: string | null;
+      }>
+    >(
+      `SELECT il.id, il.code, il.created_at,
+              l.id AS location_id, l.name AS location_name, l.code AS location_code,
+              ilb.quantity
+       FROM inventory_lots il
+       LEFT JOIN inventory_lot_balances ilb
+         ON ilb.lot_id = il.id AND ilb.tenant_id = il.tenant_id
+       LEFT JOIN locations l ON l.id = ilb.location_id AND l.tenant_id = ilb.tenant_id
+         AND l.warehouse_id = ?
+       WHERE il.tenant_id = ? AND il.product_id = ?
+         AND (ilb.location_id IS NULL OR l.id IS NOT NULL)
+       ORDER BY il.created_at, il.id, l.created_at, l.id`,
+      [warehouseId, tenantId, productId],
+    );
+    const lots = new Map<string, InventoryLotData>();
+    for (const row of rows) {
+      let lot = lots.get(row.id);
+      if (!lot) {
+        lot = {
+          id: row.id,
+          code: row.code,
+          product: { id: product.id, name: product.name, sku: product.sku },
+          quantity: '0.000',
+          createdAt: new Date(row.created_at).toISOString(),
+          balances: [],
+        };
+        lots.set(row.id, lot);
+      }
+      if (row.location_id && row.quantity !== null) {
+        const quantity = this.normalizeDecimal(row.quantity);
+        lot.balances.push({
+          location: {
+            id: row.location_id,
+            name: row.location_name!,
+            code: row.location_code!,
+          },
+          quantity,
+        });
+        lot.quantity = this.fromUnits(
+          this.toUnits(lot.quantity) + this.toUnits(quantity),
+        );
+      }
+    }
+    const items = [...lots.values()];
+    const lotQuantity = this.fromUnits(
+      items.reduce((sum, lot) => sum + this.toUnits(lot.quantity), 0n),
+    );
+    return {
+      items,
+      tracked: Boolean(product.track_lots),
+      totalQuantity: this.normalizeDecimal(product.total_quantity),
+      lotQuantity,
+    };
   }
 
   async listMovements(
@@ -231,6 +329,37 @@ export class InventoryRepository {
         parameters,
       ),
     ]);
+    const allocations = rows.length
+      ? await this.dataSource.query<
+          Array<{
+            movement_id: string;
+            lot_id: string;
+            code: string;
+            quantity_change: string;
+            selection_mode: InventoryLotAllocation['selectionMode'];
+          }>
+        >(
+          `SELECT iml.movement_id, il.id AS lot_id, il.code,
+                  iml.quantity_change, iml.selection_mode
+           FROM inventory_movement_lots iml
+           INNER JOIN inventory_lots il
+             ON il.id = iml.lot_id AND il.tenant_id = iml.tenant_id
+           WHERE iml.tenant_id = ? AND iml.movement_id IN (${rows.map(() => '?').join(', ')})
+           ORDER BY iml.created_at, iml.id`,
+          [tenantId, ...rows.map((row) => row.id)],
+        )
+      : [];
+    const allocationsByMovement = new Map<string, InventoryLotAllocation[]>();
+    for (const allocation of allocations) {
+      const values = allocationsByMovement.get(allocation.movement_id) ?? [];
+      values.push({
+        id: allocation.lot_id,
+        code: allocation.code,
+        quantityChange: this.normalizeDecimal(allocation.quantity_change),
+        selectionMode: allocation.selection_mode,
+      });
+      allocationsByMovement.set(allocation.movement_id, values);
+    }
     return {
       items: rows.map((row) => ({
         id: row.id,
@@ -341,6 +470,7 @@ export class InventoryRepository {
                     : this.normalizeCost(row.average_unit_cost),
               }
             : null,
+        lots: allocationsByMovement.get(row.id) ?? [],
       })),
       total: Number(countRows[0]?.total ?? 0),
       scope: { branch },
@@ -401,6 +531,7 @@ export class InventoryRepository {
           product_name: string;
           product_sku: string;
           active: number | boolean;
+          track_lots: number | boolean;
           available_quantity: string;
           reserved_quantity: string;
           damaged_quantity: string;
@@ -410,9 +541,10 @@ export class InventoryRepository {
           valuation_quantity: string;
           average_unit_cost: string;
           total_inventory_value: string;
+          lot_quantity: string;
         }>
       >(
-        `SELECT p.id AS product_id, p.name AS product_name, p.sku AS product_sku, p.active,
+        `SELECT p.id AS product_id, p.name AS product_name, p.sku AS product_sku, p.active, p.track_lots,
                 COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.available_quantity ELSE 0 END), 0) AS available_quantity,
                 COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.reserved_quantity ELSE 0 END), 0) AS reserved_quantity,
                 COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.damaged_quantity ELSE 0 END), 0) AS damaged_quantity,
@@ -422,15 +554,24 @@ export class InventoryRepository {
                 COALESCE(iv.quantity, 0) AS valuation_quantity,
                 COALESCE(iv.average_unit_cost, p.cost) AS average_unit_cost,
                 COALESCE(iv.inventory_value, 0) AS total_inventory_value
+                ,(SELECT COALESCE(SUM(ilb.quantity), 0)
+                  FROM inventory_lots il
+                  INNER JOIN inventory_lot_balances ilb
+                    ON ilb.lot_id = il.id AND ilb.tenant_id = il.tenant_id
+                  INNER JOIN locations ll
+                    ON ll.id = ilb.location_id AND ll.tenant_id = ilb.tenant_id
+                  WHERE il.tenant_id = p.tenant_id AND il.product_id = p.id
+                    AND ll.warehouse_id = ?) AS lot_quantity
          FROM products p
          LEFT JOIN inventory_balances ib ON ib.product_id = p.id AND ib.tenant_id = p.tenant_id
          LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
          LEFT JOIN inventory_valuations iv ON iv.product_id = p.id AND iv.tenant_id = p.tenant_id
          WHERE ${where}
-         GROUP BY p.id, p.name, p.sku, p.active, p.cost, p.created_at,
+         GROUP BY p.id, p.name, p.sku, p.active, p.track_lots, p.cost, p.created_at,
                   iv.quantity, iv.average_unit_cost, iv.inventory_value
          ORDER BY p.created_at DESC, p.id DESC LIMIT ? OFFSET ?`,
         [
+          warehouseId,
           warehouseId,
           warehouseId,
           warehouseId,
@@ -467,6 +608,7 @@ export class InventoryRepository {
             name: row.product_name,
             sku: row.product_sku,
             active: Boolean(row.active),
+            trackLots: Boolean(row.track_lots),
           },
           availableQuantity: available,
           totalQuantity: total,
@@ -488,6 +630,14 @@ export class InventoryRepository {
             valueReconciled,
             reconciled: quantityReconciled && valueReconciled,
           },
+          lotTracking: row.track_lots
+            ? {
+                lotQuantity: this.normalizeDecimal(row.lot_quantity),
+                reconciled:
+                  this.toUnits(row.lot_quantity) ===
+                  this.toUnits(row.total_quantity),
+              }
+            : null,
         };
       }),
       total: Number(countRows[0]?.total ?? 0),
@@ -684,6 +834,9 @@ export class InventoryRepository {
             ],
           );
           await applyInventoryValuation(manager, movementId);
+          await applyInventoryLotTracking(manager, movementId, {
+            lotCode: input.dto.lotCode,
+          });
           const movement = await this.findMovement(
             manager,
             input.tenantId,
@@ -823,6 +976,7 @@ export class InventoryRepository {
               ],
             );
             await applyInventoryValuation(manager, movementId);
+            await applyInventoryLotTracking(manager, movementId);
           }
           await manager.query(
             `INSERT INTO inventory_counts
@@ -1001,6 +1155,7 @@ export class InventoryRepository {
             ],
           );
           await applyInventoryValuation(manager, movementId);
+          await applyInventoryLotTracking(manager, movementId);
           const movement = await this.findMovement(
             manager,
             input.tenantId,

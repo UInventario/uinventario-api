@@ -10,6 +10,7 @@ import {
   InventoryImportStaleError,
 } from './inventory-import.errors';
 import { applyInventoryValuation } from './inventory-valuation';
+import { applyInventoryLotTracking } from './inventory-lot-tracking';
 import type {
   InventoryImportPreviewRow,
   InventoryImportResponse,
@@ -453,6 +454,7 @@ export class InventoryImportRepository {
               ],
             );
             await applyInventoryValuation(manager, movementId);
+            await applyInventoryLotTracking(manager, movementId);
             movementCount += 1;
           }
           await manager.query(

@@ -45,3 +45,27 @@ export class InventoryCountConflictError extends Error {
     super('INVENTORY_COUNT_CONFLICT');
   }
 }
+
+export class InvalidInventoryLotCodeError extends Error {
+  constructor() {
+    super('INVALID_INVENTORY_LOT_CODE');
+  }
+}
+
+export class InventoryLotRequiredError extends Error {
+  constructor() {
+    super('INVENTORY_LOT_REQUIRED');
+  }
+}
+
+export class InventoryLotNotFoundError extends Error {
+  constructor() {
+    super('INVENTORY_LOT_NOT_FOUND');
+  }
+}
+
+export class InsufficientInventoryLotStockError extends Error {
+  constructor() {
+    super('INSUFFICIENT_INVENTORY_LOT_STOCK');
+  }
+}

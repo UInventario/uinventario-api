@@ -59,6 +59,11 @@ describe('UInventario API (e2e)', () => {
       'inventory_count_session_lines',
       'inventory_count_sessions',
       'inventory_counts',
+      'inventory_movement_lots',
+      'inventory_lot_origins',
+      'inventory_lot_balances',
+      'inventory_lots',
+      'inventory_valuations',
       'inventory_movements',
       'inventory_import_rows',
       'inventory_imports',
@@ -1471,6 +1476,7 @@ describe('UInventario API (e2e)', () => {
       email: string,
       cookie: string,
       suffix: string,
+      trackLots = false,
     ): Promise<{
       supplierId: string;
       supplierProductId: string;
@@ -1523,6 +1529,7 @@ describe('UInventario API (e2e)', () => {
           sku: `${suffix.toUpperCase()}-1`,
           cost: '85.40',
           price: '119.90',
+          trackLots,
         })
         .expect(201)
         .expect(({ body }: { body: { data: { id: string } } }) => {
@@ -2407,6 +2414,7 @@ describe('UInventario API (e2e)', () => {
                   name: 'Receipts Producto',
                   sku: 'RECEIPTS-1',
                   active: true,
+                  trackLots: false,
                 },
                 totalQuantity: '7.000',
                 averageUnitCost: '80.7714',
@@ -2544,6 +2552,7 @@ describe('UInventario API (e2e)', () => {
         registrationPayload.email,
         cookie,
         'SupplierReturn',
+        true,
       );
       let order!: {
         id: string;
@@ -2587,6 +2596,7 @@ describe('UInventario API (e2e)', () => {
             {
               purchaseOrderLineId: order.lines[0].id,
               receivedQuantity: '5.000',
+              lotCode: 'LOT-PROVEEDOR-100',
             },
           ],
         })
@@ -2670,7 +2680,11 @@ describe('UInventario API (e2e)', () => {
               receipts: [
                 {
                   lines: [
-                    { returnedQuantity: '2.000', returnableQuantity: '3.000' },
+                    {
+                      lotCode: 'LOT-PROVEEDOR-100',
+                      returnedQuantity: '2.000',
+                      returnableQuantity: '3.000',
+                    },
                   ],
                 },
               ],
@@ -2804,9 +2818,29 @@ describe('UInventario API (e2e)', () => {
             product: { id: setup.productId },
             location: { id: setup.locationId },
             document: { type: 'SUPPLIER_RETURN' },
+            lots: [
+              {
+                code: 'LOT-PROVEEDOR-100',
+                selectionMode: 'MANUAL',
+              },
+            ],
           });
           expect(body.meta).toMatchObject({ pagination: { total: 2 } });
         });
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${setup.productId}/lots`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [{ code: 'LOT-PROVEEDOR-100', quantity: '0.000' }],
+            meta: {
+              totalQuantity: '0.000',
+              lotQuantity: '0.000',
+              reconciled: true,
+            },
+          }),
+        );
     });
 
     it('rolls back supplier return, stock and credit state when movement persistence fails', async () => {
@@ -4602,6 +4636,7 @@ describe('UInventario API (e2e)', () => {
           sku: 'TRANSFER-1',
           cost: '4.00',
           price: '8.00',
+          trackLots: true,
         })
         .expect(201);
       const productId = (productResponse.body as { data: { id: string } }).data
@@ -4616,6 +4651,7 @@ describe('UInventario API (e2e)', () => {
           type: 'INITIAL',
           quantity: '10',
           reason: 'Stock para transferir',
+          lotCode: 'LOT-TRANSFER-1',
         })
         .expect(201);
 
@@ -5031,6 +5067,11 @@ describe('UInventario API (e2e)', () => {
                 type: string;
                 correlationId: string;
                 document: { type: string; id: string };
+                lots: Array<{
+                  code: string;
+                  quantityChange: string;
+                  selectionMode: string;
+                }>;
               }>;
             };
           }) => {
@@ -5046,6 +5087,25 @@ describe('UInventario API (e2e)', () => {
                 ({ correlationId }) => correlationId === transferId,
               ),
             ).toBe(true);
+            expect(
+              body.data.find(({ type }) => type === 'TRANSFER_IN')?.lots,
+            ).toEqual([
+              expect.objectContaining({
+                code: 'LOT-TRANSFER-1',
+                quantityChange: '6.000',
+                selectionMode: 'TRANSFER',
+              }),
+            ]);
+            expect(
+              body.data.find(({ type }) => type === 'TRANSFER_DISCREPANCY')
+                ?.lots,
+            ).toEqual([
+              expect.objectContaining({
+                code: 'LOT-TRANSFER-1',
+                quantityChange: '-1.000',
+                selectionMode: 'AUTOMATIC',
+              }),
+            ]);
             expect(body.data.map(({ document }) => document.type)).toContain(
               'RECEIPT',
             );
@@ -11199,6 +11259,219 @@ describe('UInventario API (e2e)', () => {
           ],
         })
         .expect(403);
+    });
+  });
+
+  describe('inventory lot traceability', () => {
+    beforeEach(resetIdentityData);
+
+    it('tracks, selects, restores and reconciles lots without crossing tenants', async () => {
+      await registerAccount('lot-tracking-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Lotes Legal',
+          tradeName: 'Lotes',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Sucursal Lotes',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Lotes',
+          locationName: 'General Lotes',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Lotes' })
+        .expect(200);
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto por lote',
+          sku: 'LOT-001',
+          cost: '6.00',
+          price: '10.00',
+          trackLots: true,
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      expect(productResponse.body).toMatchObject({
+        data: { trackLots: true },
+      });
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-missing-code')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '3',
+          reason: 'Alta de lote',
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) =>
+          expect(body.code).toBe('INVENTORY_LOT_REQUIRED'),
+        );
+      for (const [index, lot] of ['LOT-A', 'LOT-B'].entries()) {
+        await request(app.getHttpServer())
+          .post('/api/v1/inventory/movements')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', `lot-stock-${index}`)
+          .send({
+            productId,
+            locationId: location.id,
+            type: index === 0 ? 'INITIAL' : 'ENTRY',
+            quantity: index === 0 ? '3' : '4',
+            reason: 'Alta de lote',
+            reference: index === 0 ? undefined : 'RECEPCION-LOT-B',
+            lotCode: lot,
+          })
+          .expect(201);
+      }
+      const lotsBeforeSale = await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/lots`)
+        .set('Cookie', cookie)
+        .expect(200);
+      const lots = (
+        lotsBeforeSale.body as {
+          data: Array<{ id: string; code: string; quantity: string }>;
+        }
+      ).data;
+      expect(lotsBeforeSale.body).toMatchObject({
+        meta: {
+          tracked: true,
+          totalQuantity: '7.000',
+          lotQuantity: '7.000',
+          reconciled: true,
+        },
+      });
+      expect(lots.map(({ code, quantity }) => ({ code, quantity }))).toEqual([
+        { code: 'LOT-A', quantity: '3.000' },
+        { code: 'LOT-B', quantity: '4.000' },
+      ]);
+      const lotB = lots.find(({ code }) => code === 'LOT-B')!;
+
+      await openCurrentCashRegister(cookie, 'lot-open-shift');
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [{ productId, lotId: lotB.id, quantity: '5' }] })
+        .expect(409);
+      const saleResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-manual-sale')
+        .send({
+          lines: [{ productId, lotId: lotB.id, quantity: '2' }],
+          payment: { method: 'CASH', amountReceived: '20.00' },
+        })
+        .expect(201);
+      const saleId = (saleResponse.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/lots`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [
+              { code: 'LOT-A', quantity: '3.000' },
+              { code: 'LOT-B', quantity: '2.000' },
+            ],
+            meta: { totalQuantity: '5.000', reconciled: true },
+          }),
+        );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-sale-void')
+        .send({ reason: 'Prueba de restauración de lote' })
+        .expect(201);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .query({ productId, page: 1, pageSize: 20 })
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: Array<{ type: string; lots: unknown[] }> };
+          }) => {
+            expect(body.data.find(({ type }) => type === 'SALE')?.lots).toEqual(
+              [
+                expect.objectContaining({
+                  id: lotB.id,
+                  code: 'LOT-B',
+                  quantityChange: '-2.000',
+                  selectionMode: 'MANUAL',
+                }),
+              ],
+            );
+            expect(
+              body.data.find(({ type }) => type === 'SALE_VOID')?.lots,
+            ).toEqual([
+              expect.objectContaining({
+                id: lotB.id,
+                quantityChange: '2.000',
+                selectionMode: 'RESTORE',
+              }),
+            ]);
+          },
+        );
+
+      const isolated = {
+        organizationName: 'Otro tenant lotes',
+        email: 'otro-lotes@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'lot-isolated-registration')
+        .send(isolated)
+        .expect(201);
+      const isolatedCookie = await createPersistedSession(isolated.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', isolatedCookie)
+        .send({ legalName: 'Otro Lotes', tradeName: 'Otro', countryCode: 'MX' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', isolatedCookie)
+        .send({
+          branchName: 'Otra Sucursal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Otra Bodega',
+          locationName: 'Otra Ubicación',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', isolatedCookie)
+        .send({ name: 'Otra Caja' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/lots`)
+        .set('Cookie', isolatedCookie)
+        .expect(404);
     });
   });
 

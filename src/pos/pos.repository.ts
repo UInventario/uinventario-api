@@ -70,10 +70,11 @@ export class PosRepository {
           sku: string;
           price: string;
           active: number | boolean;
+          track_lots: number | boolean;
           available_quantity: string;
         }>
       >(
-        `SELECT p.id, p.name, p.sku, p.price, p.active,
+        `SELECT p.id, p.name, p.sku, p.price, p.active, p.track_lots,
                 rl.quantity AS available_quantity
          FROM product_reservations r
          INNER JOIN product_reservation_lines rl
@@ -90,6 +91,7 @@ export class PosRepository {
         sku: row.sku,
         price: row.price,
         active: Boolean(row.active),
+        trackLots: Boolean(row.track_lots),
         availableQuantity: this.normalizeQuantity(row.available_quantity),
       }));
     }
@@ -100,16 +102,17 @@ export class PosRepository {
         sku: string;
         price: string;
         active: number | boolean;
+        track_lots: number | boolean;
         available_quantity: string;
       }>
     >(
-      `SELECT p.id, p.name, p.sku, p.price, p.active,
+      `SELECT p.id, p.name, p.sku, p.price, p.active, p.track_lots,
               COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.available_quantity ELSE 0 END), 0) AS available_quantity
        FROM products p
        LEFT JOIN inventory_balances ib ON ib.product_id = p.id AND ib.tenant_id = p.tenant_id
        LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
        WHERE p.tenant_id = ? AND p.id IN (${placeholders})
-       GROUP BY p.id, p.name, p.sku, p.price, p.active`,
+       GROUP BY p.id, p.name, p.sku, p.price, p.active, p.track_lots`,
       [warehouseId, tenantId, ...productIds],
     );
     return rows.map((row) => ({
@@ -118,8 +121,45 @@ export class PosRepository {
       sku: row.sku,
       price: row.price,
       active: Boolean(row.active),
+      trackLots: Boolean(row.track_lots),
       availableQuantity: this.normalizeQuantity(row.available_quantity),
     }));
+  }
+
+  async getSelectedLotAvailability(
+    tenantId: string,
+    warehouseId: string,
+    selections: Array<{ productId: string; lotId: string }>,
+  ): Promise<Map<string, string>> {
+    if (selections.length === 0) return new Map();
+    const filters = selections.map(() => '(il.product_id = ? AND il.id = ?)');
+    const parameters = selections.flatMap((item) => [
+      item.productId,
+      item.lotId,
+    ]);
+    const rows = await this.dataSource.query<
+      Array<{ product_id: string; lot_id: string; quantity: string }>
+    >(
+      `SELECT il.product_id, il.id AS lot_id,
+              COALESCE(SUM(LEAST(ilb.quantity, COALESCE(ib.available_quantity, 0))), 0) AS quantity
+       FROM inventory_lots il
+       LEFT JOIN inventory_lot_balances ilb
+         ON ilb.lot_id = il.id AND ilb.tenant_id = il.tenant_id
+       LEFT JOIN locations l ON l.id = ilb.location_id AND l.tenant_id = ilb.tenant_id
+       LEFT JOIN inventory_balances ib
+         ON ib.tenant_id = ilb.tenant_id AND ib.product_id = il.product_id
+        AND ib.location_id = ilb.location_id
+       WHERE il.tenant_id = ? AND (${filters.join(' OR ')})
+         AND (ilb.location_id IS NULL OR l.warehouse_id = ?)
+       GROUP BY il.product_id, il.id`,
+      [tenantId, ...parameters, warehouseId],
+    );
+    return new Map(
+      rows.map((row) => [
+        `${row.product_id}:${row.lot_id}`,
+        this.normalizeQuantity(row.quantity),
+      ]),
+    );
   }
 
   private normalizeQuantity(value: string): string {
