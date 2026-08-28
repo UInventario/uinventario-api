@@ -59,6 +59,7 @@ export interface OfflineCashSaleSnapshot {
 export type PaymentMethod = 'CASH' | 'CARD' | 'TRANSFER' | 'VOUCHER';
 
 export interface SalePaymentData {
+  id: string;
   method: PaymentMethod;
   status: 'COMPLETED' | 'REVERSED';
   amountReceived: string;

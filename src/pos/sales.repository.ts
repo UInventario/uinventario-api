@@ -1020,6 +1020,7 @@ export class SalesRepository {
     );
     const paymentRows = await manager.query<
       Array<{
+        id: string;
         method: PaymentMethod;
         status: 'COMPLETED' | 'REVERSED';
         amount_received: string;
@@ -1030,12 +1031,13 @@ export class SalesRepository {
         authorization_code: string | null;
       }>
     >(
-      `SELECT method, status, amount_received, amount_applied, change_amount,
+      `SELECT id, method, status, amount_received, amount_applied, change_amount,
               external_reference, provider, authorization_code
        FROM sale_payments WHERE tenant_id = ? AND sale_id = ? ORDER BY created_at, id`,
       [tenantId, row.id],
     );
     const payments: SalePaymentData[] = paymentRows.map((payment) => ({
+      id: payment.id,
       method: payment.method,
       status: payment.status,
       amountReceived: this.decimal(payment.amount_received, 2),

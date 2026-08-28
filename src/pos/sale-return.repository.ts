@@ -7,6 +7,7 @@ import { applyInventorySerialTracking } from '../inventory/inventory-serial-trac
 import { applyInventoryValuation } from '../inventory/inventory-valuation';
 import { CreateSaleReturnDto } from './dto/create-sale-return.dto';
 import { PosIdempotencyConflictError } from './pos.errors';
+import { SaleReturnSettlementRepository } from './sale-return-settlement.repository';
 import {
   SaleReturnData,
   SaleReturnExchangeError,
@@ -41,7 +42,7 @@ interface ReturnRow {
   exchange_sale_id: string | null;
   exchange_receipt_number: string | null;
   reason: string;
-  settlement_status: 'PENDING';
+  settlement_status: 'PENDING' | 'PARTIALLY_SETTLED' | 'SETTLED';
   subtotal: string;
   tax_total: string;
   total: string;
@@ -56,6 +57,7 @@ export class SaleReturnRepository {
   constructor(
     private readonly dataSource: DataSource,
     private readonly audit: AuditService,
+    private readonly settlements: SaleReturnSettlementRepository,
   ) {}
 
   async listBySale(
@@ -78,6 +80,23 @@ export class SaleReturnRepository {
     for (const row of rows)
       result.push(await this.toData(this.dataSource.manager, row));
     return result;
+  }
+
+  async getById(
+    tenantId: string,
+    branchId: string,
+    saleId: string,
+    returnId: string,
+  ): Promise<SaleReturnData | null> {
+    const [row] = await this.dataSource.query<ReturnRow[]>(
+      `${this.returnSelect()}
+       INNER JOIN sales source_sale
+         ON source_sale.id = sr.sale_id AND source_sale.tenant_id = sr.tenant_id
+       WHERE sr.tenant_id = ? AND sr.sale_id = ? AND sr.id = ?
+         AND source_sale.branch_id = ? LIMIT 1`,
+      [tenantId, saleId, returnId, branchId],
+    );
+    return row ? this.toData(this.dataSource.manager, row) : null;
   }
 
   async create(input: {
@@ -576,6 +595,15 @@ export class SaleReturnRepository {
     manager: EntityManager,
     row: ReturnRow,
   ): Promise<SaleReturnData> {
+    const settlements = await this.settlements.list(
+      manager,
+      row.tenant_id,
+      row.id,
+    );
+    const settled = settlements
+      .filter(({ status }) => status === 'COMPLETED')
+      .reduce((sum, settlement) => sum + this.toMoney(settlement.amount), 0n);
+    const refundable = this.toMoney(row.total) - settled;
     const lines = await manager.query<
       Array<{
         id: string;
@@ -614,6 +642,7 @@ export class SaleReturnRepository {
           : null,
       reason: row.reason,
       settlementStatus: row.settlement_status,
+      refundableAmount: this.money(refundable),
       totals: {
         subtotal: this.decimal(row.subtotal, 2),
         tax: this.decimal(row.tax_total, 2),
@@ -621,6 +650,7 @@ export class SaleReturnRepository {
       },
       returnedBy: { id: row.returned_by_user_id, email: row.returned_by_email },
       createdAt: new Date(row.created_at).toISOString(),
+      settlements,
       lines: lines.map((line) => ({
         id: line.id,
         saleLineId: line.sale_line_id,

@@ -14,6 +14,7 @@ import { RequirePermissions } from '../auth/authorization/require-permissions.de
 import { SessionGuard } from '../auth/session/session.guard';
 import type { AuthenticatedRequest } from '../auth/session/session.types';
 import { CreateSaleReturnDto } from './dto/create-sale-return.dto';
+import { CreateSaleReturnSettlementDto } from './dto/create-sale-return-settlement.dto';
 import { PosAccessGuard } from './pos-access.guard';
 import { SaleReturnService } from './sale-return.service';
 
@@ -47,6 +48,27 @@ export class SaleReturnController {
       branchId: request.principal.context.branch!.id,
       userId: request.principal.user.id,
       saleId,
+      idempotencyKey,
+      correlationId: request.requestId!,
+      dto,
+    });
+  }
+
+  @Post(':saleId/returns/:returnId/settlements')
+  settle(
+    @Req() request: AuthenticatedRequest,
+    @Param('saleId', ParseUUIDPipe) saleId: string,
+    @Param('returnId', ParseUUIDPipe) returnId: string,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: CreateSaleReturnSettlementDto,
+  ) {
+    return this.returns.settle({
+      tenantId: request.principal.tenant.id,
+      branchId: request.principal.context.branch!.id,
+      cashRegisterId: request.principal.context.cashRegister!.id,
+      userId: request.principal.user.id,
+      saleId,
+      returnId,
       idempotencyKey,
       correlationId: request.requestId!,
       dto,
