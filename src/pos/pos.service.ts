@@ -9,7 +9,7 @@ import type { ConfigType } from '@nestjs/config';
 import { createHash } from 'node:crypto';
 import { posConfig } from '../config/pos.config';
 import { CreateCashSaleDto } from './dto/create-cash-sale.dto';
-import { CreateSaleDto } from './dto/create-sale.dto';
+import { CreateSaleDto, SalePaymentDto } from './dto/create-sale.dto';
 import { ListSalesDto } from './dto/list-sales.dto';
 import { QuoteCartDto } from './dto/quote-cart.dto';
 import { VoidSaleDto } from './dto/void-sale.dto';
@@ -205,35 +205,12 @@ export class PosService {
         userId: input.userId,
       });
       const totalCents = this.toMoneyCents(quote.data.totals.total);
-      const isCash = input.dto.payment.method === 'CASH';
-      if (isCash && !input.dto.payment.amountReceived) {
-        throw new BadRequestException({
-          code: 'CASH_RECEIVED_REQUIRED',
-          message: 'Indica el efectivo recibido.',
-        });
-      }
-      if (!isCash && !input.dto.payment.reference) {
-        throw new BadRequestException({
-          code: 'PAYMENT_REFERENCE_REQUIRED',
-          message: 'La referencia es obligatoria para pagos no efectivos.',
-        });
-      }
-      const receivedCents = isCash
-        ? this.toMoneyCents(input.dto.payment.amountReceived!)
-        : totalCents;
-      if (isCash && receivedCents < totalCents) {
-        throw new BadRequestException({
-          code: 'INSUFFICIENT_CASH_RECEIVED',
-          message: 'El efectivo recibido no cubre el total de la venta.',
-        });
-      }
-      const authorization = this.paymentAuthorization.authorize({
-        method: input.dto.payment.method,
-        reference: input.dto.payment.reference,
-        amount: quote.data.totals.total,
-        currency: quote.data.currency,
-        idempotencyKey: input.idempotencyKey!,
-      });
+      const payments = this.preparePayments(
+        input.dto,
+        totalCents,
+        quote.data.currency,
+        input.idempotencyKey!,
+      );
       const result = await this.sales.persistSale({
         tenantId: input.tenantId,
         userId: input.userId,
@@ -243,13 +220,7 @@ export class PosService {
         quote: quote.data,
         customerId: input.dto.customerId ?? null,
         reservationId: input.dto.reservationId ?? null,
-        amountReceived: this.fromMoneyCents(receivedCents),
-        change: this.fromMoneyCents(receivedCents - totalCents),
-        payment: {
-          method: input.dto.payment.method,
-          reference: input.dto.payment.reference ?? null,
-          ...authorization,
-        },
+        payments,
       });
       return {
         data: result.sale,
@@ -483,6 +454,88 @@ export class PosService {
     }
   }
 
+  private preparePayments(
+    dto: CreateSaleDto,
+    totalCents: bigint,
+    currency: string,
+    idempotencyKey: string,
+  ) {
+    if ((!dto.payment && !dto.payments) || (dto.payment && dto.payments)) {
+      throw new BadRequestException({
+        code: 'PAYMENT_CONFIGURATION_INVALID',
+        message: 'Indica un pago único o un desglose de pagos, pero no ambos.',
+      });
+    }
+    const source: SalePaymentDto[] = dto.payments ?? [dto.payment!];
+    let appliedTotal = 0n;
+    const payments = source.map((payment, index) => {
+      const amount =
+        payment.amount ??
+        (source.length === 1 ? this.fromMoneyCents(totalCents) : undefined);
+      if (!amount || this.toMoneyCents(amount) <= 0n) {
+        throw new BadRequestException({
+          code: 'PAYMENT_AMOUNT_INVALID',
+          message: 'Cada pago debe tener un importe mayor a cero.',
+        });
+      }
+      const amountCents = this.toMoneyCents(amount);
+      appliedTotal += amountCents;
+      const isCash = payment.method === 'CASH';
+      if (
+        (isCash && payment.reference) ||
+        (!isCash && payment.amountReceived)
+      ) {
+        throw new BadRequestException({
+          code: 'PAYMENT_FIELDS_INVALID',
+          message: 'Los campos del pago no corresponden al medio seleccionado.',
+        });
+      }
+      if (isCash && !payment.amountReceived) {
+        throw new BadRequestException({
+          code: 'CASH_RECEIVED_REQUIRED',
+          message: 'Indica el efectivo recibido.',
+        });
+      }
+      if (!isCash && !payment.reference) {
+        throw new BadRequestException({
+          code: 'PAYMENT_REFERENCE_REQUIRED',
+          message: 'La referencia es obligatoria para pagos no efectivos.',
+        });
+      }
+      const receivedCents = isCash
+        ? this.toMoneyCents(payment.amountReceived!)
+        : amountCents;
+      if (receivedCents < amountCents) {
+        throw new BadRequestException({
+          code: 'INSUFFICIENT_CASH_RECEIVED',
+          message: 'El efectivo recibido no cubre su parte de la venta.',
+        });
+      }
+      const authorization = this.paymentAuthorization.authorize({
+        method: payment.method,
+        reference: payment.reference,
+        amount: this.fromMoneyCents(amountCents),
+        currency,
+        idempotencyKey: `${idempotencyKey}:${index}`,
+      });
+      return {
+        method: payment.method,
+        amountReceived: this.fromMoneyCents(receivedCents),
+        amountApplied: this.fromMoneyCents(amountCents),
+        change: this.fromMoneyCents(receivedCents - amountCents),
+        reference: isCash ? null : payment.reference!,
+        ...authorization,
+      };
+    });
+    if (appliedTotal !== totalCents) {
+      throw new BadRequestException({
+        code: 'PAYMENT_TOTAL_MISMATCH',
+        message: 'La suma de pagos debe coincidir exactamente con el total.',
+      });
+    }
+    return payments;
+  }
+
   private saleFingerprint(dto: CreateSaleDto): string {
     const quantities = new Map<string, bigint>();
     for (const line of dto.lines) {
@@ -499,13 +552,18 @@ export class PosService {
           productId,
           quantity: this.fromQuantityUnits(quantity),
         })),
-      payment: {
-        method: dto.payment.method,
-        amountReceived: dto.payment.amountReceived
-          ? this.fromMoneyCents(this.toMoneyCents(dto.payment.amountReceived))
-          : null,
-        reference: dto.payment.reference ?? null,
-      },
+      payments: (dto.payments ?? (dto.payment ? [dto.payment] : [])).map(
+        (payment) => ({
+          method: payment.method,
+          amount: payment.amount
+            ? this.fromMoneyCents(this.toMoneyCents(payment.amount))
+            : null,
+          amountReceived: payment.amountReceived
+            ? this.fromMoneyCents(this.toMoneyCents(payment.amountReceived))
+            : null,
+          reference: payment.reference ?? null,
+        }),
+      ),
       customerId: dto.customerId ?? null,
       reservationId: dto.reservationId ?? null,
     };
