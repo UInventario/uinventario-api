@@ -85,6 +85,7 @@ export class RegistrationRepository {
         (?, ?, 'SALES_MANAGE'), (?, ?, 'SALES_VOID'),
         (?, ?, 'SALES_RETURN'),
         (?, ?, 'SALES_DISCOUNT'), (?, ?, 'SALE_REPRINT'),
+        (?, ?, 'CASH_DRAWER_OPEN'),
         (?, ?, 'CASH_REGISTER_OPEN'), (?, ?, 'CASH_REGISTER_CLOSE'),
         (?, ?, 'CASH_REGISTER_MOVE'),
         (?, ?, 'ACCESS_MANAGE'),
@@ -98,7 +99,7 @@ export class RegistrationRepository {
         (?, ?, 'INVENTORY_TRANSFER'), (?, ?, 'INVENTORY_COUNT'),
         (?, ?, 'INVENTORY_APPROVE'),
         (?, ?, 'INVENTORY_VALUATION_MANAGE')`,
-      Array.from({ length: 24 }, () => [role.id, tenant.id]).flat(),
+      Array.from({ length: 25 }, () => [role.id, tenant.id]).flat(),
     );
     await manager.query(
       `INSERT INTO privacy_policies
