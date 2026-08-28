@@ -9,3 +9,15 @@ export class ProductVersionConflictError extends Error {
     super('PRODUCT_VERSION_CONFLICT');
   }
 }
+
+export class CatalogClassificationConflictError extends Error {
+  constructor() {
+    super('CATALOG_CLASSIFICATION_CONFLICT');
+  }
+}
+
+export class ProductCodeAmbiguousError extends Error {
+  constructor() {
+    super('PRODUCT_CODE_AMBIGUOUS');
+  }
+}

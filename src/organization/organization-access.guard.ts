@@ -7,13 +7,13 @@ import {
 import type { AuthenticatedRequest } from '../auth/session/session.types';
 
 @Injectable()
-export class AuditAccessGuard implements CanActivate {
+export class OrganizationAccessGuard implements CanActivate {
   canActivate(context: ExecutionContext): boolean {
     const request = context.switchToHttp().getRequest<AuthenticatedRequest>();
-    if (!request.principal.user.roles.includes('ADMIN')) {
+    if (!request.principal.user.permissions.includes('TENANT_MANAGE')) {
       throw new ForbiddenException({
-        code: 'AUDIT_ACCESS_DENIED',
-        message: 'No tienes permisos para consultar la auditoría.',
+        code: 'ORGANIZATION_ACCESS_DENIED',
+        message: 'No tienes permiso para administrar sucursales y bodegas.',
       });
     }
     return true;

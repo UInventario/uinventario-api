@@ -1,6 +1,7 @@
 import { PosRepository } from './pos.repository';
 import { SalesRepository } from './sales.repository';
 import { PosService } from './pos.service';
+import { CashRegisterShiftService } from './cash-register-shift.service';
 
 describe('PosService', () => {
   it('selects the tenant country tax rate without changing the final sale price', async () => {
@@ -26,7 +27,13 @@ describe('PosService', () => {
       repository as unknown as PosRepository,
       {} as SalesRepository,
       {
+        requireCurrent: jest.fn().mockResolvedValue({ id: 'shift' }),
+      } as unknown as CashRegisterShiftService,
+      { enabledMethods: jest.fn().mockReturnValue(['CASH']) } as never,
+      {
         taxRates: { MX: '0.1600', CL: '0.1900', DEFAULT: '0.0000' },
+        nonCashProvider: 'DISABLED',
+        paymentMethods: ['CASH'],
       },
     );
 
@@ -35,6 +42,7 @@ describe('PosService', () => {
       branchId: 'branch',
       warehouseId: 'warehouse',
       cashRegisterId: 'register',
+      userId: 'user',
       dto: {
         lines: [
           {

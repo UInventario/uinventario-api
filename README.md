@@ -58,6 +58,16 @@ compuestas impiden relacionar recursos de tenants distintos.
 
 MySQL 8.4 local corre en Docker con volumen persistente. Dev y Prod reciben una `DATABASE_URL` independiente mediante secretos; el repositorio no contiene credenciales productivas.
 
+El mapeo verificado de nombres, IDs y números de proyecto para Dev/Prod está en
+[`docs/operations/gcp-projects.md`](docs/operations/gcp-projects.md). Todo comando
+de despliegue debe indicar el Project ID explícitamente.
+El contrato validado de variables y nombres de Secret Manager está en
+[`docs/operations/environment-contract.md`](docs/operations/environment-contract.md).
+Las imágenes, recursos mínimos, migración previa y rollback de Cloud Run están en
+[`docs/operations/cloud-run.md`](docs/operations/cloud-run.md).
+El mapeo automático `develop` → Dev y `master` → Prod, sus identidades y triggers
+están en [`docs/operations/cloud-build.md`](docs/operations/cloud-build.md).
+
 ## Aislamiento multiempresa
 
 El tenant y el contexto operativo siempre se derivan de la sesión; los IDs enviados
@@ -96,11 +106,19 @@ credenciales reales; los secretos pertenecen al gestor seguro del ambiente.
 ## Gates
 
 ```bash
-npm run lint
-npm test
-npm run test:e2e
+npm ci
+npm run format:check
+npm run lint:check
+npm run typecheck
+npm run test:ci
 npm run build
+npm run migration:run
+npm run test:e2e:ci
 ```
+
+El workflow `CI` ejecuta esta secuencia en cada PR y push a `develop` o `master`
+con MySQL 8.4 efímero. El job se llama `verify`; cualquier paso fallido detiene el
+job y, por contrato, el pipeline de despliegue debe ejecutar este gate antes de publicar.
 
 ## Ramas
 

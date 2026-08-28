@@ -1,9 +1,15 @@
 import { Request } from 'express';
+import type { AppPermission } from '../authorization/authorization.types';
 
 export interface SessionIdentity {
   sessionId: string;
   expiresAt: Date;
-  user: { id: string; email: string; roles: string[]; permissions: string[] };
+  user: {
+    id: string;
+    email: string;
+    roles: string[];
+    permissions: AppPermission[];
+  };
   tenant: { id: string; name: string };
   context: {
     branch: { id: string; name: string } | null;

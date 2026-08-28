@@ -3,6 +3,7 @@ import {
   ArrayMaxSize,
   ArrayMinSize,
   IsArray,
+  IsOptional,
   IsString,
   IsUUID,
   Matches,
@@ -19,6 +20,10 @@ export class QuoteCartLineDto {
 }
 
 export class QuoteCartDto {
+  @IsUUID()
+  @IsOptional()
+  reservationId?: string;
+
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(100)

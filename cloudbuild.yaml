@@ -1,0 +1,79 @@
+steps:
+  - id: validate-context
+    name: alpine:3.22
+    entrypoint: sh
+    args:
+      - deploy/validate-pipeline-context.sh
+      - ${_DEPLOY_ENV}
+      - $PROJECT_ID
+      - $BRANCH_NAME
+
+  - id: verify
+    name: node:24-alpine
+    entrypoint: sh
+    args:
+      - -ceu
+      - |
+        npm ci
+        npm run format:check
+        npm run lint:check
+        npm run typecheck
+        npm run test:ci
+        npm run build
+
+  - id: build-image
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --tag
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPOSITORY}/api:$COMMIT_SHA
+      - .
+
+  - id: push-image
+    name: gcr.io/cloud-builders/docker
+    entrypoint: sh
+    args:
+      - -ceu
+      - |
+        image="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPOSITORY}/api:$COMMIT_SHA"
+        if docker manifest inspect "$$image" >/dev/null 2>&1; then
+          echo "Image already exists; reusing immutable commit tag."
+        else
+          docker push "$$image"
+        fi
+
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        image="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPOSITORY}/api:$COMMIT_SHA"
+        web_origin="$$(gcloud run services describe uinventario-web --project="$PROJECT_ID" --region="${_REGION}" --format='value(status.url)' 2>/dev/null || true)"
+        if [ -z "$$web_origin" ]; then
+          web_origin="https://placeholder.invalid"
+        fi
+
+        sh deploy/cloud-run.sh "${_DEPLOY_ENV}" "$$image" "$$web_origin"
+
+        api_url="$$(gcloud run services describe uinventario-api --project="$PROJECT_ID" --region="${_REGION}" --format='value(status.url)')"
+        if gcloud run services describe uinventario-web --project="$PROJECT_ID" --region="${_REGION}" >/dev/null 2>&1; then
+          gcloud run services update uinventario-web \
+            --project="$PROJECT_ID" \
+            --region="${_REGION}" \
+            --update-env-vars="DEPLOY_ENV=${_DEPLOY_ENV},API_UPSTREAM=$$api_url" \
+            --quiet
+          web_url="$$(gcloud run services describe uinventario-web --project="$PROJECT_ID" --region="${_REGION}" --format='value(status.url)')"
+          curl --fail --silent --show-error "$$web_url/health/live" >/dev/null
+          curl --fail --silent --show-error "$$web_url/config.json" >/dev/null
+        fi
+
+substitutions:
+  _DEPLOY_ENV: dev
+  _REGION: us-central1
+  _ARTIFACT_REPOSITORY: uinventario
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1800s

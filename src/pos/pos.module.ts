@@ -5,10 +5,36 @@ import { PosController } from './pos.controller';
 import { PosRepository } from './pos.repository';
 import { PosService } from './pos.service';
 import { SalesRepository } from './sales.repository';
+import { CashRegisterShiftRepository } from './cash-register-shift.repository';
+import { CashRegisterShiftService } from './cash-register-shift.service';
+import { CashRegisterMovementRepository } from './cash-register-movement.repository';
+import { CashRegisterMovementService } from './cash-register-movement.service';
+import { CashRegisterClosureRepository } from './cash-register-closure.repository';
+import { CashRegisterClosureService } from './cash-register-closure.service';
+import { PermissionGuard } from '../auth/authorization/permission.guard';
+import { PaymentAuthorizationService } from './payment-authorization.service';
+import { SalesCashReportRepository } from './sales-cash-report.repository';
+import { SalesCashReportService } from './sales-cash-report.service';
 
 @Module({
   imports: [SessionModule],
   controllers: [PosController],
-  providers: [PosRepository, SalesRepository, PosService, PosAccessGuard],
+  providers: [
+    PosRepository,
+    SalesRepository,
+    CashRegisterShiftRepository,
+    CashRegisterShiftService,
+    CashRegisterMovementRepository,
+    CashRegisterMovementService,
+    CashRegisterClosureRepository,
+    CashRegisterClosureService,
+    PermissionGuard,
+    PaymentAuthorizationService,
+    SalesCashReportRepository,
+    SalesCashReportService,
+    PosService,
+    PosAccessGuard,
+  ],
+  exports: [PosService],
 })
 export class PosModule {}

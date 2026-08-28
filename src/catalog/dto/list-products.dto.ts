@@ -1,12 +1,20 @@
 import { Transform, Type } from 'class-transformer';
 import {
+  IsEnum,
   IsInt,
   IsOptional,
   IsString,
   Max,
   MaxLength,
   Min,
+  IsUUID,
 } from 'class-validator';
+
+export enum ProductStatusFilter {
+  ACTIVE = 'ACTIVE',
+  INACTIVE = 'INACTIVE',
+  ALL = 'ALL',
+}
 
 const optionalTrim = ({ value }: { value: unknown }) => {
   if (typeof value !== 'string') return value;
@@ -20,6 +28,21 @@ export class ListProductsDto {
   @IsString()
   @MaxLength(80)
   q?: string;
+
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.trim().toUpperCase() : value,
+  )
+  @IsEnum(ProductStatusFilter)
+  @IsOptional()
+  status = ProductStatusFilter.ACTIVE;
+
+  @IsOptional()
+  @IsUUID()
+  categoryId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  brandId?: string;
 
   @Type(() => Number)
   @IsInt()

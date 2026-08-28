@@ -1,4 +1,50 @@
-export type InventoryMovementType = 'INITIAL' | 'ENTRY' | 'ADJUSTMENT' | 'SALE';
+export const INVENTORY_MOVEMENT_TYPES = [
+  'INITIAL',
+  'ENTRY',
+  'EXIT',
+  'RETURN',
+  'LOSS',
+  'DAMAGE',
+  'ADJUSTMENT',
+  'IMPORT',
+  'STATE_TRANSITION',
+  'TRANSFER_OUT',
+  'TRANSFER_IN',
+  'TRANSFER_RECEIPT',
+  'TRANSFER_DISCREPANCY',
+  'SALE',
+  'SALE_VOID',
+  'PURCHASE_RECEIPT',
+  'SUPPLIER_RETURN',
+] as const;
+
+export type InventoryMovementType = (typeof INVENTORY_MOVEMENT_TYPES)[number];
+export type UserInventoryMovementType = Exclude<
+  InventoryMovementType,
+  | 'STATE_TRANSITION'
+  | 'IMPORT'
+  | 'TRANSFER_OUT'
+  | 'TRANSFER_IN'
+  | 'TRANSFER_RECEIPT'
+  | 'TRANSFER_DISCREPANCY'
+  | 'SALE'
+  | 'SALE_VOID'
+  | 'PURCHASE_RECEIPT'
+  | 'SUPPLIER_RETURN'
+>;
+export type InventoryStockState =
+  'AVAILABLE' | 'RESERVED' | 'DAMAGED' | 'IN_TRANSIT';
+
+export const INVENTORY_STOCK_POLICY = {
+  negativeStock: 'DENY',
+} as const;
+
+export type InventoryStockPolicy = typeof INVENTORY_STOCK_POLICY;
+
+export interface InventoryStateQuantity {
+  code: InventoryStockState;
+  quantity: string;
+}
 
 export interface InventoryLocationData {
   id: string;
@@ -10,6 +56,9 @@ export interface InventoryBalanceData {
   product: { id: string; name: string; sku: string };
   location: InventoryLocationData;
   quantity: string;
+  availableQuantity?: string;
+  totalQuantity?: string;
+  states?: InventoryStateQuantity[];
 }
 
 export interface InventoryMovementData extends InventoryBalanceData {
@@ -19,6 +68,11 @@ export interface InventoryMovementData extends InventoryBalanceData {
   reason: string;
   reference: string | null;
   createdAt: string;
+  stateTransition: {
+    from: InventoryStockState;
+    to: InventoryStockState;
+    quantity: string;
+  } | null;
 }
 
 export interface InventoryLocationsResponse {
@@ -28,7 +82,7 @@ export interface InventoryLocationsResponse {
 
 export interface InventoryBalanceResponse {
   data: InventoryBalanceData;
-  meta: { apiVersion: '1' };
+  meta: { apiVersion: '1'; policy: InventoryStockPolicy };
 }
 
 export interface InventoryMovementResponse {
@@ -36,11 +90,41 @@ export interface InventoryMovementResponse {
   meta: { apiVersion: '1'; idempotentReplay: boolean };
 }
 
+export interface InventoryCountData {
+  id: string;
+  product: { id: string; name: string; sku: string };
+  location: InventoryLocationData;
+  snapshotQuantity: string;
+  countedQuantity: string;
+  varianceQuantity: string;
+  reason: string;
+  reference: string;
+  capturedAt: string;
+  createdAt: string;
+  movementId: string | null;
+}
+
+export interface InventoryCountInput {
+  productId: string;
+  locationId: string;
+  snapshotQuantity: string;
+  countedQuantity: string;
+  reason: string;
+  reference: string;
+  capturedAt: string;
+}
+
+export interface InventoryCountResponse {
+  data: InventoryCountData;
+  meta: { apiVersion: '1'; idempotentReplay: boolean };
+}
+
 export interface InventoryMovementHistoryItem {
   id: string;
   type: InventoryMovementType;
-  direction: 'IN' | 'OUT';
+  direction: 'IN' | 'OUT' | 'TRANSFER';
   quantityChange: string;
+  previousQuantity: string;
   resultingQuantity: string;
   reason: string;
   reference: string | null;
@@ -53,6 +137,26 @@ export interface InventoryMovementHistoryItem {
     warehouse: { id: string; name: string };
   };
   responsible: { id: string; email: string };
+  correlationId: string;
+  idempotencyKey: string;
+  document: {
+    type:
+      | 'MOVEMENT'
+      | 'IMPORT'
+      | 'SALE'
+      | 'TRANSFER'
+      | 'RECEIPT'
+      | 'PURCHASE_RECEIPT'
+      | 'SUPPLIER_RETURN'
+      | 'RESERVATION';
+    id: string;
+    reference: string | null;
+  };
+  stateTransition: {
+    from: InventoryStockState;
+    to: InventoryStockState;
+    quantity: string;
+  } | null;
 }
 
 export interface InventoryMovementListResponse {
@@ -73,13 +177,19 @@ export interface InventoryStockItem {
   product: { id: string; name: string; sku: string; active: boolean };
   availableQuantity: string;
   totalQuantity: string;
-  states: Array<{ code: 'AVAILABLE'; quantity: string }>;
+  states: InventoryStateQuantity[];
+}
+
+export interface InventoryStateTransitionResponse {
+  data: InventoryMovementData;
+  meta: { apiVersion: '1'; idempotentReplay: boolean };
 }
 
 export interface InventoryStockListResponse {
   data: InventoryStockItem[];
   meta: {
     apiVersion: '1';
+    policy: InventoryStockPolicy;
     scope: {
       branch: { id: string; name: string };
       warehouse: { id: string; name: string };

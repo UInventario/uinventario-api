@@ -20,6 +20,14 @@ import { OnboardingModule } from './onboarding/onboarding.module';
 import { PosModule } from './pos/pos.module';
 import { PasswordResetModule } from './auth/password-reset/password-reset.module';
 import { AuditModule } from './audit/audit.module';
+import { OrganizationModule } from './organization/organization.module';
+import { AccessControlModule } from './identity/access-control/access-control.module';
+import { SupplierModule } from './suppliers/supplier.module';
+import { ProcurementModule } from './procurement/procurement.module';
+import { CustomerModule } from './customers/customer.module';
+import { ProductReservationModule } from './reservations/product-reservation.module';
+import { OfflineSyncModule } from './offline-sync/offline-sync.module';
+import { DataExportModule } from './data-exports/data-export.module';
 
 @Module({
   imports: [
@@ -56,9 +64,17 @@ import { AuditModule } from './audit/audit.module';
     PasswordResetModule,
     AuditModule,
     OnboardingModule,
+    OrganizationModule,
+    AccessControlModule,
     CatalogModule,
+    SupplierModule,
+    ProcurementModule,
+    CustomerModule,
+    ProductReservationModule,
+    OfflineSyncModule,
     InventoryModule,
     PosModule,
+    DataExportModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })

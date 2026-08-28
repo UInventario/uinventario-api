@@ -9,23 +9,43 @@ import type { ConfigType } from '@nestjs/config';
 import { createHash } from 'node:crypto';
 import { posConfig } from '../config/pos.config';
 import { CreateCashSaleDto } from './dto/create-cash-sale.dto';
+import { CreateSaleDto, SalePaymentDto } from './dto/create-sale.dto';
 import { ListSalesDto } from './dto/list-sales.dto';
 import { QuoteCartDto } from './dto/quote-cart.dto';
+import { VoidSaleDto } from './dto/void-sale.dto';
 import {
   PosContextNotFoundError,
+  PosCustomerNotAvailableError,
   PosIdempotencyConflictError,
   PosInsufficientStockError,
+  PaymentReferenceConflictError,
   PosProductNotAvailableError,
+  PosReservationNotAvailableError,
+  SaleAlreadyVoidedError,
+  SaleVoidNotAllowedError,
 } from './pos.errors';
 import { PosRepository } from './pos.repository';
 import { SalesRepository } from './sales.repository';
-import { CashSaleResponse, PosCartQuoteResponse } from './pos.types';
+import {
+  CashSaleResponse,
+  OfflineCashSaleSnapshot,
+  PosCartQuoteResponse,
+} from './pos.types';
+import { CashRegisterShiftService } from './cash-register-shift.service';
+import { CashRegisterShiftRequiredError } from './cash-register-shift.errors';
+import {
+  PaymentAuthorizationService,
+  PaymentDeclinedError,
+  PaymentMethodUnavailableError,
+} from './payment-authorization.service';
 
 @Injectable()
 export class PosService {
   constructor(
     private readonly pos: PosRepository,
     private readonly sales: SalesRepository,
+    private readonly shifts: CashRegisterShiftService,
+    private readonly paymentAuthorization: PaymentAuthorizationService,
     @Inject(posConfig.KEY)
     private readonly config: ConfigType<typeof posConfig>,
   ) {}
@@ -58,6 +78,69 @@ export class PosService {
     return { data: sale, meta: { apiVersion: '1' as const } };
   }
 
+  async voidSale(input: {
+    tenantId: string;
+    branchId: string;
+    cashRegisterId: string;
+    userId: string;
+    saleId: string;
+    idempotencyKey: string | undefined;
+    dto: VoidSaleDto;
+    correlationId: string;
+  }) {
+    this.assertIdempotencyKey(input.idempotencyKey);
+    const fingerprint = createHash('sha256')
+      .update(
+        JSON.stringify({ saleId: input.saleId, reason: input.dto.reason }),
+      )
+      .digest('hex');
+    try {
+      const result = await this.sales.voidSale({
+        tenantId: input.tenantId,
+        branchId: input.branchId,
+        cashRegisterId: input.cashRegisterId,
+        userId: input.userId,
+        saleId: input.saleId,
+        reason: input.dto.reason,
+        idempotencyKey: input.idempotencyKey!,
+        fingerprint,
+        correlationId: input.correlationId,
+      });
+      if (!result) throw new NotFoundException();
+      const detail = await this.sales.getSaleDetail(
+        input.tenantId,
+        input.branchId,
+        result.saleId,
+      );
+      if (!detail) throw new NotFoundException();
+      return {
+        data: detail,
+        meta: { apiVersion: '1' as const, idempotentReplay: result.replay },
+      };
+    } catch (error) {
+      if (error instanceof PosIdempotencyConflictError) {
+        throw new ConflictException({
+          code: 'IDEMPOTENCY_KEY_REUSED',
+          message: 'La clave de idempotencia ya fue usada con otros datos.',
+        });
+      }
+      if (error instanceof SaleAlreadyVoidedError) {
+        throw new ConflictException({
+          code: 'SALE_ALREADY_VOIDED',
+          message: 'La venta ya fue anulada.',
+        });
+      }
+      if (error instanceof SaleVoidNotAllowedError) {
+        throw new ConflictException({
+          code: 'SALE_VOID_NOT_ALLOWED',
+          message:
+            'La venta sólo puede anularse mientras su turno de caja siga abierto.',
+        });
+      }
+      throw error;
+    }
+  }
+
   async createCashSale(input: {
     tenantId: string;
     branchId: string;
@@ -66,6 +149,28 @@ export class PosService {
     userId: string;
     idempotencyKey: string | undefined;
     dto: CreateCashSaleDto;
+    expectedSnapshot?: OfflineCashSaleSnapshot;
+  }): Promise<CashSaleResponse> {
+    return this.createSale({
+      ...input,
+      dto: {
+        customerId: input.dto.customerId,
+        reservationId: input.dto.reservationId,
+        lines: input.dto.lines,
+        payment: { method: 'CASH', amountReceived: input.dto.cashReceived },
+      },
+    });
+  }
+
+  async createSale(input: {
+    tenantId: string;
+    branchId: string;
+    warehouseId: string;
+    cashRegisterId: string;
+    userId: string;
+    idempotencyKey: string | undefined;
+    dto: CreateSaleDto;
+    expectedSnapshot?: OfflineCashSaleSnapshot;
   }): Promise<CashSaleResponse> {
     this.assertIdempotencyKey(input.idempotencyKey);
     const fingerprint = this.saleFingerprint(input.dto);
@@ -87,24 +192,35 @@ export class PosService {
         branchId: input.branchId,
         warehouseId: input.warehouseId,
         cashRegisterId: input.cashRegisterId,
-        dto: { lines: input.dto.lines },
+        userId: input.userId,
+        dto: { lines: input.dto.lines, reservationId: input.dto.reservationId },
       });
-      const receivedCents = this.toMoneyCents(input.dto.cashReceived);
-      const totalCents = this.toMoneyCents(quote.data.totals.total);
-      if (receivedCents < totalCents) {
-        throw new BadRequestException({
-          code: 'INSUFFICIENT_CASH_RECEIVED',
-          message: 'El efectivo recibido no cubre el total de la venta.',
-        });
+      if (input.expectedSnapshot) {
+        this.assertOfflineSnapshot(input.expectedSnapshot, quote.data);
       }
-      const result = await this.sales.persistCashSale({
+      const shift = await this.shifts.requireCurrent({
+        tenantId: input.tenantId,
+        branchId: input.branchId,
+        cashRegisterId: input.cashRegisterId,
+        userId: input.userId,
+      });
+      const totalCents = this.toMoneyCents(quote.data.totals.total);
+      const payments = this.preparePayments(
+        input.dto,
+        totalCents,
+        quote.data.currency,
+        input.idempotencyKey!,
+      );
+      const result = await this.sales.persistSale({
         tenantId: input.tenantId,
         userId: input.userId,
         idempotencyKey: input.idempotencyKey!,
         fingerprint,
+        cashRegisterShiftId: shift.id,
         quote: quote.data,
-        amountReceived: this.fromMoneyCents(receivedCents),
-        change: this.fromMoneyCents(receivedCents - totalCents),
+        customerId: input.dto.customerId ?? null,
+        reservationId: input.dto.reservationId ?? null,
+        payments,
       });
       return {
         data: result.sale,
@@ -117,14 +233,88 @@ export class PosService {
           message: 'La clave de idempotencia ya fue usada con otros datos.',
         });
       }
+      if (error instanceof PaymentMethodUnavailableError) {
+        throw new BadRequestException({
+          code: 'PAYMENT_METHOD_UNAVAILABLE',
+          message: 'El medio de pago no está habilitado en este ambiente.',
+        });
+      }
+      if (error instanceof PaymentDeclinedError) {
+        throw new ConflictException({
+          code: 'PAYMENT_DECLINED',
+          message:
+            'La autorización del pago fue rechazada; no se registró la venta.',
+        });
+      }
+      if (error instanceof PaymentReferenceConflictError) {
+        throw new ConflictException({
+          code: 'PAYMENT_REFERENCE_REUSED',
+          message: 'La referencia del pago ya fue utilizada.',
+        });
+      }
       if (error instanceof PosInsufficientStockError) {
         throw new ConflictException({
           code: 'INSUFFICIENT_STOCK',
           productId: error.productId,
         });
       }
+      if (error instanceof PosCustomerNotAvailableError) {
+        throw new BadRequestException({
+          code: 'POS_CUSTOMER_NOT_AVAILABLE',
+          message: 'El cliente no existe o está inactivo.',
+        });
+      }
+      if (error instanceof PosReservationNotAvailableError) {
+        throw new ConflictException({
+          code: 'POS_RESERVATION_NOT_AVAILABLE',
+          message: 'La reserva no está activa o no coincide con esta venta.',
+          status: error.status,
+        });
+      }
+      if (error instanceof CashRegisterShiftRequiredError) {
+        throw new ConflictException({
+          code: 'CASH_REGISTER_SHIFT_REQUIRED',
+          message: 'Abre un turno en la caja activa antes de registrar ventas.',
+        });
+      }
       throw error;
     }
+  }
+
+  async offlinePolicy(input: {
+    tenantId: string;
+    branchId: string;
+    warehouseId: string;
+    cashRegisterId: string;
+    userId: string;
+  }) {
+    const [shiftResponse, context] = await Promise.all([
+      this.shifts.current(input),
+      this.pos.getContext(input),
+    ]);
+    const shift = shiftResponse.data;
+    if (!shift) return null;
+    const taxRate =
+      this.config.taxRates[context.countryCode] ??
+      this.config.taxRates.DEFAULT ??
+      '0.0000';
+    return {
+      shift,
+      currency: this.currencyFor(context.countryCode),
+      taxRate: this.normalizeTaxRate(taxRate),
+      paymentMethods: ['CASH'] as const,
+      negativeStock: 'DENY' as const,
+    };
+  }
+
+  paymentOptions() {
+    return {
+      data: {
+        methods: this.paymentAuthorization.enabledMethods(),
+        nonCashProvider: this.config.nonCashProvider,
+      },
+      meta: { apiVersion: '1' as const },
+    };
   }
 
   async quoteCart(input: {
@@ -132,9 +322,16 @@ export class PosService {
     branchId: string;
     warehouseId: string;
     cashRegisterId: string;
+    userId: string;
     dto: QuoteCartDto;
   }): Promise<PosCartQuoteResponse> {
     try {
+      await this.shifts.requireCurrent({
+        tenantId: input.tenantId,
+        branchId: input.branchId,
+        cashRegisterId: input.cashRegisterId,
+        userId: input.userId,
+      });
       const context = await this.pos.getContext(input);
       const requested = new Map<string, bigint>();
       for (const line of input.dto.lines) {
@@ -154,10 +351,13 @@ export class PosService {
         input.tenantId,
         input.warehouseId,
         [...requested.keys()],
+        input.dto.reservationId,
       );
       const productMap = new Map(
         products.map((product) => [product.id, product]),
       );
+      if (input.dto.reservationId && productMap.size !== requested.size)
+        throw new PosReservationNotAvailableError();
       const taxRate =
         this.config.taxRates[context.countryCode] ??
         this.config.taxRates.DEFAULT ??
@@ -234,6 +434,12 @@ export class PosService {
           productId: error.productId,
         });
       }
+      if (error instanceof PosReservationNotAvailableError) {
+        throw new ConflictException({
+          code: 'POS_RESERVATION_NOT_AVAILABLE',
+          message: 'La reserva no está activa o no coincide con este carrito.',
+        });
+      }
       throw error;
     }
   }
@@ -248,7 +454,89 @@ export class PosService {
     }
   }
 
-  private saleFingerprint(dto: CreateCashSaleDto): string {
+  private preparePayments(
+    dto: CreateSaleDto,
+    totalCents: bigint,
+    currency: string,
+    idempotencyKey: string,
+  ) {
+    if ((!dto.payment && !dto.payments) || (dto.payment && dto.payments)) {
+      throw new BadRequestException({
+        code: 'PAYMENT_CONFIGURATION_INVALID',
+        message: 'Indica un pago único o un desglose de pagos, pero no ambos.',
+      });
+    }
+    const source: SalePaymentDto[] = dto.payments ?? [dto.payment!];
+    let appliedTotal = 0n;
+    const payments = source.map((payment, index) => {
+      const amount =
+        payment.amount ??
+        (source.length === 1 ? this.fromMoneyCents(totalCents) : undefined);
+      if (!amount || this.toMoneyCents(amount) <= 0n) {
+        throw new BadRequestException({
+          code: 'PAYMENT_AMOUNT_INVALID',
+          message: 'Cada pago debe tener un importe mayor a cero.',
+        });
+      }
+      const amountCents = this.toMoneyCents(amount);
+      appliedTotal += amountCents;
+      const isCash = payment.method === 'CASH';
+      if (
+        (isCash && payment.reference) ||
+        (!isCash && payment.amountReceived)
+      ) {
+        throw new BadRequestException({
+          code: 'PAYMENT_FIELDS_INVALID',
+          message: 'Los campos del pago no corresponden al medio seleccionado.',
+        });
+      }
+      if (isCash && !payment.amountReceived) {
+        throw new BadRequestException({
+          code: 'CASH_RECEIVED_REQUIRED',
+          message: 'Indica el efectivo recibido.',
+        });
+      }
+      if (!isCash && !payment.reference) {
+        throw new BadRequestException({
+          code: 'PAYMENT_REFERENCE_REQUIRED',
+          message: 'La referencia es obligatoria para pagos no efectivos.',
+        });
+      }
+      const receivedCents = isCash
+        ? this.toMoneyCents(payment.amountReceived!)
+        : amountCents;
+      if (receivedCents < amountCents) {
+        throw new BadRequestException({
+          code: 'INSUFFICIENT_CASH_RECEIVED',
+          message: 'El efectivo recibido no cubre su parte de la venta.',
+        });
+      }
+      const authorization = this.paymentAuthorization.authorize({
+        method: payment.method,
+        reference: payment.reference,
+        amount: this.fromMoneyCents(amountCents),
+        currency,
+        idempotencyKey: `${idempotencyKey}:${index}`,
+      });
+      return {
+        method: payment.method,
+        amountReceived: this.fromMoneyCents(receivedCents),
+        amountApplied: this.fromMoneyCents(amountCents),
+        change: this.fromMoneyCents(receivedCents - amountCents),
+        reference: isCash ? null : payment.reference!,
+        ...authorization,
+      };
+    });
+    if (appliedTotal !== totalCents) {
+      throw new BadRequestException({
+        code: 'PAYMENT_TOTAL_MISMATCH',
+        message: 'La suma de pagos debe coincidir exactamente con el total.',
+      });
+    }
+    return payments;
+  }
+
+  private saleFingerprint(dto: CreateSaleDto): string {
     const quantities = new Map<string, bigint>();
     for (const line of dto.lines) {
       quantities.set(
@@ -264,9 +552,70 @@ export class PosService {
           productId,
           quantity: this.fromQuantityUnits(quantity),
         })),
-      cashReceived: this.fromMoneyCents(this.toMoneyCents(dto.cashReceived)),
+      payments: (dto.payments ?? (dto.payment ? [dto.payment] : [])).map(
+        (payment) => ({
+          method: payment.method,
+          amount: payment.amount
+            ? this.fromMoneyCents(this.toMoneyCents(payment.amount))
+            : null,
+          amountReceived: payment.amountReceived
+            ? this.fromMoneyCents(this.toMoneyCents(payment.amountReceived))
+            : null,
+          reference: payment.reference ?? null,
+        }),
+      ),
+      customerId: dto.customerId ?? null,
+      reservationId: dto.reservationId ?? null,
     };
     return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+  }
+
+  private assertOfflineSnapshot(
+    expected: OfflineCashSaleSnapshot,
+    current: PosCartQuoteResponse['data'],
+  ): void {
+    const expectedValue = {
+      branchId: expected.branchId,
+      warehouseId: expected.warehouseId,
+      cashRegisterId: expected.cashRegisterId,
+      currency: expected.currency,
+      taxRate: expected.taxRate,
+      paymentMethod: expected.paymentMethod,
+      negativeStock: expected.negativeStock,
+      lines: [...expected.lines].sort((left, right) =>
+        left.productId.localeCompare(right.productId),
+      ),
+      totals: expected.totals,
+    };
+    const currentValue = {
+      branchId: current.context.branch.id,
+      warehouseId: current.context.warehouse.id,
+      cashRegisterId: current.context.cashRegister.id,
+      currency: current.currency,
+      taxRate: current.taxRate,
+      paymentMethod: 'CASH' as const,
+      negativeStock: 'DENY' as const,
+      lines: current.lines
+        .map((line) => ({
+          productId: line.product.id,
+          name: line.product.name,
+          sku: line.product.sku,
+          quantity: line.quantity,
+          unitPrice: line.unitPrice,
+          subtotal: line.subtotal,
+          tax: line.tax,
+          total: line.total,
+        }))
+        .sort((left, right) => left.productId.localeCompare(right.productId)),
+      totals: current.totals,
+    };
+    if (JSON.stringify(expectedValue) !== JSON.stringify(currentValue)) {
+      throw new ConflictException({
+        code: 'OFFLINE_SALE_SNAPSHOT_CONFLICT',
+        message:
+          'Precio, impuesto o contexto cambiaron desde la captura offline; la venta requiere conciliación.',
+      });
+    }
   }
 
   private toQuantityUnits(value: string): bigint {

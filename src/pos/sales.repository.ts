@@ -3,21 +3,33 @@ import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import {
   PosIdempotencyConflictError,
+  PaymentReferenceConflictError,
+  PosCustomerNotAvailableError,
   PosInsufficientStockError,
+  PosReservationNotAvailableError,
+  SaleAlreadyVoidedError,
+  SaleVoidNotAllowedError,
 } from './pos.errors';
 import { ListSalesDto } from './dto/list-sales.dto';
+import { CashRegisterShiftRequiredError } from './cash-register-shift.errors';
 import {
   CashSaleData,
   PosCartQuoteResponse,
+  SalePaymentData,
   SaleDetailData,
   SaleSummaryData,
 } from './pos.types';
+import type { PaymentMethod } from './dto/create-sale.dto';
+import { AuditService } from '../audit/audit.service';
 
 interface SaleRow {
   id: string;
   receipt_number: string;
-  status: 'COMPLETED';
+  status: 'COMPLETED' | 'VOIDED';
   created_by_user_id: string;
+  customer_id: string | null;
+  customer_name: string | null;
+  customer_identifier: string | null;
   currency: string;
   tax_rate: string;
   subtotal: string;
@@ -32,20 +44,27 @@ interface SaleRow {
   cash_register_id: string;
   cash_register_name: string;
   cash_register_code: string;
-  amount_received: string;
-  amount_applied: string;
-  change_amount: string;
+  voided_by_user_id: string | null;
+  voided_by_email: string | null;
+  void_reason: string | null;
+  voided_at: Date | string | null;
 }
 
 interface StockAllocation {
   locationId: string;
   quantityChange: string;
   resultingQuantity: string;
+  resultingAvailableQuantity: string;
+  resultingReservedQuantity: string;
+  reservationLineId?: string;
 }
 
 @Injectable()
 export class SalesRepository {
-  constructor(private readonly dataSource: DataSource) {}
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly audit: AuditService,
+  ) {}
 
   async listSales(
     tenantId: string,
@@ -77,23 +96,33 @@ export class SalesRepository {
         Array<{
           id: string;
           receipt_number: string;
-          status: 'COMPLETED';
+          status: 'COMPLETED' | 'VOIDED';
           user_id: string;
           user_email: string;
+          customer_id: string | null;
+          customer_name: string | null;
+          customer_identifier: string | null;
           cash_register_id: string;
           cash_register_name: string;
           cash_register_code: string;
           currency: string;
           total: string;
           created_at: Date | string;
+          payment_method: PaymentMethod | 'MIXED';
         }>
       >(
         `SELECT s.id, s.receipt_number, s.status,
                 u.id AS user_id, u.email AS user_email,
+                c.id AS customer_id, c.name AS customer_name,
+                c.identifier AS customer_identifier,
                 cr.id AS cash_register_id, cr.name AS cash_register_name,
-                cr.code AS cash_register_code, s.currency, s.total, s.created_at
+                cr.code AS cash_register_code, s.currency, s.total, s.created_at,
+                (SELECT CASE WHEN COUNT(*) = 1 THEN MAX(sp.method) ELSE 'MIXED' END
+                 FROM sale_payments sp
+                 WHERE sp.sale_id = s.id AND sp.tenant_id = s.tenant_id) AS payment_method
          FROM sales s
          INNER JOIN users u ON u.id = s.created_by_user_id AND u.tenant_id = s.tenant_id
+         LEFT JOIN customers c ON c.id = s.customer_id AND c.tenant_id = s.tenant_id
          INNER JOIN cash_registers cr ON cr.id = s.cash_register_id AND cr.tenant_id = s.tenant_id
          WHERE ${where}
          ORDER BY s.created_at DESC, s.id DESC LIMIT ? OFFSET ?`,
@@ -110,6 +139,13 @@ export class SalesRepository {
         receiptNumber: row.receipt_number,
         status: row.status,
         user: { id: row.user_id, email: row.user_email },
+        customer: row.customer_id
+          ? {
+              id: row.customer_id,
+              name: row.customer_name!,
+              identifier: row.customer_identifier,
+            }
+          : null,
         cashRegister: {
           id: row.cash_register_id,
           name: row.cash_register_name,
@@ -117,7 +153,7 @@ export class SalesRepository {
         },
         currency: row.currency,
         total: this.decimal(row.total, 2),
-        paymentMethod: 'CASH',
+        paymentMethod: row.payment_method,
         createdAt: new Date(row.created_at).toISOString(),
       })),
       total: Number(countRows[0]?.total ?? 0),
@@ -148,6 +184,7 @@ export class SalesRepository {
     const movements = await this.dataSource.query<
       Array<{
         id: string;
+        type: 'SALE' | 'SALE_VOID';
         sale_line_id: string;
         product_id: string;
         product_name: string;
@@ -161,14 +198,14 @@ export class SalesRepository {
         created_at: Date | string;
       }>
     >(
-      `SELECT im.id, im.sale_line_id, p.id AS product_id,
+      `SELECT im.id, im.type, im.sale_line_id, p.id AS product_id,
               p.name AS product_name, p.sku AS product_sku,
               l.id AS location_id, l.name AS location_name, l.code AS location_code,
               im.quantity_change, im.resulting_quantity, im.reference, im.created_at
        FROM inventory_movements im
        INNER JOIN products p ON p.id = im.product_id AND p.tenant_id = im.tenant_id
        INNER JOIN locations l ON l.id = im.location_id AND l.tenant_id = im.tenant_id
-       WHERE im.tenant_id = ? AND im.sale_id = ? AND im.type = 'SALE'
+       WHERE im.tenant_id = ? AND im.sale_id = ? AND im.type IN ('SALE', 'SALE_VOID')
        ORDER BY im.created_at, im.id`,
       [tenantId, saleId],
     );
@@ -178,6 +215,7 @@ export class SalesRepository {
       user: { id: userId, email: keys[0].user_email },
       movements: movements.map((movement) => ({
         id: movement.id,
+        type: movement.type,
         saleLineId: movement.sale_line_id,
         product: {
           id: movement.product_id,
@@ -208,14 +246,244 @@ export class SalesRepository {
     );
   }
 
-  async persistCashSale(input: {
+  async voidSale(input: {
+    tenantId: string;
+    branchId: string;
+    cashRegisterId: string;
+    saleId: string;
+    userId: string;
+    reason: string;
+    idempotencyKey: string;
+    fingerprint: string;
+    correlationId: string;
+  }): Promise<{ saleId: string; replay: boolean } | null> {
+    try {
+      return await this.dataSource.transaction(
+        'READ COMMITTED',
+        async (manager) => {
+          const existing = await this.findVoidByKey(
+            manager,
+            input.tenantId,
+            input.idempotencyKey,
+          );
+          if (existing) {
+            if (
+              existing.saleId !== input.saleId ||
+              existing.fingerprint !== input.fingerprint
+            ) {
+              throw new PosIdempotencyConflictError();
+            }
+            return { saleId: existing.saleId, replay: true };
+          }
+
+          const [sale] = await manager.query<
+            Array<{
+              id: string;
+              receipt_number: string;
+              status: 'COMPLETED' | 'VOIDED';
+              cash_register_shift_id: string;
+              void_idempotency_key: string | null;
+              void_request_fingerprint: string | null;
+            }>
+          >(
+            `SELECT id, receipt_number, status, cash_register_shift_id,
+                    void_idempotency_key, void_request_fingerprint
+             FROM sales
+             WHERE id = ? AND tenant_id = ? AND branch_id = ? AND cash_register_id = ?
+             LIMIT 1 FOR UPDATE`,
+            [
+              input.saleId,
+              input.tenantId,
+              input.branchId,
+              input.cashRegisterId,
+            ],
+          );
+          if (!sale) return null;
+          if (sale.status === 'VOIDED') {
+            if (
+              sale.void_idempotency_key === input.idempotencyKey &&
+              sale.void_request_fingerprint === input.fingerprint
+            ) {
+              return { saleId: sale.id, replay: true };
+            }
+            throw new SaleAlreadyVoidedError();
+          }
+
+          const [shift] = await manager.query<
+            Array<{ status: 'OPEN' | 'CLOSED' }>
+          >(
+            `SELECT status FROM cash_register_shifts
+             WHERE id = ? AND tenant_id = ? AND branch_id = ? AND cash_register_id = ?
+             LIMIT 1 FOR UPDATE`,
+            [
+              sale.cash_register_shift_id,
+              input.tenantId,
+              input.branchId,
+              input.cashRegisterId,
+            ],
+          );
+          if (!shift || shift.status !== 'OPEN') {
+            throw new SaleVoidNotAllowedError();
+          }
+
+          const movements = await manager.query<
+            Array<{
+              id: string;
+              product_id: string;
+              location_id: string;
+              sale_line_id: string;
+              quantity_change: string;
+            }>
+          >(
+            `SELECT id, product_id, location_id, sale_line_id, quantity_change
+             FROM inventory_movements
+             WHERE tenant_id = ? AND sale_id = ? AND type = 'SALE'
+             ORDER BY product_id, location_id, id FOR UPDATE`,
+            [input.tenantId, sale.id],
+          );
+          for (const movement of movements) {
+            const [balance] = await manager.query<
+              Array<{ quantity: string; available_quantity: string }>
+            >(
+              `SELECT quantity, available_quantity FROM inventory_balances
+               WHERE tenant_id = ? AND product_id = ? AND location_id = ?
+               LIMIT 1 FOR UPDATE`,
+              [input.tenantId, movement.product_id, movement.location_id],
+            );
+            if (!balance) throw new Error('SALE_VOID_BALANCE_NOT_FOUND');
+            const restored = -this.toQuantityUnits(movement.quantity_change);
+            if (restored <= 0n) throw new Error('SALE_VOID_INVALID_MOVEMENT');
+            const resultingQuantity =
+              this.toQuantityUnits(balance.quantity) + restored;
+            const resultingAvailable =
+              this.toQuantityUnits(balance.available_quantity) + restored;
+            await manager.query(
+              `UPDATE inventory_balances
+               SET quantity = ?, available_quantity = ?
+               WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
+              [
+                this.fromQuantityUnits(resultingQuantity),
+                this.fromQuantityUnits(resultingAvailable),
+                input.tenantId,
+                movement.product_id,
+                movement.location_id,
+              ],
+            );
+            const movementKey = `sale-void:${sale.id}:${movement.id}`;
+            const movementFingerprint = createHash('sha256')
+              .update(
+                JSON.stringify({
+                  saleId: sale.id,
+                  originalMovementId: movement.id,
+                  quantityChange: this.fromQuantityUnits(restored),
+                }),
+              )
+              .digest('hex');
+            await manager.query(
+              `INSERT INTO inventory_movements
+                (id, tenant_id, product_id, location_id, type, quantity_change,
+                 resulting_quantity, reason, reference, idempotency_key,
+                 request_fingerprint, created_by_user_id, sale_id, sale_line_id)
+               VALUES (?, ?, ?, ?, 'SALE_VOID', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                randomUUID(),
+                input.tenantId,
+                movement.product_id,
+                movement.location_id,
+                this.fromQuantityUnits(restored),
+                this.fromQuantityUnits(resultingQuantity),
+                `Anulación ${sale.receipt_number}: ${input.reason}`,
+                sale.receipt_number,
+                movementKey,
+                movementFingerprint,
+                input.userId,
+                sale.id,
+                movement.sale_line_id,
+              ],
+            );
+          }
+          const paymentUpdate = await manager.query<{ affectedRows?: number }>(
+            `UPDATE sale_payments
+             SET status = 'REVERSED', reversed_by_user_id = ?, reversed_at = CURRENT_TIMESTAMP(6)
+             WHERE tenant_id = ? AND sale_id = ? AND status = 'COMPLETED'`,
+            [input.userId, input.tenantId, sale.id],
+          );
+          if (Number(paymentUpdate.affectedRows ?? 0) !== 1) {
+            throw new Error('SALE_VOID_PAYMENT_NOT_REVERSED');
+          }
+          const saleUpdate = await manager.query<{ affectedRows?: number }>(
+            `UPDATE sales SET status = 'VOIDED', voided_by_user_id = ?, void_reason = ?,
+               void_idempotency_key = ?, void_request_fingerprint = ?,
+               voided_at = CURRENT_TIMESTAMP(6)
+             WHERE id = ? AND tenant_id = ? AND status = 'COMPLETED'`,
+            [
+              input.userId,
+              input.reason,
+              input.idempotencyKey,
+              input.fingerprint,
+              sale.id,
+              input.tenantId,
+            ],
+          );
+          if (Number(saleUpdate.affectedRows ?? 0) !== 1) {
+            throw new Error('SALE_VOID_STATUS_NOT_UPDATED');
+          }
+          await this.audit.recordInTransaction(manager, {
+            tenantId: input.tenantId,
+            actorUserId: input.userId,
+            action: 'SALE_VOIDED',
+            entityType: 'SALE',
+            entityId: sale.id,
+            correlationId: input.correlationId,
+            deduplicate: true,
+            before: { status: 'COMPLETED', paymentStatus: 'COMPLETED' },
+            after: {
+              status: 'VOIDED',
+              paymentStatus: 'REVERSED',
+              reason: input.reason,
+              restoredMovementCount: movements.length,
+            },
+          });
+          return { saleId: sale.id, replay: false };
+        },
+      );
+    } catch (error) {
+      if (!this.isDuplicate(error)) throw error;
+      const existing = await this.findVoidByKey(
+        this.dataSource.manager,
+        input.tenantId,
+        input.idempotencyKey,
+      );
+      if (
+        !existing ||
+        existing.saleId !== input.saleId ||
+        existing.fingerprint !== input.fingerprint
+      ) {
+        throw new PosIdempotencyConflictError();
+      }
+      return { saleId: existing.saleId, replay: true };
+    }
+  }
+
+  async persistSale(input: {
     tenantId: string;
     userId: string;
     idempotencyKey: string;
     fingerprint: string;
+    cashRegisterShiftId: string;
+    customerId?: string | null;
+    reservationId?: string | null;
     quote: PosCartQuoteResponse['data'];
-    amountReceived: string;
-    change: string;
+    payments: Array<{
+      method: PaymentMethod;
+      amountReceived: string;
+      amountApplied: string;
+      change: string;
+      reference: string | null;
+      provider: string;
+      providerReference: string | null;
+      authorizationCode: string | null;
+    }>;
   }): Promise<{ sale: CashSaleData; replay: boolean }> {
     try {
       return await this.dataSource.transaction(
@@ -231,36 +499,152 @@ export class SalesRepository {
               throw new PosIdempotencyConflictError();
             return { sale: replay.sale, replay: true };
           }
+          let effectiveCustomerId = input.customerId ?? null;
+          let reservedLocationId: string | null = null;
+          const reservationLines = new Map<
+            string,
+            { id: string; quantity: string }
+          >();
+          if (input.reservationId) {
+            const [reservation] = await manager.query<
+              Array<{
+                customer_id: string;
+                location_id: string;
+                status: string;
+                expired: number | boolean;
+              }>
+            >(
+              `SELECT customer_id, location_id, status,
+                      expires_at <= CURRENT_TIMESTAMP(6) AS expired
+               FROM product_reservations
+               WHERE id = ? AND tenant_id = ? AND branch_id = ? AND warehouse_id = ?
+               LIMIT 1 FOR UPDATE`,
+              [
+                input.reservationId,
+                input.tenantId,
+                input.quote.context.branch.id,
+                input.quote.context.warehouse.id,
+              ],
+            );
+            if (!reservation) throw new PosReservationNotAvailableError();
+            if (reservation.status !== 'ACTIVE')
+              throw new PosReservationNotAvailableError(reservation.status);
+            if (Number(reservation.expired) === 1)
+              throw new PosReservationNotAvailableError('EXPIRED');
+            if (
+              effectiveCustomerId &&
+              effectiveCustomerId !== reservation.customer_id
+            )
+              throw new PosReservationNotAvailableError('CUSTOMER_MISMATCH');
+            effectiveCustomerId = reservation.customer_id;
+            reservedLocationId = reservation.location_id;
+            const lines = await manager.query<
+              Array<{ id: string; product_id: string; quantity: string }>
+            >(
+              `SELECT id, product_id, quantity FROM product_reservation_lines
+               WHERE reservation_id = ? AND tenant_id = ? ORDER BY product_id FOR UPDATE`,
+              [input.reservationId, input.tenantId],
+            );
+            for (const line of lines)
+              reservationLines.set(line.product_id, {
+                id: line.id,
+                quantity: line.quantity,
+              });
+            const quoteLines = new Map(
+              input.quote.lines.map((line) => [line.product.id, line.quantity]),
+            );
+            if (
+              quoteLines.size !== reservationLines.size ||
+              [...reservationLines].some(
+                ([productId, line]) =>
+                  this.toQuantityUnits(quoteLines.get(productId) ?? '0') !==
+                  this.toQuantityUnits(line.quantity),
+              )
+            )
+              throw new PosReservationNotAvailableError('LINES_MISMATCH');
+          }
+          if (effectiveCustomerId && !input.reservationId) {
+            const [customer] = await manager.query<Array<{ id: string }>>(
+              `SELECT id FROM customers
+               WHERE id = ? AND tenant_id = ? AND active = TRUE FOR UPDATE`,
+              [effectiveCustomerId, input.tenantId],
+            );
+            if (!customer) throw new PosCustomerNotAvailableError();
+          }
+          const [openShift] = await manager.query<Array<{ id: string }>>(
+            `SELECT id FROM cash_register_shifts
+             WHERE id = ? AND tenant_id = ? AND branch_id = ?
+               AND cash_register_id = ? AND opened_by_user_id = ?
+               AND status = 'OPEN' LIMIT 1 FOR UPDATE`,
+            [
+              input.cashRegisterShiftId,
+              input.tenantId,
+              input.quote.context.branch.id,
+              input.quote.context.cashRegister.id,
+              input.userId,
+            ],
+          );
+          if (!openShift) throw new CashRegisterShiftRequiredError();
           const allocations = new Map<string, StockAllocation[]>();
           let insufficientProductId: string | null = null;
           for (const line of [...input.quote.lines].sort((left, right) =>
             left.product.id.localeCompare(right.product.id),
           )) {
             const balances = await manager.query<
-              Array<{ location_id: string; quantity: string }>
+              Array<{
+                location_id: string;
+                quantity: string;
+                available_quantity: string;
+                reserved_quantity: string;
+              }>
             >(
-              `SELECT ib.location_id, ib.quantity
+              `SELECT ib.location_id, ib.quantity, ib.available_quantity, ib.reserved_quantity
              FROM inventory_balances ib
              INNER JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
              WHERE ib.tenant_id = ? AND ib.product_id = ? AND l.warehouse_id = ?
+               AND (? IS NULL OR ib.location_id = ?)
              ORDER BY l.created_at, l.id FOR UPDATE`,
               [
                 input.tenantId,
                 line.product.id,
                 input.quote.context.warehouse.id,
+                reservedLocationId,
+                reservedLocationId,
               ],
             );
             let remaining = this.toQuantityUnits(line.quantity);
             const lineAllocations: StockAllocation[] = [];
             for (const balance of balances) {
               if (remaining === 0n) break;
-              const available = this.toQuantityUnits(balance.quantity);
+              const available = this.toQuantityUnits(
+                input.reservationId
+                  ? balance.reserved_quantity
+                  : balance.available_quantity,
+              );
+              const total = this.toQuantityUnits(balance.quantity);
+              const currentAvailable = this.toQuantityUnits(
+                balance.available_quantity,
+              );
+              const currentReserved = this.toQuantityUnits(
+                balance.reserved_quantity,
+              );
               const taken = available < remaining ? available : remaining;
               if (taken === 0n) continue;
               lineAllocations.push({
                 locationId: balance.location_id,
                 quantityChange: this.fromQuantityUnits(-taken),
-                resultingQuantity: this.fromQuantityUnits(available - taken),
+                resultingQuantity: this.fromQuantityUnits(total - taken),
+                resultingAvailableQuantity: this.fromQuantityUnits(
+                  input.reservationId
+                    ? currentAvailable
+                    : currentAvailable - taken,
+                ),
+                resultingReservedQuantity: this.fromQuantityUnits(
+                  input.reservationId
+                    ? currentReserved - taken
+                    : currentReserved,
+                ),
+                reservationLineId: reservationLines.get(line.product.id)?.id,
               });
               remaining -= taken;
             }
@@ -285,16 +669,19 @@ export class SalesRepository {
           await manager.query(
             `INSERT INTO sales
             (id, tenant_id, branch_id, warehouse_id, cash_register_id,
-             created_by_user_id, receipt_number, currency, tax_rate, subtotal,
+             cash_register_shift_id, created_by_user_id, customer_id, reservation_id, receipt_number, currency, tax_rate, subtotal,
              tax_total, total, status, idempotency_key, request_fingerprint)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
             [
               saleId,
               input.tenantId,
               input.quote.context.branch.id,
               input.quote.context.warehouse.id,
               input.quote.context.cashRegister.id,
+              input.cashRegisterShiftId,
               input.userId,
+              effectiveCustomerId,
+              input.reservationId ?? null,
               receiptNumber,
               input.quote.currency,
               input.quote.taxRate,
@@ -307,11 +694,16 @@ export class SalesRepository {
           );
           for (const [index, line] of input.quote.lines.entries()) {
             const saleLineId = randomUUID();
+            const [productCost] = await manager.query<Array<{ cost: string }>>(
+              `SELECT cost FROM products WHERE id = ? AND tenant_id = ? LIMIT 1`,
+              [line.product.id, input.tenantId],
+            );
+            if (!productCost) throw new Error('SALE_PRODUCT_COST_NOT_FOUND');
             await manager.query(
               `INSERT INTO sale_lines
               (id, tenant_id, sale_id, line_number, product_id, product_name,
-               product_sku, quantity, unit_price, subtotal, tax, total)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               product_sku, quantity, unit_price, unit_cost, subtotal, tax, total)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 saleLineId,
                 input.tenantId,
@@ -322,6 +714,7 @@ export class SalesRepository {
                 line.product.sku,
                 line.quantity,
                 line.unitPrice,
+                productCost.cost,
                 line.subtotal,
                 line.tax,
                 line.total,
@@ -331,10 +724,13 @@ export class SalesRepository {
               allocations.get(line.product.id) ?? []
             ).entries()) {
               await manager.query(
-                `UPDATE inventory_balances SET quantity = ?
+                `UPDATE inventory_balances
+                 SET quantity = ?, available_quantity = ?, reserved_quantity = ?
                WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
                 [
                   allocation.resultingQuantity,
+                  allocation.resultingAvailableQuantity,
+                  allocation.resultingReservedQuantity,
                   input.tenantId,
                   line.product.id,
                   allocation.locationId,
@@ -356,8 +752,9 @@ export class SalesRepository {
                 `INSERT INTO inventory_movements
                 (id, tenant_id, product_id, location_id, type, quantity_change,
                  resulting_quantity, reason, reference, idempotency_key,
-                 request_fingerprint, created_by_user_id, sale_id, sale_line_id)
-               VALUES (?, ?, ?, ?, 'SALE', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 request_fingerprint, created_by_user_id, sale_id, sale_line_id,
+                 reservation_id, reservation_line_id)
+               VALUES (?, ?, ?, ?, 'SALE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
                   randomUUID(),
                   input.tenantId,
@@ -372,31 +769,61 @@ export class SalesRepository {
                   input.userId,
                   saleId,
                   saleLineId,
+                  input.reservationId ?? null,
+                  allocation.reservationLineId ?? null,
                 ],
               );
             }
           }
-          await manager.query(
-            `INSERT INTO sale_payments
-            (id, tenant_id, sale_id, method, currency, amount_received,
-             amount_applied, change_amount)
-           VALUES (?, ?, ?, 'CASH', ?, ?, ?, ?)`,
-            [
-              randomUUID(),
-              input.tenantId,
-              saleId,
-              input.quote.currency,
-              input.amountReceived,
-              input.quote.totals.total,
-              input.change,
-            ],
-          );
+          for (const payment of input.payments) {
+            await manager.query(
+              `INSERT INTO sale_payments
+              (id, tenant_id, sale_id, method, provider, external_reference,
+               provider_reference, authorization_code, authorization_status,
+               currency, amount_received, amount_applied, change_amount)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'APPROVED', ?, ?, ?, ?)`,
+              [
+                randomUUID(),
+                input.tenantId,
+                saleId,
+                payment.method,
+                payment.provider,
+                payment.reference,
+                payment.providerReference,
+                payment.authorizationCode,
+                input.quote.currency,
+                payment.amountReceived,
+                payment.amountApplied,
+                payment.change,
+              ],
+            );
+          }
+          if (input.reservationId) {
+            const closed = await manager.query<{ affectedRows?: number }>(
+              `UPDATE product_reservations
+               SET status = 'CONSUMED', closed_by_user_id = ?,
+                   closed_at = CURRENT_TIMESTAMP(6), closure_reason = ?,
+                   closed_idempotency_key = ?, closed_request_fingerprint = ?, sale_id = ?
+               WHERE id = ? AND tenant_id = ? AND status = 'ACTIVE'`,
+              [
+                input.userId,
+                `Consumida en venta ${receiptNumber}`,
+                input.idempotencyKey,
+                input.fingerprint,
+                saleId,
+                input.reservationId,
+                input.tenantId,
+              ],
+            );
+            if (Number(closed.affectedRows ?? 0) !== 1)
+              throw new PosReservationNotAvailableError();
+          }
           const created = await this.findWithManager(
             manager,
             input.tenantId,
             input.idempotencyKey,
           );
-          if (!created) throw new Error('CREATED_CASH_SALE_NOT_FOUND');
+          if (!created) throw new Error('CREATED_SALE_NOT_FOUND');
           return { sale: created.sale, replay: false };
         },
       );
@@ -406,7 +833,8 @@ export class SalesRepository {
         input.tenantId,
         input.idempotencyKey,
       );
-      if (!replay || replay.fingerprint !== input.fingerprint)
+      if (!replay) throw new PaymentReferenceConflictError();
+      if (replay.fingerprint !== input.fingerprint)
         throw new PosIdempotencyConflictError();
       return { sale: replay.sale, replay: true };
     }
@@ -419,18 +847,21 @@ export class SalesRepository {
   ): Promise<{ sale: CashSaleData; fingerprint: string } | null> {
     const rows = await manager.query<SaleRow[]>(
       `SELECT s.id, s.receipt_number, s.status, s.created_by_user_id,
+              c.id AS customer_id, c.name AS customer_name,
+              c.identifier AS customer_identifier,
               s.currency, s.tax_rate, s.subtotal, s.tax_total, s.total,
-              s.request_fingerprint, s.created_at,
+              s.request_fingerprint, s.created_at, s.voided_by_user_id,
+              vu.email AS voided_by_email, s.void_reason, s.voided_at,
               b.id AS branch_id, b.name AS branch_name,
               w.id AS warehouse_id, w.name AS warehouse_name,
               cr.id AS cash_register_id, cr.name AS cash_register_name,
-              cr.code AS cash_register_code,
-              sp.amount_received, sp.amount_applied, sp.change_amount
+              cr.code AS cash_register_code
        FROM sales s
        INNER JOIN branches b ON b.id = s.branch_id AND b.tenant_id = s.tenant_id
        INNER JOIN warehouses w ON w.id = s.warehouse_id AND w.tenant_id = s.tenant_id
        INNER JOIN cash_registers cr ON cr.id = s.cash_register_id AND cr.tenant_id = s.tenant_id
-       INNER JOIN sale_payments sp ON sp.sale_id = s.id AND sp.tenant_id = s.tenant_id AND sp.method = 'CASH'
+       LEFT JOIN users vu ON vu.id = s.voided_by_user_id AND vu.tenant_id = s.tenant_id
+       LEFT JOIN customers c ON c.id = s.customer_id AND c.tenant_id = s.tenant_id
        WHERE s.tenant_id = ? AND s.idempotency_key = ? LIMIT 1`,
       [tenantId, idempotencyKey],
     );
@@ -453,6 +884,34 @@ export class SalesRepository {
        FROM sale_lines WHERE tenant_id = ? AND sale_id = ? ORDER BY line_number`,
       [tenantId, row.id],
     );
+    const paymentRows = await manager.query<
+      Array<{
+        method: PaymentMethod;
+        status: 'COMPLETED' | 'REVERSED';
+        amount_received: string;
+        amount_applied: string;
+        change_amount: string;
+        external_reference: string | null;
+        provider: string;
+        authorization_code: string | null;
+      }>
+    >(
+      `SELECT method, status, amount_received, amount_applied, change_amount,
+              external_reference, provider, authorization_code
+       FROM sale_payments WHERE tenant_id = ? AND sale_id = ? ORDER BY created_at, id`,
+      [tenantId, row.id],
+    );
+    const payments: SalePaymentData[] = paymentRows.map((payment) => ({
+      method: payment.method,
+      status: payment.status,
+      amountReceived: this.decimal(payment.amount_received, 2),
+      amountApplied: this.decimal(payment.amount_applied, 2),
+      change: this.decimal(payment.change_amount, 2),
+      reference: payment.external_reference,
+      provider: payment.provider,
+      authorizationCode: payment.authorization_code,
+    }));
+    if (!payments[0]) throw new Error('SALE_PAYMENT_NOT_FOUND');
     return {
       fingerprint: row.request_fingerprint,
       sale: {
@@ -469,6 +928,13 @@ export class SalesRepository {
           },
         },
         userId: row.created_by_user_id,
+        customer: row.customer_id
+          ? {
+              id: row.customer_id,
+              name: row.customer_name!,
+              identifier: row.customer_identifier,
+            }
+          : null,
         currency: row.currency,
         taxRate: this.decimal(row.tax_rate, 4),
         lines: lines.map((line) => ({
@@ -488,15 +954,39 @@ export class SalesRepository {
           tax: this.decimal(row.tax_total, 2),
           total: this.decimal(row.total, 2),
         },
-        payment: {
-          method: 'CASH',
-          amountReceived: this.decimal(row.amount_received, 2),
-          amountApplied: this.decimal(row.amount_applied, 2),
-          change: this.decimal(row.change_amount, 2),
-        },
+        payment: payments[0],
+        payments,
         createdAt: new Date(row.created_at).toISOString(),
+        void:
+          row.voided_by_user_id &&
+          row.voided_by_email &&
+          row.void_reason &&
+          row.voided_at
+            ? {
+                reason: row.void_reason,
+                user: { id: row.voided_by_user_id, email: row.voided_by_email },
+                voidedAt: new Date(row.voided_at).toISOString(),
+              }
+            : null,
       },
     };
+  }
+
+  private async findVoidByKey(
+    manager: EntityManager,
+    tenantId: string,
+    idempotencyKey: string,
+  ): Promise<{ saleId: string; fingerprint: string } | null> {
+    const [row] = await manager.query<
+      Array<{ id: string; void_request_fingerprint: string }>
+    >(
+      `SELECT id, void_request_fingerprint FROM sales
+       WHERE tenant_id = ? AND void_idempotency_key = ? LIMIT 1`,
+      [tenantId, idempotencyKey],
+    );
+    return row
+      ? { saleId: row.id, fingerprint: row.void_request_fingerprint }
+      : null;
   }
 
   private decimal(value: string, scale: number): string {

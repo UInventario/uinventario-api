@@ -1,21 +1,29 @@
 import {
+  BadRequestException,
   ConflictException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { CatalogRepository } from './catalog.repository';
 import {
+  CatalogClassificationConflictError,
+  ProductCodeAmbiguousError,
   ProductIdentifierConflictError,
   ProductVersionConflictError,
 } from './catalog.errors';
 import {
   CatalogOptionsResponse,
   ProductListResponse,
+  ProductRetirementResponse,
   ProductResponse,
 } from './catalog.types';
 import { CreateProductDto } from './dto/create-product.dto';
 import { ListProductsDto } from './dto/list-products.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
+import {
+  CatalogClassificationKind,
+  UpdateCatalogClassificationDto,
+} from './dto/catalog-classification.dto';
 
 @Injectable()
 export class CatalogService {
@@ -108,6 +116,99 @@ export class CatalogService {
     return { data: product, meta: { apiVersion: '1' } };
   }
 
+  async resolveCode(tenantId: string, code: string): Promise<ProductResponse> {
+    try {
+      const product = await this.catalog.resolveCode(tenantId, code);
+      if (!product) {
+        throw new NotFoundException({
+          code: 'PRODUCT_CODE_NOT_FOUND',
+          message: 'No existe un producto con ese SKU, código de barras o QR.',
+        });
+      }
+      return { data: product, meta: { apiVersion: '1' } };
+    } catch (error) {
+      if (error instanceof ProductCodeAmbiguousError) {
+        throw new ConflictException({
+          code: 'PRODUCT_CODE_AMBIGUOUS',
+          message:
+            'El código coincide con más de un producto. Corrige los identificadores.',
+        });
+      }
+      throw error;
+    }
+  }
+
+  async retireProduct(
+    tenantId: string,
+    id: string,
+  ): Promise<ProductRetirementResponse> {
+    const retirement = await this.catalog.retireProduct(tenantId, id);
+    if (!retirement) throw new NotFoundException();
+    return { data: retirement, meta: { apiVersion: '1' } };
+  }
+
+  listClassifications(
+    tenantId: string,
+    kind: CatalogClassificationKind,
+    includeInactive: boolean,
+  ) {
+    return this.catalog.listClassifications(tenantId, kind, includeInactive);
+  }
+
+  async createClassification(
+    tenantId: string,
+    kind: CatalogClassificationKind,
+    name: string,
+  ) {
+    this.assertClassificationName(kind, name);
+    try {
+      return await this.catalog.createClassification(tenantId, kind, name);
+    } catch (error) {
+      this.mapClassificationError(error);
+    }
+  }
+
+  async updateClassification(
+    tenantId: string,
+    kind: CatalogClassificationKind,
+    id: string,
+    dto: UpdateCatalogClassificationDto,
+  ) {
+    if (dto.name) this.assertClassificationName(kind, dto.name);
+    try {
+      const result = await this.catalog.updateClassification(
+        tenantId,
+        kind,
+        id,
+        dto,
+      );
+      if (!result) throw new NotFoundException();
+      return result;
+    } catch (error) {
+      this.mapClassificationError(error);
+    }
+  }
+
+  async deactivateClassification(
+    tenantId: string,
+    kind: CatalogClassificationKind,
+    id: string,
+    replacementId?: string,
+  ) {
+    try {
+      const result = await this.catalog.deactivateClassification(
+        tenantId,
+        kind,
+        id,
+        replacementId,
+      );
+      if (!result) throw new NotFoundException();
+      return result;
+    } catch (error) {
+      this.mapClassificationError(error);
+    }
+  }
+
   private throwIdentifierConflict(
     error: ProductIdentifierConflictError,
   ): never {
@@ -120,5 +221,28 @@ export class CatalogService {
           ? 'Ya existe un producto con ese SKU en la empresa.'
           : 'Ya existe un producto con ese código de barras en la empresa.',
     });
+  }
+
+  private assertClassificationName(
+    kind: CatalogClassificationKind,
+    name: string,
+  ): void {
+    if (kind === CatalogClassificationKind.CATEGORIES && name.length > 80) {
+      throw new BadRequestException({
+        code: 'CATEGORY_NAME_TOO_LONG',
+        message: 'La categoría admite hasta 80 caracteres.',
+      });
+    }
+  }
+
+  private mapClassificationError(error: unknown): never {
+    if (error instanceof CatalogClassificationConflictError) {
+      throw new ConflictException({
+        code: 'CATALOG_CLASSIFICATION_CONFLICT',
+        message:
+          'Ya existe ese nombre o la reasignación seleccionada no es válida.',
+      });
+    }
+    throw error;
   }
 }

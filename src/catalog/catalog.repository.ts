@@ -4,12 +4,22 @@ import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import type { ResultSetHeader } from 'mysql2';
 import { CreateProductDto } from './dto/create-product.dto';
 import {
+  CatalogClassificationConflictError,
+  ProductCodeAmbiguousError,
   ProductIdentifierConflictError,
   ProductVersionConflictError,
 } from './catalog.errors';
-import { CatalogOptionsResponse, ProductData } from './catalog.types';
-import { ListProductsDto } from './dto/list-products.dto';
+import {
+  CatalogClassificationData,
+  CatalogOptionsResponse,
+  ProductData,
+} from './catalog.types';
+import { ListProductsDto, ProductStatusFilter } from './dto/list-products.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
+import {
+  CatalogClassificationKind,
+  UpdateCatalogClassificationDto,
+} from './dto/catalog-classification.dto';
 
 interface ProductRow {
   id: string;
@@ -89,11 +99,11 @@ export class CatalogRepository {
   async getOptions(tenantId: string): Promise<CatalogOptionsResponse['data']> {
     const [categories, brands] = await Promise.all([
       this.dataSource.query<Array<{ id: string; name: string }>>(
-        'SELECT id, name FROM categories WHERE tenant_id = ? ORDER BY name',
+        'SELECT id, name FROM categories WHERE tenant_id = ? AND active = TRUE ORDER BY name',
         [tenantId],
       ),
       this.dataSource.query<Array<{ id: string; name: string }>>(
-        'SELECT id, name FROM brands WHERE tenant_id = ? ORDER BY name',
+        'SELECT id, name FROM brands WHERE tenant_id = ? AND active = TRUE ORDER BY name',
         [tenantId],
       ),
     ]);
@@ -166,13 +176,27 @@ export class CatalogRepository {
     query: ListProductsDto,
   ): Promise<{ products: ProductData[]; total: number }> {
     const search = query.q ? `%${query.q.trim()}%` : null;
-    const where = search
-      ? `p.tenant_id = ? AND
-         (p.name LIKE ? OR p.normalized_sku LIKE ? OR p.barcode LIKE ?)`
-      : 'p.tenant_id = ?';
-    const parameters = search
-      ? [tenantId, search, search.toUpperCase(), search]
-      : [tenantId];
+    const conditions = ['p.tenant_id = ?'];
+    const parameters: Array<string | number> = [tenantId];
+    if (query.status !== ProductStatusFilter.ALL) {
+      conditions.push('p.active = ?');
+      parameters.push(query.status === ProductStatusFilter.ACTIVE ? 1 : 0);
+    }
+    if (search) {
+      conditions.push(
+        '(p.name LIKE ? OR p.normalized_sku LIKE ? OR p.barcode LIKE ?)',
+      );
+      parameters.push(search, search.toUpperCase(), search);
+    }
+    if (query.categoryId) {
+      conditions.push('p.category_id = ?');
+      parameters.push(query.categoryId);
+    }
+    if (query.brandId) {
+      conditions.push('p.brand_id = ?');
+      parameters.push(query.brandId);
+    }
+    const where = conditions.join(' AND ');
     const offset = (query.page - 1) * query.pageSize;
     const [rows, countRows] = await Promise.all([
       this.dataSource.query<ProductRow[]>(
@@ -199,6 +223,242 @@ export class CatalogRepository {
     return rows[0] ? this.toProduct(rows[0]) : null;
   }
 
+  async resolveCode(
+    tenantId: string,
+    code: string,
+  ): Promise<ProductData | null> {
+    const rows = await this.dataSource.query<ProductRow[]>(
+      `${this.productSelect()} WHERE p.tenant_id = ?
+         AND (p.normalized_sku = ? OR p.barcode = ?)
+       ORDER BY p.id LIMIT 2`,
+      [tenantId, this.normalize(code), code],
+    );
+    if (rows.length > 1) throw new ProductCodeAmbiguousError();
+    return rows[0] ? this.toProduct(rows[0]) : null;
+  }
+
+  async retireProduct(
+    tenantId: string,
+    id: string,
+  ): Promise<{
+    outcome: 'DELETED' | 'DEACTIVATED';
+    product: ProductData | null;
+  } | null> {
+    return this.dataSource.transaction(async (manager) => {
+      const products = await manager.query<
+        Array<{
+          id: string;
+          active: number | boolean;
+          sku: string;
+          barcode: string | null;
+          name: string;
+          category_id: string | null;
+          brand_id: string | null;
+          price: string;
+          version: number;
+        }>
+      >(
+        `SELECT id, active, sku, barcode, name, category_id, brand_id, price, version
+         FROM products WHERE id = ? AND tenant_id = ? FOR UPDATE`,
+        [id, tenantId],
+      );
+      if (!products[0]) return null;
+
+      const [references] = await manager.query<
+        Array<{
+          has_movements: number | string;
+          has_sales: number | string;
+          has_stock: number | string;
+        }>
+      >(
+        `SELECT
+           EXISTS(SELECT 1 FROM inventory_movements WHERE tenant_id = ? AND product_id = ?) AS has_movements,
+           EXISTS(SELECT 1 FROM sale_lines WHERE tenant_id = ? AND product_id = ?) AS has_sales,
+           EXISTS(SELECT 1 FROM inventory_balances WHERE tenant_id = ? AND product_id = ? AND quantity <> 0) AS has_stock`,
+        [tenantId, id, tenantId, id, tenantId, id],
+      );
+      const mustPreserve =
+        Number(references.has_movements) === 1 ||
+        Number(references.has_sales) === 1 ||
+        Number(references.has_stock) === 1;
+      if (mustPreserve) {
+        if (products[0].active) {
+          await manager.query(
+            `UPDATE products SET active = FALSE, version = version + 1
+             WHERE id = ? AND tenant_id = ?`,
+            [id, tenantId],
+          );
+        }
+        return {
+          outcome: 'DEACTIVATED',
+          product: await this.findProduct(manager, tenantId, id),
+        };
+      }
+
+      const removed = products[0];
+      await manager.query(
+        `INSERT INTO offline_sync_tombstones
+          (change_id, tenant_id, entity_kind, entity_id, payload)
+         VALUES (?, ?, 'PRODUCT', ?, ?)`,
+        [
+          randomUUID(),
+          tenantId,
+          id,
+          JSON.stringify({
+            sku: removed.sku,
+            barcode: removed.barcode,
+            name: removed.name,
+            categoryId: removed.category_id,
+            brandId: removed.brand_id,
+            price: Number(removed.price).toFixed(2),
+            version: Number(removed.version) + 1,
+            active: false,
+          }),
+        ],
+      );
+      await manager.query(
+        'DELETE FROM products WHERE id = ? AND tenant_id = ?',
+        [id, tenantId],
+      );
+      return { outcome: 'DELETED', product: null };
+    });
+  }
+
+  async listClassifications(
+    tenantId: string,
+    kind: CatalogClassificationKind,
+    includeInactive: boolean,
+  ): Promise<CatalogClassificationData[]> {
+    const { table, productColumn } = this.classification(kind);
+    const rows = await this.dataSource.query<
+      Array<{
+        id: string;
+        name: string;
+        active: number | boolean;
+        product_count: string | number;
+      }>
+    >(
+      `SELECT x.id, x.name, x.active, COUNT(p.id) AS product_count
+       FROM ${table} x
+       LEFT JOIN products p ON p.tenant_id = x.tenant_id AND p.${productColumn} = x.id
+       WHERE x.tenant_id = ?${includeInactive ? '' : ' AND x.active = TRUE'}
+       GROUP BY x.id, x.name, x.active
+       ORDER BY x.active DESC, x.name`,
+      [tenantId],
+    );
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      active: Boolean(row.active),
+      productCount: Number(row.product_count),
+    }));
+  }
+
+  async createClassification(
+    tenantId: string,
+    kind: CatalogClassificationKind,
+    name: string,
+  ): Promise<CatalogClassificationData> {
+    const { table } = this.classification(kind);
+    const id = randomUUID();
+    try {
+      await this.dataSource.query(
+        `INSERT INTO ${table} (id, tenant_id, name, normalized_name)
+         VALUES (?, ?, ?, ?)`,
+        [id, tenantId, name, this.normalize(name)],
+      );
+    } catch (error) {
+      if (this.duplicateConstraint(error)) {
+        throw new CatalogClassificationConflictError();
+      }
+      throw error;
+    }
+    return { id, name, active: true, productCount: 0 };
+  }
+
+  async updateClassification(
+    tenantId: string,
+    kind: CatalogClassificationKind,
+    id: string,
+    dto: UpdateCatalogClassificationDto,
+  ): Promise<CatalogClassificationData | null> {
+    const { table } = this.classification(kind);
+    try {
+      const result = await this.dataSource.query<ResultSetHeader>(
+        `UPDATE ${table} SET
+           name = COALESCE(?, name),
+           normalized_name = COALESCE(?, normalized_name),
+           active = COALESCE(?, active)
+         WHERE tenant_id = ? AND id = ?`,
+        [
+          dto.name ?? null,
+          dto.name ? this.normalize(dto.name) : null,
+          dto.active === undefined ? null : dto.active,
+          tenantId,
+          id,
+        ],
+      );
+      if (!result.affectedRows) {
+        const existing = await this.classificationById(tenantId, kind, id);
+        return existing;
+      }
+      return this.classificationById(tenantId, kind, id);
+    } catch (error) {
+      if (this.duplicateConstraint(error)) {
+        throw new CatalogClassificationConflictError();
+      }
+      throw error;
+    }
+  }
+
+  async deactivateClassification(
+    tenantId: string,
+    kind: CatalogClassificationKind,
+    id: string,
+    replacementId?: string,
+  ): Promise<{
+    classification: CatalogClassificationData;
+    reassignedProducts: number;
+  } | null> {
+    const { table, productColumn } = this.classification(kind);
+    return this.dataSource.transaction(async (manager) => {
+      const current = await manager.query<Array<{ id: string }>>(
+        `SELECT id FROM ${table} WHERE tenant_id = ? AND id = ? FOR UPDATE`,
+        [tenantId, id],
+      );
+      if (!current[0]) return null;
+      if (replacementId === id) throw new CatalogClassificationConflictError();
+      if (replacementId) {
+        const replacement = await manager.query<Array<{ id: string }>>(
+          `SELECT id FROM ${table}
+           WHERE tenant_id = ? AND id = ? AND active = TRUE FOR UPDATE`,
+          [tenantId, replacementId],
+        );
+        if (!replacement[0]) return null;
+      }
+      const reassigned = await manager.query<ResultSetHeader>(
+        `UPDATE products SET ${productColumn} = ?, version = version + 1
+         WHERE tenant_id = ? AND ${productColumn} = ?`,
+        [replacementId ?? null, tenantId, id],
+      );
+      await manager.query(
+        `UPDATE ${table} SET active = FALSE WHERE tenant_id = ? AND id = ?`,
+        [tenantId, id],
+      );
+      const classification = await this.classificationById(
+        tenantId,
+        kind,
+        id,
+        manager,
+      );
+      if (!classification) throw new Error('CLASSIFICATION_NOT_FOUND');
+      return {
+        classification,
+        reassignedProducts: reassigned.affectedRows,
+      };
+    });
+  }
+
   private async findOrCreateClassification(
     manager: EntityManager,
     table: 'categories' | 'brands',
@@ -209,7 +469,7 @@ export class CatalogRepository {
     await manager.query(
       `INSERT INTO ${table} (id, tenant_id, name, normalized_name)
        VALUES (?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE name = VALUES(name)`,
+       ON DUPLICATE KEY UPDATE name = VALUES(name), active = TRUE`,
       [randomUUID(), tenantId, name, normalizedName],
     );
     const rows = await manager.query<Array<{ id: string }>>(
@@ -239,6 +499,45 @@ export class CatalogRepository {
             FROM products p
             LEFT JOIN categories c ON c.id = p.category_id AND c.tenant_id = p.tenant_id
             LEFT JOIN brands b ON b.id = p.brand_id AND b.tenant_id = p.tenant_id`;
+  }
+
+  private classification(kind: CatalogClassificationKind) {
+    return kind === CatalogClassificationKind.CATEGORIES
+      ? ({ table: 'categories', productColumn: 'category_id' } as const)
+      : ({ table: 'brands', productColumn: 'brand_id' } as const);
+  }
+
+  private async classificationById(
+    tenantId: string,
+    kind: CatalogClassificationKind,
+    id: string,
+    source: DataSource | EntityManager = this.dataSource,
+  ): Promise<CatalogClassificationData | null> {
+    const { table, productColumn } = this.classification(kind);
+    const rows = await source.query<
+      Array<{
+        id: string;
+        name: string;
+        active: number | boolean;
+        product_count: string | number;
+      }>
+    >(
+      `SELECT x.id, x.name, x.active, COUNT(p.id) AS product_count
+       FROM ${table} x
+       LEFT JOIN products p ON p.tenant_id = x.tenant_id AND p.${productColumn} = x.id
+       WHERE x.tenant_id = ? AND x.id = ?
+       GROUP BY x.id, x.name, x.active LIMIT 1`,
+      [tenantId, id],
+    );
+    const row = rows[0];
+    return row
+      ? {
+          id: row.id,
+          name: row.name,
+          active: Boolean(row.active),
+          productCount: Number(row.product_count),
+        }
+      : null;
   }
 
   private toProduct(row: ProductRow): ProductData {

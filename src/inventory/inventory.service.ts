@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
+import { CreateInventoryStateTransitionDto } from './dto/create-inventory-state-transition.dto';
 import { ListInventoryStockDto } from './dto/list-inventory-stock.dto';
 import { ListInventoryMovementsDto } from './dto/list-inventory-movements.dto';
 import {
@@ -12,14 +13,22 @@ import {
   InitialStockAlreadyExistsError,
   InsufficientStockError,
   InventoryTargetNotFoundError,
+  InventoryCountConflictError,
+  MovementReferenceRequiredError,
+  InsufficientStockStateError,
+  InvalidStockStateTransitionError,
 } from './inventory.errors';
 import { InventoryRepository } from './inventory.repository';
 import {
   InventoryBalanceResponse,
+  InventoryCountInput,
+  InventoryCountResponse,
   InventoryLocationsResponse,
   InventoryMovementResponse,
   InventoryMovementListResponse,
   InventoryStockListResponse,
+  InventoryStateTransitionResponse,
+  INVENTORY_STOCK_POLICY,
 } from './inventory.types';
 
 @Injectable()
@@ -90,6 +99,7 @@ export class InventoryService {
         data: result.items,
         meta: {
           apiVersion: '1',
+          policy: INVENTORY_STOCK_POLICY,
           scope: result.scope,
           pagination: {
             page: query.page,
@@ -120,7 +130,7 @@ export class InventoryService {
           productId,
           locationId,
         ),
-        meta: { apiVersion: '1' },
+        meta: { apiVersion: '1', policy: INVENTORY_STOCK_POLICY },
       };
     } catch (error) {
       if (error instanceof InventoryTargetNotFoundError)
@@ -165,6 +175,13 @@ export class InventoryService {
             'El stock inicial ya fue registrado para este producto y ubicación.',
         });
       }
+      if (error instanceof MovementReferenceRequiredError) {
+        throw new BadRequestException({
+          code: 'MOVEMENT_REFERENCE_REQUIRED',
+          message:
+            'La referencia o evidencia es obligatoria para este tipo de movimiento.',
+        });
+      }
       if (error instanceof IdempotencyConflictError) {
         throw new ConflictException({
           code: 'IDEMPOTENCY_KEY_REUSED',
@@ -175,6 +192,110 @@ export class InventoryService {
         throw new ConflictException({
           code: 'INVALID_STOCK_QUANTITY',
           message: 'La cantidad es inválida o dejaría el saldo negativo.',
+        });
+      }
+      throw error;
+    }
+  }
+
+  async createCount(input: {
+    tenantId: string;
+    warehouseId: string;
+    userId: string;
+    idempotencyKey: string | undefined;
+    dto: InventoryCountInput;
+  }): Promise<InventoryCountResponse> {
+    if (
+      !input.idempotencyKey ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(input.idempotencyKey)
+    ) {
+      throw new BadRequestException({
+        code: 'INVALID_IDEMPOTENCY_KEY',
+        message:
+          'Idempotency-Key es obligatorio y debe tener entre 8 y 128 caracteres.',
+      });
+    }
+    try {
+      const result = await this.inventory.createCount({
+        ...input,
+        idempotencyKey: input.idempotencyKey,
+      });
+      return {
+        data: result.count,
+        meta: { apiVersion: '1', idempotentReplay: result.replay },
+      };
+    } catch (error) {
+      if (error instanceof InventoryTargetNotFoundError)
+        throw new NotFoundException();
+      if (error instanceof InventoryCountConflictError) {
+        throw new ConflictException({
+          code: 'INVENTORY_COUNT_CONFLICT',
+          currentQuantity: error.currentQuantity,
+          message:
+            'El saldo cambió desde la captura; revisa el conteo antes de reintentarlo.',
+        });
+      }
+      if (error instanceof IdempotencyConflictError) {
+        throw new ConflictException({
+          code: 'IDEMPOTENCY_KEY_REUSED',
+          message: 'La clave de idempotencia ya fue usada con otros datos.',
+        });
+      }
+      if (error instanceof InsufficientStockError) {
+        throw new ConflictException({
+          code: 'INVALID_STOCK_QUANTITY',
+          message: 'El conteo produciría un saldo total inválido.',
+        });
+      }
+      throw error;
+    }
+  }
+
+  async createStateTransition(input: {
+    tenantId: string;
+    warehouseId: string;
+    userId: string;
+    idempotencyKey: string | undefined;
+    dto: CreateInventoryStateTransitionDto;
+  }): Promise<InventoryStateTransitionResponse> {
+    if (
+      !input.idempotencyKey ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(input.idempotencyKey)
+    ) {
+      throw new BadRequestException({
+        code: 'INVALID_IDEMPOTENCY_KEY',
+        message:
+          'Idempotency-Key es obligatorio y debe tener entre 8 y 128 caracteres.',
+      });
+    }
+    try {
+      const result = await this.inventory.createStateTransition({
+        ...input,
+        idempotencyKey: input.idempotencyKey,
+      });
+      return {
+        data: result.movement,
+        meta: { apiVersion: '1', idempotentReplay: result.replay },
+      };
+    } catch (error) {
+      if (error instanceof InventoryTargetNotFoundError)
+        throw new NotFoundException();
+      if (error instanceof InvalidStockStateTransitionError) {
+        throw new BadRequestException({
+          code: 'INVALID_STOCK_STATE_TRANSITION',
+          message: 'La transición de estado solicitada no está permitida.',
+        });
+      }
+      if (error instanceof InsufficientStockStateError) {
+        throw new ConflictException({
+          code: 'INSUFFICIENT_STOCK_STATE',
+          message: 'El estado de origen no tiene cantidad suficiente.',
+        });
+      }
+      if (error instanceof IdempotencyConflictError) {
+        throw new ConflictException({
+          code: 'IDEMPOTENCY_KEY_REUSED',
+          message: 'La clave de idempotencia ya fue usada con otros datos.',
         });
       }
       throw error;

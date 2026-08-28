@@ -1,4 +1,10 @@
-import { Column, CreateDateColumn, Entity, PrimaryColumn } from 'typeorm';
+import {
+  Column,
+  CreateDateColumn,
+  Entity,
+  PrimaryColumn,
+  UpdateDateColumn,
+} from 'typeorm';
 
 @Entity({ name: 'brands' })
 export class BrandEntity {
@@ -14,6 +20,12 @@ export class BrandEntity {
   @Column({ name: 'normalized_name', type: 'varchar', length: 120 })
   normalizedName!: string;
 
+  @Column({ type: 'boolean', default: true })
+  active!: boolean;
+
   @CreateDateColumn({ name: 'created_at', type: 'datetime', precision: 6 })
   createdAt!: Date;
+
+  @UpdateDateColumn({ name: 'updated_at', type: 'datetime', precision: 6 })
+  updatedAt!: Date;
 }

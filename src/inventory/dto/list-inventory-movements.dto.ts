@@ -10,7 +10,10 @@ import {
   MaxLength,
   Min,
 } from 'class-validator';
-import type { InventoryMovementType } from '../inventory.types';
+import {
+  INVENTORY_MOVEMENT_TYPES,
+  type InventoryMovementType,
+} from '../inventory.types';
 
 const optionalTrim = ({ value }: { value: unknown }) => {
   if (typeof value !== 'string') return value;
@@ -23,14 +26,40 @@ export class ListInventoryMovementsDto {
   @IsUUID()
   productId?: string;
 
+  @IsOptional()
+  @IsUUID()
+  locationId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  userId?: string;
+
   @Transform(optionalTrim)
   @IsOptional()
   @IsString()
   @MaxLength(80)
   q?: string;
 
+  @Transform(optionalTrim)
   @IsOptional()
-  @IsIn(['INITIAL', 'ENTRY', 'ADJUSTMENT', 'SALE'])
+  @IsString()
+  @MaxLength(120)
+  location?: string;
+
+  @Transform(optionalTrim)
+  @IsOptional()
+  @IsString()
+  @MaxLength(254)
+  responsible?: string;
+
+  @Transform(optionalTrim)
+  @IsOptional()
+  @IsString()
+  @MaxLength(128)
+  document?: string;
+
+  @IsOptional()
+  @IsIn(INVENTORY_MOVEMENT_TYPES)
   type?: InventoryMovementType;
 
   @IsOptional()
