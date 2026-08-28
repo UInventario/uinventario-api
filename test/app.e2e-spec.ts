@@ -2103,7 +2103,7 @@ describe('UInventario API (e2e)', () => {
           productId: order.lines[0].productId,
           locationId: setup.locationId,
           type: 'INITIAL',
-          quantity: '1.000',
+          quantity: '2.000',
           reason: 'Stock previo para validar costo histórico',
         })
         .expect(201);
@@ -2182,7 +2182,7 @@ describe('UInventario API (e2e)', () => {
                       unitCost: '80.00',
                       totalCost: '160.00',
                       previousCatalogCost: '85.40',
-                      resultingCatalogCost: '80.00',
+                      resultingCatalogCost: '81.80',
                     },
                   ],
                 },
@@ -2316,6 +2316,9 @@ describe('UInventario API (e2e)', () => {
           productCost: string;
           historicalSaleCost: string;
           receivedCost: string;
+          valuationQuantity: string;
+          valuationValue: string;
+          averageUnitCost: string;
           audits: number | string;
         }>
       >(
@@ -2336,6 +2339,12 @@ describe('UInventario API (e2e)', () => {
            (SELECT SUM(prl.total_cost) FROM purchase_receipt_lines prl
             INNER JOIN purchase_receipts pr ON pr.id = prl.receipt_id
             WHERE pr.purchase_order_id = ?) AS receivedCost,
+           (SELECT quantity FROM inventory_valuations
+            WHERE product_id = ?) AS valuationQuantity,
+           (SELECT inventory_value FROM inventory_valuations
+            WHERE product_id = ?) AS valuationValue,
+           (SELECT average_unit_cost FROM inventory_valuations
+            WHERE product_id = ?) AS averageUnitCost,
            (SELECT COUNT(*) FROM audit_events
             WHERE entity_id = ? AND action = 'PURCHASE_ORDER_RECEIVED') AS audits`,
         [
@@ -2347,16 +2356,22 @@ describe('UInventario API (e2e)', () => {
           order.lines[0].productId,
           order.lines[0].productId,
           order.id,
+          order.lines[0].productId,
+          order.lines[0].productId,
+          order.lines[0].productId,
           order.id,
         ],
       );
       expect(Number(counts.receipts)).toBe(3);
       expect(Number(counts.receiptLines)).toBe(3);
       expect(Number(counts.purchaseMovements)).toBe(3);
-      expect(counts.balance).toBe('6.000');
-      expect(counts.productCost).toBe('80.00');
+      expect(counts.balance).toBe('7.000');
+      expect(counts.productCost).toBe('80.77');
       expect(counts.historicalSaleCost).toBe('85.40');
       expect(counts.receivedCost).toBe('480.00');
+      expect(counts.valuationQuantity).toBe('7.000');
+      expect(counts.valuationValue).toBe('565.4000');
+      expect(counts.averageUnitCost).toBe('80.7714');
       expect(Number(counts.audits)).toBe(3);
 
       await request(app.getHttpServer())
@@ -2372,8 +2387,40 @@ describe('UInventario API (e2e)', () => {
             product: { id: order.lines[0].productId },
             location: { id: setup.locationId },
             document: { type: 'PURCHASE_RECEIPT' },
+            valuation: {
+              unitCost: '80.0000',
+              averageUnitCost: '80.7714',
+            },
           });
           expect(body.meta).toMatchObject({ pagination: { total: 3 } });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                product: {
+                  id: order.lines[0].productId,
+                  name: 'Receipts Producto',
+                  sku: 'RECEIPTS-1',
+                  active: true,
+                },
+                totalQuantity: '7.000',
+                averageUnitCost: '80.7714',
+                inventoryValue: '565.3998',
+                valuation: {
+                  quantity: '7.000',
+                  inventoryValue: '565.4000',
+                  quantityReconciled: true,
+                  valueReconciled: true,
+                  reconciled: true,
+                },
+              }),
+            ]),
+          );
         });
     });
 
@@ -2451,6 +2498,7 @@ describe('UInventario API (e2e)', () => {
           receipts: number | string;
           movements: number | string;
           balances: number | string;
+          valuations: number | string;
           productCost: string;
         }>
       >(
@@ -2460,6 +2508,8 @@ describe('UInventario API (e2e)', () => {
             WHERE purchase_receipt_id IS NOT NULL) AS movements,
            (SELECT COUNT(*) FROM inventory_balances
             WHERE product_id = pol.product_id AND location_id = ?) AS balances,
+           (SELECT COUNT(*) FROM inventory_valuations
+            WHERE product_id = pol.product_id) AS valuations,
            (SELECT cost FROM products WHERE id = pol.product_id) AS productCost
          FROM purchase_orders po
          INNER JOIN purchase_order_lines pol ON pol.purchase_order_id = po.id
@@ -2473,6 +2523,7 @@ describe('UInventario API (e2e)', () => {
         receipts: Number(state.receipts),
         movements: Number(state.movements),
         balances: Number(state.balances),
+        valuations: Number(state.valuations),
         productCost: state.productCost,
       }).toEqual({
         status: 'APPROVED',
@@ -2481,6 +2532,7 @@ describe('UInventario API (e2e)', () => {
         receipts: 0,
         movements: 0,
         balances: 0,
+        valuations: 0,
         productCost: '85.40',
       });
     });
@@ -8012,6 +8064,11 @@ describe('UInventario API (e2e)', () => {
           reversed_payments: number | string;
           sale_void_movements: number | string;
           balance: string;
+          valuationQuantity: string;
+          valuationValue: string;
+          averageUnitCost: string;
+          saleUnitCost: string;
+          voidUnitCost: string;
           audit_events: number | string;
           before_data: string | { status: string };
           after_data: string | { status: string; reason: string };
@@ -8022,10 +8079,28 @@ describe('UInventario API (e2e)', () => {
                 (SELECT COUNT(*) FROM inventory_movements WHERE type = 'SALE_VOID') AS sale_void_movements,
                 (SELECT quantity FROM inventory_balances
                   WHERE product_id = ? AND location_id = ?) AS balance,
+                (SELECT quantity FROM inventory_valuations
+                  WHERE product_id = ?) AS valuationQuantity,
+                (SELECT inventory_value FROM inventory_valuations
+                  WHERE product_id = ?) AS valuationValue,
+                (SELECT average_unit_cost FROM inventory_valuations
+                  WHERE product_id = ?) AS averageUnitCost,
+                (SELECT unit_cost FROM inventory_movements
+                  WHERE product_id = ? AND type = 'SALE' LIMIT 1) AS saleUnitCost,
+                (SELECT unit_cost FROM inventory_movements
+                  WHERE product_id = ? AND type = 'SALE_VOID' LIMIT 1) AS voidUnitCost,
                 (SELECT COUNT(*) FROM audit_events WHERE action = 'SALE_VOIDED') AS audit_events,
                 (SELECT before_data FROM audit_events WHERE action = 'SALE_VOIDED' LIMIT 1) AS before_data,
                 (SELECT after_data FROM audit_events WHERE action = 'SALE_VOIDED' LIMIT 1) AS after_data`,
-        [productId, locationId],
+        [
+          productId,
+          locationId,
+          productId,
+          productId,
+          productId,
+          productId,
+          productId,
+        ],
       );
       const before =
         typeof state.before_data === 'string'
@@ -8040,6 +8115,11 @@ describe('UInventario API (e2e)', () => {
         reversedPayments: Number(state.reversed_payments),
         saleVoidMovements: Number(state.sale_void_movements),
         balance: state.balance,
+        valuationQuantity: state.valuationQuantity,
+        valuationValue: state.valuationValue,
+        averageUnitCost: state.averageUnitCost,
+        saleUnitCost: state.saleUnitCost,
+        voidUnitCost: state.voidUnitCost,
         auditEvents: Number(state.audit_events),
         before,
         after,
@@ -8048,6 +8128,11 @@ describe('UInventario API (e2e)', () => {
         reversedPayments: 1,
         saleVoidMovements: 1,
         balance: '5.000',
+        valuationQuantity: '5.000',
+        valuationValue: '400.0000',
+        averageUnitCost: '80.0000',
+        saleUnitCost: '80.0000',
+        voidUnitCost: '80.0000',
         auditEvents: 1,
         before: { status: 'COMPLETED', paymentStatus: 'COMPLETED' },
         after: {
@@ -8078,6 +8163,12 @@ describe('UInventario API (e2e)', () => {
                 quantityChange: '2.000',
                 responsible: { email: registrationPayload.email },
                 document: { type: 'SALE', id: saleId },
+                valuation: {
+                  unitCost: '80.0000',
+                  valueChange: '160.0000',
+                  resultingInventoryValue: '400.0000',
+                  averageUnitCost: '80.0000',
+                },
               },
             ],
           });
@@ -8205,19 +8296,33 @@ describe('UInventario API (e2e)', () => {
           sales: number | string;
           sale_movements: number | string;
           balance: string;
+          valuationQuantity: string;
+          valuationValue: string;
         }>
       >(
         `SELECT (SELECT COUNT(*) FROM sales) AS sales,
                 (SELECT COUNT(*) FROM inventory_movements WHERE type = 'SALE') AS sale_movements,
                 (SELECT quantity FROM inventory_balances
-                  WHERE product_id = ? AND location_id = ?) AS balance`,
-        [productId, locationId],
+                  WHERE product_id = ? AND location_id = ?) AS balance,
+                (SELECT quantity FROM inventory_valuations
+                  WHERE product_id = ?) AS valuationQuantity,
+                (SELECT inventory_value FROM inventory_valuations
+                  WHERE product_id = ?) AS valuationValue`,
+        [productId, locationId, productId, productId],
       );
       expect({
         sales: Number(state.sales),
         saleMovements: Number(state.sale_movements),
         balance: state.balance,
-      }).toEqual({ sales: 1, saleMovements: 1, balance: '2.000' });
+        valuationQuantity: state.valuationQuantity,
+        valuationValue: state.valuationValue,
+      }).toEqual({
+        sales: 1,
+        saleMovements: 1,
+        balance: '2.000',
+        valuationQuantity: '2.000',
+        valuationValue: '160.0000',
+      });
     });
 
     it('rolls back the stock decrement when payment persistence fails', async () => {

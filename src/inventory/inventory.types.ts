@@ -73,6 +73,14 @@ export interface InventoryMovementData extends InventoryBalanceData {
     to: InventoryStockState;
     quantity: string;
   } | null;
+  valuation: InventoryMovementValuation | null;
+}
+
+export interface InventoryMovementValuation {
+  unitCost: string;
+  valueChange: string;
+  resultingInventoryValue: string | null;
+  averageUnitCost: string | null;
 }
 
 export interface InventoryLocationsResponse {
@@ -157,6 +165,7 @@ export interface InventoryMovementHistoryItem {
     to: InventoryStockState;
     quantity: string;
   } | null;
+  valuation: InventoryMovementValuation | null;
 }
 
 export interface InventoryMovementListResponse {
@@ -178,6 +187,15 @@ export interface InventoryStockItem {
   availableQuantity: string;
   totalQuantity: string;
   states: InventoryStateQuantity[];
+  averageUnitCost: string;
+  inventoryValue: string;
+  valuation: {
+    quantity: string;
+    inventoryValue: string;
+    quantityReconciled: boolean;
+    valueReconciled: boolean;
+    reconciled: boolean;
+  };
 }
 
 export interface InventoryStateTransitionResponse {

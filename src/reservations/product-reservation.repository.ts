@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
+import { applyInventoryValuation } from '../inventory/inventory-valuation';
 import { CreateProductReservationDto } from './dto/create-product-reservation.dto';
 import {
   ProductReservationIdempotencyConflictError,
@@ -131,6 +132,7 @@ export class ProductReservationRepository {
               [line.productId, input.tenantId],
             );
             if (!product) throw new ProductReservationTargetNotFoundError();
+            const movementId = randomUUID();
             await manager.query(
               `INSERT INTO inventory_balances (tenant_id, product_id, location_id, quantity)
              VALUES (?, ?, ?, 0) ON DUPLICATE KEY UPDATE quantity = quantity`,
@@ -190,7 +192,7 @@ export class ProductReservationRepository {
              VALUES (?, ?, ?, ?, 'STATE_TRANSITION', 'AVAILABLE', 'RESERVED', ?, 0, ?,
                      'Reserva de cliente', ?, ?, ?, ?, ?, ?)`,
               [
-                randomUUID(),
+                movementId,
                 input.tenantId,
                 line.productId,
                 input.dto.locationId,
@@ -204,6 +206,7 @@ export class ProductReservationRepository {
                 reservationLineId,
               ],
             );
+            await applyInventoryValuation(manager, movementId);
           }
           const reservation = await this.findById(manager, input.tenantId, id);
           if (!reservation) throw new Error('CREATED_RESERVATION_NOT_FOUND');
@@ -477,6 +480,7 @@ export class ProductReservationRepository {
         throw new ProductReservationInsufficientStockError(line.product_id);
       const available = this.units(balance.available_quantity) + quantity;
       const reserved = this.units(balance.reserved_quantity) - quantity;
+      const movementId = randomUUID();
       await manager.query(
         `UPDATE inventory_balances SET available_quantity = ?, reserved_quantity = ?
          WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
@@ -497,7 +501,7 @@ export class ProductReservationRepository {
          VALUES (?, ?, ?, ?, 'STATE_TRANSITION', 'RESERVED', 'AVAILABLE', ?, 0, ?,
                  ?, ?, ?, ?, ?, ?, ?)`,
         [
-          randomUUID(),
+          movementId,
           input.tenantId,
           line.product_id,
           reservation.location_id,
@@ -512,6 +516,7 @@ export class ProductReservationRepository {
           line.id,
         ],
       );
+      await applyInventoryValuation(manager, movementId);
     }
     await manager.query(
       `UPDATE product_reservations

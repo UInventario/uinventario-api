@@ -103,6 +103,18 @@ El workflow `Security` audita dependencias y escanea el historial Git en cada PR
 y push a `develop` o `master`. No se deben agregar excepciones al escaneo para
 credenciales reales; los secretos pertenecen al gestor seguro del ambiente.
 
+## Valorización de inventario
+
+Las cantidades se persisten con 3 decimales y los costos/valores de inventario con
+4; el costo comercial del producto conserva 2 decimales. Los cálculos usan enteros
+escalados y redondeo aritmético a la mitad alejándose de cero. Cada recepción de
+compra recalcula el promedio móvil bajo bloqueo por tenant/producto; las salidas
+conservan el costo promedio vigente y una anulación de venta repone el costo
+histórico del movimiento original. Cantidad, valor, movimiento y costo de catálogo
+se actualizan en la misma transacción. Al migrar datos previos, el saldo inicial de
+valorización se corta al costo de catálogo vigente. `GET /api/v1/inventory/stock`
+expone cantidad/valor globales y sus indicadores de reconciliación.
+
 ## Gates
 
 ```bash

@@ -26,6 +26,7 @@ import {
   InventoryMovementData,
   InventoryStockItem,
 } from './inventory.types';
+import { applyInventoryValuation } from './inventory-valuation';
 
 interface MovementRow {
   id: string;
@@ -45,6 +46,10 @@ interface MovementRow {
   from_state: InventoryStockState | null;
   to_state: InventoryStockState | null;
   state_quantity: string | null;
+  unit_cost: string | null;
+  value_change: string | null;
+  resulting_inventory_value: string | null;
+  average_unit_cost: string | null;
 }
 
 interface CountRow {
@@ -199,6 +204,10 @@ export class InventoryRepository {
           from_state: InventoryStockState | null;
           to_state: InventoryStockState | null;
           state_quantity: string | null;
+          unit_cost: string | null;
+          value_change: string | null;
+          resulting_inventory_value: string | null;
+          average_unit_cost: string | null;
         }>
       >(
         `SELECT im.id, im.type, im.quantity_change, im.resulting_quantity,
@@ -206,6 +215,8 @@ export class InventoryRepository {
                 im.inventory_import_id, im.purchase_receipt_id, im.purchase_return_id,
                 im.reservation_id,
                 im.from_state, im.to_state, im.state_quantity,
+                im.unit_cost, im.value_change, im.resulting_inventory_value,
+                im.average_unit_cost,
                 im.reason, im.reference, im.created_at,
                 p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
                 l.id AS location_id, l.name AS location_name, l.code AS location_code,
@@ -315,6 +326,21 @@ export class InventoryRepository {
                 quantity: this.normalizeDecimal(row.state_quantity),
               }
             : null,
+        valuation:
+          row.unit_cost !== null && row.value_change !== null
+            ? {
+                unitCost: this.normalizeCost(row.unit_cost),
+                valueChange: this.normalizeCost(row.value_change),
+                resultingInventoryValue:
+                  row.resulting_inventory_value === null
+                    ? null
+                    : this.normalizeCost(row.resulting_inventory_value),
+                averageUnitCost:
+                  row.average_unit_cost === null
+                    ? null
+                    : this.normalizeCost(row.average_unit_cost),
+              }
+            : null,
       })),
       total: Number(countRows[0]?.total ?? 0),
       scope: { branch },
@@ -380,6 +406,10 @@ export class InventoryRepository {
           damaged_quantity: string;
           in_transit_quantity: string;
           total_quantity: string;
+          global_balance_quantity: string;
+          valuation_quantity: string;
+          average_unit_cost: string;
+          total_inventory_value: string;
         }>
       >(
         `SELECT p.id AS product_id, p.name AS product_name, p.sku AS product_sku, p.active,
@@ -387,12 +417,18 @@ export class InventoryRepository {
                 COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.reserved_quantity ELSE 0 END), 0) AS reserved_quantity,
                 COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.damaged_quantity ELSE 0 END), 0) AS damaged_quantity,
                 COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.in_transit_quantity ELSE 0 END), 0) AS in_transit_quantity,
-                COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.quantity ELSE 0 END), 0) AS total_quantity
+                COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.quantity ELSE 0 END), 0) AS total_quantity,
+                COALESCE(SUM(ib.quantity), 0) AS global_balance_quantity,
+                COALESCE(iv.quantity, 0) AS valuation_quantity,
+                COALESCE(iv.average_unit_cost, p.cost) AS average_unit_cost,
+                COALESCE(iv.inventory_value, 0) AS total_inventory_value
          FROM products p
          LEFT JOIN inventory_balances ib ON ib.product_id = p.id AND ib.tenant_id = p.tenant_id
          LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
+         LEFT JOIN inventory_valuations iv ON iv.product_id = p.id AND iv.tenant_id = p.tenant_id
          WHERE ${where}
-         GROUP BY p.id, p.name, p.sku, p.active, p.created_at
+         GROUP BY p.id, p.name, p.sku, p.active, p.cost, p.created_at,
+                  iv.quantity, iv.average_unit_cost, iv.inventory_value
          ORDER BY p.created_at DESC, p.id DESC LIMIT ? OFFSET ?`,
         [
           warehouseId,
@@ -417,6 +453,14 @@ export class InventoryRepository {
         const damaged = this.normalizeDecimal(row.damaged_quantity);
         const inTransit = this.normalizeDecimal(row.in_transit_quantity);
         const total = this.normalizeDecimal(row.total_quantity);
+        const quantityReconciled =
+          this.toUnits(row.global_balance_quantity) ===
+          this.toUnits(row.valuation_quantity);
+        const valueReconciled = this.isValuationValueReconciled(
+          row.valuation_quantity,
+          row.average_unit_cost,
+          row.total_inventory_value,
+        );
         return {
           product: {
             id: row.product_id,
@@ -432,6 +476,18 @@ export class InventoryRepository {
             { code: 'DAMAGED', quantity: damaged },
             { code: 'IN_TRANSIT', quantity: inTransit },
           ],
+          averageUnitCost: this.normalizeCost(row.average_unit_cost),
+          inventoryValue: this.valuationValue(
+            row.total_quantity,
+            row.average_unit_cost,
+          ),
+          valuation: {
+            quantity: this.normalizeDecimal(row.valuation_quantity),
+            inventoryValue: this.normalizeCost(row.total_inventory_value),
+            quantityReconciled,
+            valueReconciled,
+            reconciled: quantityReconciled && valueReconciled,
+          },
         };
       }),
       total: Number(countRows[0]?.total ?? 0),
@@ -594,7 +650,6 @@ export class InventoryRepository {
             throw new InsufficientStockError();
           const resultingQuantity = this.fromUnits(resultingUnits);
           const resultingAvailable = this.fromUnits(resultingAvailableUnits);
-          const movementId = randomUUID();
           await manager.query(
             `UPDATE inventory_balances SET quantity = ?, available_quantity = ?
            WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
@@ -606,6 +661,7 @@ export class InventoryRepository {
               input.dto.locationId,
             ],
           );
+          const movementId = randomUUID();
           await manager.query(
             `INSERT INTO inventory_movements
             (id, tenant_id, product_id, location_id, type, quantity_change,
@@ -627,6 +683,7 @@ export class InventoryRepository {
               input.userId,
             ],
           );
+          await applyInventoryValuation(manager, movementId);
           const movement = await this.findMovement(
             manager,
             input.tenantId,
@@ -765,6 +822,7 @@ export class InventoryRepository {
                 input.userId,
               ],
             );
+            await applyInventoryValuation(manager, movementId);
           }
           await manager.query(
             `INSERT INTO inventory_counts
@@ -919,6 +977,7 @@ export class InventoryRepository {
               input.dto.locationId,
             ],
           );
+          const movementId = randomUUID();
           await manager.query(
             `INSERT INTO inventory_movements
               (id, tenant_id, product_id, location_id, type, from_state, to_state,
@@ -926,7 +985,7 @@ export class InventoryRepository {
                idempotency_key, request_fingerprint, created_by_user_id)
              VALUES (?, ?, ?, ?, 'STATE_TRANSITION', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
             [
-              randomUUID(),
+              movementId,
               input.tenantId,
               input.dto.productId,
               input.dto.locationId,
@@ -941,6 +1000,7 @@ export class InventoryRepository {
               input.userId,
             ],
           );
+          await applyInventoryValuation(manager, movementId);
           const movement = await this.findMovement(
             manager,
             input.tenantId,
@@ -988,6 +1048,8 @@ export class InventoryRepository {
     const rows = await manager.query<MovementRow[]>(
       `SELECT im.id, im.type, im.quantity_change, im.resulting_quantity,
               im.from_state, im.to_state, im.state_quantity,
+              im.unit_cost, im.value_change, im.resulting_inventory_value,
+              im.average_unit_cost,
               im.reason, im.reference, im.request_fingerprint, im.created_at,
               p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
               l.id AS location_id, l.name AS location_name, l.code AS location_code
@@ -1065,6 +1127,51 @@ export class InventoryRepository {
     return this.fromUnits(this.toUnits(value));
   }
 
+  private normalizeCost(value: string): string {
+    return this.fromCostUnits(this.toCostUnits(value));
+  }
+
+  private valuationValue(quantity: string, unitCost: string): string {
+    const numerator = this.toUnits(quantity) * this.toCostUnits(unitCost);
+    const rounded =
+      numerator >= 0n ? (numerator + 500n) / 1000n : (numerator - 500n) / 1000n;
+    return this.fromCostUnits(rounded);
+  }
+
+  private isValuationValueReconciled(
+    quantity: string,
+    averageUnitCost: string,
+    inventoryValue: string,
+  ): boolean {
+    const quantityUnits = this.toUnits(quantity);
+    const expectedValue = this.toCostUnits(
+      this.valuationValue(quantity, averageUnitCost),
+    );
+    const actualValue = this.toCostUnits(inventoryValue);
+    const difference =
+      expectedValue >= actualValue
+        ? expectedValue - actualValue
+        : actualValue - expectedValue;
+    const absoluteQuantity =
+      quantityUnits < 0n ? -quantityUnits : quantityUnits;
+    const roundingTolerance = (absoluteQuantity + 1999n) / 2000n;
+    return difference <= roundingTolerance;
+  }
+
+  private toCostUnits(value: string): bigint {
+    const negative = value.startsWith('-');
+    const unsigned = negative ? value.slice(1) : value;
+    const [whole, fraction = ''] = unsigned.split('.');
+    const units = BigInt(whole) * 10000n + BigInt(fraction.padEnd(4, '0'));
+    return negative ? -units : units;
+  }
+
+  private fromCostUnits(units: bigint): string {
+    const sign = units < 0n ? '-' : '';
+    const absolute = units < 0n ? -units : units;
+    return `${sign}${absolute / 10000n}.${String(absolute % 10000n).padStart(4, '0')}`;
+  }
+
   private toMovement(row: MovementRow): InventoryMovementData {
     return {
       id: row.id,
@@ -1080,6 +1187,21 @@ export class InventoryRepository {
               from: row.from_state,
               to: row.to_state,
               quantity: this.normalizeDecimal(row.state_quantity),
+            }
+          : null,
+      valuation:
+        row.unit_cost !== null && row.value_change !== null
+          ? {
+              unitCost: this.normalizeCost(row.unit_cost),
+              valueChange: this.normalizeCost(row.value_change),
+              resultingInventoryValue:
+                row.resulting_inventory_value === null
+                  ? null
+                  : this.normalizeCost(row.resulting_inventory_value),
+              averageUnitCost:
+                row.average_unit_cost === null
+                  ? null
+                  : this.normalizeCost(row.average_unit_cost),
             }
           : null,
       product: {

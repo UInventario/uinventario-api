@@ -14,6 +14,7 @@ import {
   InventoryTransferDiscrepancyReasonRequiredError,
   InventoryTransferReceiptExceedsPendingError,
 } from './inventory-transfer.errors';
+import { applyInventoryValuation } from './inventory-valuation';
 import {
   InventoryTransferData,
   InventoryTransferLineData,
@@ -1113,6 +1114,7 @@ export class InventoryTransferRepository {
         }),
       )
       .digest('hex');
+    const movementId = randomUUID();
     await input.manager.query(
       `INSERT INTO inventory_movements
         (id, tenant_id, product_id, location_id, type, quantity_change,
@@ -1120,7 +1122,7 @@ export class InventoryTransferRepository {
          request_fingerprint, created_by_user_id, transfer_id, transfer_line_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        randomUUID(),
+        movementId,
         input.tenantId,
         input.line.product_id,
         input.locationId,
@@ -1136,6 +1138,7 @@ export class InventoryTransferRepository {
         input.line.id,
       ],
     );
+    await applyInventoryValuation(input.manager, movementId);
   }
 
   private async insertReceiptMovement(input: {
@@ -1167,6 +1170,7 @@ export class InventoryTransferRepository {
         }),
       )
       .digest('hex');
+    const movementId = randomUUID();
     await input.manager.query(
       `INSERT INTO inventory_movements
         (id, tenant_id, product_id, location_id, type, from_state, to_state,
@@ -1175,7 +1179,7 @@ export class InventoryTransferRepository {
          transfer_id, transfer_line_id, receipt_id, receipt_line_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        randomUUID(),
+        movementId,
         input.tenantId,
         input.transferLine.product_id,
         input.transferLine.destination_location_id,
@@ -1196,6 +1200,7 @@ export class InventoryTransferRepository {
         input.receiptLineId,
       ],
     );
+    await applyInventoryValuation(input.manager, movementId);
   }
 
   private toLine(line: TransferLineRow): InventoryTransferLineData {

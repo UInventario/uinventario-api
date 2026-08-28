@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
+import { applyInventoryValuation } from '../inventory/inventory-valuation';
 import { ReceivePurchaseOrderDto } from './dto/receive-purchase-order.dto';
 import {
   InvalidPurchaseReceiptError,
@@ -163,6 +164,7 @@ export class PurchaseReceiptRepository {
               [item.orderLine.product_id, input.tenantId],
             );
             if (!product) throw new InvalidPurchaseReceiptError();
+            const movementId = randomUUID();
             await manager.query(
               `INSERT INTO inventory_balances
                 (tenant_id, product_id, location_id, quantity)
@@ -221,16 +223,7 @@ export class PurchaseReceiptRepository {
                 item.orderLine.unit_cost,
                 this.receiptCost(item.received, item.orderLine.unit_cost),
                 product.cost,
-                item.orderLine.unit_cost,
-              ],
-            );
-            await manager.query(
-              `UPDATE products SET cost = ?, version = version + 1
-               WHERE id = ? AND tenant_id = ?`,
-              [
-                item.orderLine.unit_cost,
-                item.orderLine.product_id,
-                input.tenantId,
+                product.cost,
               ],
             );
             const movementFingerprint = createHash('sha256')
@@ -253,7 +246,7 @@ export class PurchaseReceiptRepository {
                  purchase_receipt_line_id)
                VALUES (?, ?, ?, ?, 'PURCHASE_RECEIPT', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
-                randomUUID(),
+                movementId,
                 input.tenantId,
                 item.orderLine.product_id,
                 input.dto.locationId,
@@ -267,6 +260,15 @@ export class PurchaseReceiptRepository {
                 receiptId,
                 receiptLineId,
               ],
+            );
+            await applyInventoryValuation(manager, movementId);
+            await manager.query(
+              `UPDATE purchase_receipt_lines prl
+               INNER JOIN products p
+                 ON p.id = ? AND p.tenant_id = prl.tenant_id
+               SET prl.resulting_catalog_cost = p.cost
+               WHERE prl.id = ? AND prl.tenant_id = ?`,
+              [item.orderLine.product_id, receiptLineId, input.tenantId],
             );
           }
 
