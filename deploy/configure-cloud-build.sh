@@ -49,7 +49,6 @@ if ! gcloud artifacts repositories describe "$artifact_repository" --project="$p
     --location="$region" \
     --repository-format=docker \
     --description="UInventario deployment images" \
-    --immutable-tags \
     --quiet
 fi
 

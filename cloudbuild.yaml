@@ -33,8 +33,13 @@ steps:
         sh -n deploy/database-backup-jobs.sh
         sh -n deploy/configure-cloud-build.sh
         sh -n deploy/configure-observability.sh
+        sh -n deploy/configure-cost-guardrails.sh
         sh -n deploy/verify-observability.sh
+        python -m py_compile deploy/manage-budget.py
+        python -m py_compile deploy/verify-cost-guardrails.py
         python -m py_compile deploy/verify-cloud-run-scaling.py
+        python -m unittest deploy/test_manage_budget.py
+        python deploy/verify-cost-guardrails.py
 
   - id: build-image
     name: gcr.io/cloud-builders/docker

@@ -63,7 +63,7 @@ deploy_job() {
     --task-timeout=30m \
     --cpu=1 \
     --memory=512Mi \
-    --labels="app=uinventario,environment=${environment},component=database-recovery" \
+    --labels="app=uinventario,environment=${environment},component=database-recovery,owner=uinventario" \
     --quiet
 }
 
