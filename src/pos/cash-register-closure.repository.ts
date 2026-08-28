@@ -173,6 +173,7 @@ export class CashRegisterClosureRepository {
              AND s.status = 'COMPLETED') AS sales_count,
          COALESCE((SELECT SUM(sp.amount_applied) FROM sales s
            INNER JOIN sale_payments sp ON sp.sale_id = s.id AND sp.tenant_id = s.tenant_id
+             AND sp.method = 'CASH'
            WHERE s.tenant_id = crs.tenant_id AND s.cash_register_shift_id = crs.id
              AND s.status = 'COMPLETED'), 0) AS cash_sales,
          (SELECT COUNT(*) FROM cash_register_movements cm
@@ -225,8 +226,9 @@ export class CashRegisterClosureRepository {
                    (SELECT COUNT(*) FROM sales s WHERE s.tenant_id = crs.tenant_id
                      AND s.cash_register_shift_id = crs.id AND s.status = 'COMPLETED') AS sales_count,
                    COALESCE((SELECT SUM(sp.amount_applied) FROM sales s
-                     INNER JOIN sale_payments sp
+                   INNER JOIN sale_payments sp
                        ON sp.sale_id = s.id AND sp.tenant_id = s.tenant_id
+                         AND sp.method = 'CASH'
                      WHERE s.tenant_id = crs.tenant_id
                        AND s.cash_register_shift_id = crs.id AND s.status = 'COMPLETED'), 0)
                      AS cash_sales,

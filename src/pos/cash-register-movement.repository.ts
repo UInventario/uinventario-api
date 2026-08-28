@@ -278,6 +278,7 @@ export class CashRegisterMovementRepository {
          + COALESCE((
              SELECT SUM(sp.amount_applied) FROM sales s
              INNER JOIN sale_payments sp ON sp.sale_id = s.id AND sp.tenant_id = s.tenant_id
+               AND sp.method = 'CASH'
              WHERE s.tenant_id = crs.tenant_id
                AND s.cash_register_shift_id = crs.id AND s.status = 'COMPLETED'
            ), 0)

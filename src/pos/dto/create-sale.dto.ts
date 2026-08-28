@@ -1,0 +1,56 @@
+import { Type } from 'class-transformer';
+import {
+  ArrayMaxSize,
+  ArrayMinSize,
+  IsArray,
+  IsIn,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Matches,
+  MaxLength,
+  MinLength,
+  ValidateNested,
+} from 'class-validator';
+import { QuoteCartLineDto } from './quote-cart.dto';
+
+export const PAYMENT_METHODS = ['CASH', 'CARD', 'TRANSFER', 'VOUCHER'] as const;
+export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
+
+export class SalePaymentDto {
+  @IsIn(PAYMENT_METHODS)
+  method!: PaymentMethod;
+
+  @IsOptional()
+  @IsString()
+  @Matches(/^(0|[1-9]\d{0,11})(\.\d{1,2})?$/)
+  amountReceived?: string;
+
+  @IsOptional()
+  @IsString()
+  @MinLength(4)
+  @MaxLength(120)
+  @Matches(/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/)
+  reference?: string;
+}
+
+export class CreateSaleDto {
+  @IsOptional()
+  @IsUUID()
+  customerId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  reservationId?: string;
+
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(100)
+  @ValidateNested({ each: true })
+  @Type(() => QuoteCartLineDto)
+  lines!: QuoteCartLineDto[];
+
+  @ValidateNested()
+  @Type(() => SalePaymentDto)
+  payment!: SalePaymentDto;
+}

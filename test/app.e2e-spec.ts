@@ -5770,6 +5770,89 @@ describe('UInventario API (e2e)', () => {
       return { cookie, productId, locationId: location.id };
     }
 
+    it('authorizes card, transfer and voucher payments without affecting expected cash', async () => {
+      const { cookie, productId, locationId } = await preparePos();
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/payment-options')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              methods: ['CASH', 'CARD', 'TRANSFER', 'VOUCHER'],
+              nonCashProvider: 'SIMULATOR',
+            },
+          });
+        });
+
+      const sale = (
+        method: 'CARD' | 'TRANSFER' | 'VOUCHER',
+        reference: string,
+      ) => ({
+        lines: [{ productId, quantity: '1' }],
+        payment: { method, reference },
+      });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'noncash-declined')
+        .send(sale('CARD', 'DECLINE-001'))
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PAYMENT_DECLINED');
+        });
+
+      for (const [index, method] of (
+        ['CARD', 'TRANSFER', 'VOUCHER'] as const
+      ).entries()) {
+        const reference = `${method}-REF-001`;
+        await request(app.getHttpServer())
+          .post('/api/v1/pos/sales')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', `noncash-approved-${index}`)
+          .send(sale(method, reference))
+          .expect(201)
+          .expect(({ body }: { body: unknown }) => {
+            expect(body).toMatchObject({
+              data: {
+                payment: {
+                  method,
+                  status: 'COMPLETED',
+                  amountReceived: '119.90',
+                  amountApplied: '119.90',
+                  change: '0.00',
+                  reference,
+                  provider: 'SIMULATOR',
+                },
+              },
+            });
+          });
+      }
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'noncash-duplicate-reference')
+        .send(sale('CARD', 'CARD-REF-001'))
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PAYMENT_REFERENCE_REUSED');
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { expectedCash: '250.00' } });
+        });
+      const [balance] = await dataSource.query<Array<{ quantity: string }>>(
+        `SELECT available_quantity AS quantity FROM inventory_balances
+         WHERE product_id = ? AND location_id = ?`,
+        [productId, locationId],
+      );
+      expect(balance.quantity).toBe('2.000');
+    });
+
     it('manages tenant customers and associates an optional active customer to sales', async () => {
       const { cookie, productId } = await preparePos();
       await request(app.getHttpServer())
@@ -7592,7 +7675,7 @@ describe('UInventario API (e2e)', () => {
       );
 
       await expect(
-        app.get(SalesRepository).persistCashSale({
+        app.get(SalesRepository).persistSale({
           tenantId: principal.tenant_id,
           userId: principal.id,
           idempotencyKey: 'pos-payment-rollback',
@@ -7601,6 +7684,13 @@ describe('UInventario API (e2e)', () => {
           quote,
           amountReceived: '10000000000000.00',
           change: '0.00',
+          payment: {
+            method: 'CASH',
+            reference: null,
+            provider: 'CASH',
+            providerReference: null,
+            authorizationCode: null,
+          },
         }),
       ).rejects.toThrow();
       const [state] = await dataSource.query<

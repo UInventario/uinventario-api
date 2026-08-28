@@ -34,6 +34,12 @@ export class PosIdempotencyConflictError extends Error {
   }
 }
 
+export class PaymentReferenceConflictError extends Error {
+  constructor() {
+    super('PAYMENT_REFERENCE_REUSED');
+  }
+}
+
 export class SaleAlreadyVoidedError extends Error {
   constructor() {
     super('SALE_ALREADY_VOIDED');

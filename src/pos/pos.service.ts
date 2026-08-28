@@ -9,6 +9,7 @@ import type { ConfigType } from '@nestjs/config';
 import { createHash } from 'node:crypto';
 import { posConfig } from '../config/pos.config';
 import { CreateCashSaleDto } from './dto/create-cash-sale.dto';
+import { CreateSaleDto } from './dto/create-sale.dto';
 import { ListSalesDto } from './dto/list-sales.dto';
 import { QuoteCartDto } from './dto/quote-cart.dto';
 import { VoidSaleDto } from './dto/void-sale.dto';
@@ -17,6 +18,7 @@ import {
   PosCustomerNotAvailableError,
   PosIdempotencyConflictError,
   PosInsufficientStockError,
+  PaymentReferenceConflictError,
   PosProductNotAvailableError,
   PosReservationNotAvailableError,
   SaleAlreadyVoidedError,
@@ -31,6 +33,11 @@ import {
 } from './pos.types';
 import { CashRegisterShiftService } from './cash-register-shift.service';
 import { CashRegisterShiftRequiredError } from './cash-register-shift.errors';
+import {
+  PaymentAuthorizationService,
+  PaymentDeclinedError,
+  PaymentMethodUnavailableError,
+} from './payment-authorization.service';
 
 @Injectable()
 export class PosService {
@@ -38,6 +45,7 @@ export class PosService {
     private readonly pos: PosRepository,
     private readonly sales: SalesRepository,
     private readonly shifts: CashRegisterShiftService,
+    private readonly paymentAuthorization: PaymentAuthorizationService,
     @Inject(posConfig.KEY)
     private readonly config: ConfigType<typeof posConfig>,
   ) {}
@@ -143,6 +151,27 @@ export class PosService {
     dto: CreateCashSaleDto;
     expectedSnapshot?: OfflineCashSaleSnapshot;
   }): Promise<CashSaleResponse> {
+    return this.createSale({
+      ...input,
+      dto: {
+        customerId: input.dto.customerId,
+        reservationId: input.dto.reservationId,
+        lines: input.dto.lines,
+        payment: { method: 'CASH', amountReceived: input.dto.cashReceived },
+      },
+    });
+  }
+
+  async createSale(input: {
+    tenantId: string;
+    branchId: string;
+    warehouseId: string;
+    cashRegisterId: string;
+    userId: string;
+    idempotencyKey: string | undefined;
+    dto: CreateSaleDto;
+    expectedSnapshot?: OfflineCashSaleSnapshot;
+  }): Promise<CashSaleResponse> {
     this.assertIdempotencyKey(input.idempotencyKey);
     const fingerprint = this.saleFingerprint(input.dto);
     try {
@@ -175,15 +204,37 @@ export class PosService {
         cashRegisterId: input.cashRegisterId,
         userId: input.userId,
       });
-      const receivedCents = this.toMoneyCents(input.dto.cashReceived);
       const totalCents = this.toMoneyCents(quote.data.totals.total);
-      if (receivedCents < totalCents) {
+      const isCash = input.dto.payment.method === 'CASH';
+      if (isCash && !input.dto.payment.amountReceived) {
+        throw new BadRequestException({
+          code: 'CASH_RECEIVED_REQUIRED',
+          message: 'Indica el efectivo recibido.',
+        });
+      }
+      if (!isCash && !input.dto.payment.reference) {
+        throw new BadRequestException({
+          code: 'PAYMENT_REFERENCE_REQUIRED',
+          message: 'La referencia es obligatoria para pagos no efectivos.',
+        });
+      }
+      const receivedCents = isCash
+        ? this.toMoneyCents(input.dto.payment.amountReceived!)
+        : totalCents;
+      if (isCash && receivedCents < totalCents) {
         throw new BadRequestException({
           code: 'INSUFFICIENT_CASH_RECEIVED',
           message: 'El efectivo recibido no cubre el total de la venta.',
         });
       }
-      const result = await this.sales.persistCashSale({
+      const authorization = this.paymentAuthorization.authorize({
+        method: input.dto.payment.method,
+        reference: input.dto.payment.reference,
+        amount: quote.data.totals.total,
+        currency: quote.data.currency,
+        idempotencyKey: input.idempotencyKey!,
+      });
+      const result = await this.sales.persistSale({
         tenantId: input.tenantId,
         userId: input.userId,
         idempotencyKey: input.idempotencyKey!,
@@ -194,6 +245,11 @@ export class PosService {
         reservationId: input.dto.reservationId ?? null,
         amountReceived: this.fromMoneyCents(receivedCents),
         change: this.fromMoneyCents(receivedCents - totalCents),
+        payment: {
+          method: input.dto.payment.method,
+          reference: input.dto.payment.reference ?? null,
+          ...authorization,
+        },
       });
       return {
         data: result.sale,
@@ -204,6 +260,25 @@ export class PosService {
         throw new ConflictException({
           code: 'IDEMPOTENCY_KEY_REUSED',
           message: 'La clave de idempotencia ya fue usada con otros datos.',
+        });
+      }
+      if (error instanceof PaymentMethodUnavailableError) {
+        throw new BadRequestException({
+          code: 'PAYMENT_METHOD_UNAVAILABLE',
+          message: 'El medio de pago no está habilitado en este ambiente.',
+        });
+      }
+      if (error instanceof PaymentDeclinedError) {
+        throw new ConflictException({
+          code: 'PAYMENT_DECLINED',
+          message:
+            'La autorización del pago fue rechazada; no se registró la venta.',
+        });
+      }
+      if (error instanceof PaymentReferenceConflictError) {
+        throw new ConflictException({
+          code: 'PAYMENT_REFERENCE_REUSED',
+          message: 'La referencia del pago ya fue utilizada.',
         });
       }
       if (error instanceof PosInsufficientStockError) {
@@ -258,6 +333,16 @@ export class PosService {
       taxRate: this.normalizeTaxRate(taxRate),
       paymentMethods: ['CASH'] as const,
       negativeStock: 'DENY' as const,
+    };
+  }
+
+  paymentOptions() {
+    return {
+      data: {
+        methods: this.paymentAuthorization.enabledMethods(),
+        nonCashProvider: this.config.nonCashProvider,
+      },
+      meta: { apiVersion: '1' as const },
     };
   }
 
@@ -398,7 +483,7 @@ export class PosService {
     }
   }
 
-  private saleFingerprint(dto: CreateCashSaleDto): string {
+  private saleFingerprint(dto: CreateSaleDto): string {
     const quantities = new Map<string, bigint>();
     for (const line of dto.lines) {
       quantities.set(
@@ -414,7 +499,13 @@ export class PosService {
           productId,
           quantity: this.fromQuantityUnits(quantity),
         })),
-      cashReceived: this.fromMoneyCents(this.toMoneyCents(dto.cashReceived)),
+      payment: {
+        method: dto.payment.method,
+        amountReceived: dto.payment.amountReceived
+          ? this.fromMoneyCents(this.toMoneyCents(dto.payment.amountReceived))
+          : null,
+        reference: dto.payment.reference ?? null,
+      },
       customerId: dto.customerId ?? null,
       reservationId: dto.reservationId ?? null,
     };
