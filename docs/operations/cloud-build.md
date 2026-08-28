@@ -38,7 +38,8 @@ conexión llega a `COMPLETE`.
 
 - `uinventario-cloud-build`: escritura en el repositorio Artifact Registry,
   administración de los servicios/jobs Cloud Run, logs y `actAs` únicamente sobre
-  las dos cuentas runtime.
+  las dos cuentas runtime. Si existe el bucket temporal `PROJECT_ID_cloudbuild`,
+  recibe lectura de objetos sólo sobre ese bucket para builds manuales.
 - `uinventario-api-runtime`: acceso sólo al secret de base del ambiente, aplicado
   cuando UIN-27 crea ese secret.
 - `uinventario-web-runtime`: sin acceso a secretos ni datos GCP.
