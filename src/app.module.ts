@@ -29,6 +29,7 @@ import { ProductReservationModule } from './reservations/product-reservation.mod
 import { OfflineSyncModule } from './offline-sync/offline-sync.module';
 import { DataExportModule } from './data-exports/data-export.module';
 import { SecurityThrottlerGuard } from './security/security-throttler.guard';
+import { ObservabilityModule } from './observability/observability.module';
 
 @Module({
   imports: [
@@ -60,6 +61,7 @@ import { SecurityThrottlerGuard } from './security/security-throttler.guard';
       }),
     }),
     HealthModule,
+    ObservabilityModule,
     RegistrationModule,
     SessionModule,
     PasswordResetModule,

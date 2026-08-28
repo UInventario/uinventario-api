@@ -4,16 +4,23 @@ import {
   ExceptionFilter,
   HttpException,
   HttpStatus,
-  Logger,
 } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
+import { StructuredTelemetryService } from '../observability/structured-telemetry.service';
+import {
+  pseudonymizeTenant,
+  resolveRequestRoute,
+  resolveTraceContext,
+} from '../observability/telemetry-context';
 import type { RequestContext } from './request-context';
 
 @Catch()
 export class SanitizedExceptionFilter implements ExceptionFilter {
-  private readonly logger = new Logger(SanitizedExceptionFilter.name);
-
-  constructor(private readonly adapterHost: HttpAdapterHost) {}
+  constructor(
+    private readonly adapterHost: HttpAdapterHost,
+    private readonly telemetry: StructuredTelemetryService,
+    private readonly deploymentEnvironment: string,
+  ) {}
 
   catch(exception: unknown, host: ArgumentsHost): void {
     const context = host.switchToHttp();
@@ -32,17 +39,19 @@ export class SanitizedExceptionFilter implements ExceptionFilter {
       return;
     }
 
-    this.logger.error(
-      JSON.stringify({
-        event: 'unhandled_request_error',
-        requestId: request.requestId,
-        method: request.method,
-        path: request.originalUrl.split('?')[0],
-        tenantId: request.principal?.tenant.id,
-        userId: request.principal?.user.id,
-        errorType: exception instanceof Error ? exception.name : 'UnknownError',
-      }),
-    );
+    this.telemetry.emit({
+      severity: 'ERROR',
+      event: 'unhandled_request_error',
+      correlationId: request.requestId,
+      ...resolveTraceContext(request),
+      method: request.method,
+      route: resolveRequestRoute(request),
+      tenantRef: pseudonymizeTenant(
+        request.principal?.tenant.id,
+        this.deploymentEnvironment,
+      ),
+      errorType: exception instanceof Error ? exception.name : 'UnknownError',
+    });
     adapter.reply(
       response,
       {

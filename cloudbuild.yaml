@@ -31,6 +31,8 @@ steps:
         sh -n deploy/provision-database-backups.sh
         sh -n deploy/database-backup-jobs.sh
         sh -n deploy/configure-cloud-build.sh
+        sh -n deploy/configure-observability.sh
+        sh -n deploy/verify-observability.sh
 
   - id: build-image
     name: gcr.io/cloud-builders/docker

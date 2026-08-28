@@ -17,10 +17,12 @@ case "$environment" in
   dev)
     project_id="software-inventario-dev"
     database_secret="uinventario-dev-database-url"
+    observability_success_sample_rate="0.20"
     ;;
   prod)
     project_id="software-inventario-prod"
     database_secret="uinventario-prod-database-url"
+    observability_success_sample_rate="0.05"
     ;;
   *) usage ;;
 esac
@@ -86,7 +88,7 @@ gcloud run deploy "$service_name" \
   --image="$image" \
   --service-account="$runtime_service_account" \
   --set-secrets="DATABASE_URL=${database_secret}:latest" \
-  --set-env-vars="NODE_ENV=production,DEPLOY_ENV=${environment},DB_MIGRATIONS_RUN=false,CORS_ORIGINS=${web_origin},PASSWORD_RESET_PUBLIC_URL=${web_origin}/restablecer,PASSWORD_RESET_DELIVERY=disabled" \
+  --set-env-vars="NODE_ENV=production,DEPLOY_ENV=${environment},DB_MIGRATIONS_RUN=false,CORS_ORIGINS=${web_origin},PASSWORD_RESET_PUBLIC_URL=${web_origin}/restablecer,PASSWORD_RESET_DELIVERY=disabled,OBSERVABILITY_SUCCESS_SAMPLE_RATE=${observability_success_sample_rate}" \
   --allow-unauthenticated \
   --port=8080 \
   --cpu=1 \
