@@ -30,6 +30,13 @@ import { PaymentRefundService } from './payment-refund.service';
 import { SuspendedSaleController } from './suspended-sale.controller';
 import { SuspendedSaleRepository } from './suspended-sale.repository';
 import { SuspendedSaleService } from './suspended-sale.service';
+import { PosPeripheralController } from './pos-peripheral.controller';
+import { PosPeripheralRepository } from './pos-peripheral.repository';
+import { PosPeripheralService } from './pos-peripheral.service';
+import {
+  POS_PERIPHERAL_ADAPTER,
+  SimulatorPosPeripheralAdapter,
+} from './pos-peripheral.adapter';
 
 @Module({
   imports: [SessionModule],
@@ -38,6 +45,7 @@ import { SuspendedSaleService } from './suspended-sale.service';
     SaleReceiptController,
     SaleReturnController,
     SuspendedSaleController,
+    PosPeripheralController,
   ],
   providers: [
     PosRepository,
@@ -60,6 +68,13 @@ import { SuspendedSaleService } from './suspended-sale.service';
     PaymentRefundService,
     SuspendedSaleRepository,
     SuspendedSaleService,
+    PosPeripheralRepository,
+    PosPeripheralService,
+    SimulatorPosPeripheralAdapter,
+    {
+      provide: POS_PERIPHERAL_ADAPTER,
+      useExisting: SimulatorPosPeripheralAdapter,
+    },
     SimulatorSaleReceiptEmailAdapter,
     {
       provide: SALE_RECEIPT_EMAIL_ADAPTER,

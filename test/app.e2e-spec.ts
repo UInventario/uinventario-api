@@ -58,6 +58,8 @@ describe('UInventario API (e2e)', () => {
       'offline_devices',
       'offline_sync_tombstones',
       'password_reset_tokens',
+      'pos_peripheral_operations',
+      'pos_peripheral_profiles',
       'sale_receipt_snapshots',
       'customer_credit_ledger',
       'sale_return_settlements',
@@ -943,6 +945,7 @@ describe('UInventario API (e2e)', () => {
                   'ACCESS_MANAGE',
                   'AUDIT_EXPORT',
                   'AUDIT_VIEW',
+                  'CASH_DRAWER_OPEN',
                   'CASH_REGISTER_CLOSE',
                   'CASH_REGISTER_MOVE',
                   'CASH_REGISTER_OPEN',
@@ -9826,6 +9829,180 @@ describe('UInventario API (e2e)', () => {
         createHash('sha256').update(recipient).digest('hex'),
       );
       expect(JSON.stringify(sendData)).not.toContain(recipient);
+    });
+
+    it('operates configured POS peripherals without duplicating sales and with safe retries', async () => {
+      const { cookie, productId } = await preparePos();
+      const sale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'peripheral-sale')
+        .send({ lines: [{ productId, quantity: '1' }], cashReceived: '120.00' })
+        .expect(201);
+      const saleId = (sale.body as { data: { id: string } }).data.id;
+
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/peripherals/profile')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              adapter: 'SIMULATOR',
+              printerEnabled: true,
+              drawerEnabled: true,
+              autoOpenCashSale: true,
+              cashRegister: { code: 'MAIN' },
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .put('/api/v1/pos/peripherals/profile')
+        .set('Cookie', cookie)
+        .send({
+          deviceId: 'FAIL-PRINTER-1',
+          label: 'Impresora simulada con fallo',
+          adapter: 'SIMULATOR',
+          printerEnabled: true,
+          drawerEnabled: true,
+          autoOpenCashSale: true,
+        })
+        .expect(200);
+
+      let failedOperationId = '';
+      for (const replay of [false, true]) {
+        await request(app.getHttpServer())
+          .post(`/api/v1/pos/peripherals/receipts/${saleId}/prints`)
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', 'peripheral-print-failure')
+          .expect(201)
+          .expect(
+            ({
+              body,
+            }: {
+              body: {
+                data: {
+                  operation: { id: string; status: string; errorCode: string };
+                };
+                meta: { idempotentReplay: boolean };
+              };
+            }) => {
+              failedOperationId ||= body.data.operation.id;
+              expect(body.data.operation).toMatchObject({
+                id: failedOperationId,
+                status: 'FAILED',
+                errorCode: 'DEVICE_UNAVAILABLE',
+              });
+              expect(body.meta.idempotentReplay).toBe(replay);
+            },
+          );
+      }
+
+      await request(app.getHttpServer())
+        .put('/api/v1/pos/peripherals/profile')
+        .set('Cookie', cookie)
+        .send({
+          deviceId: 'SIM-POS-1',
+          label: 'Impresora y cajon principal',
+          adapter: 'SIMULATOR',
+          printerEnabled: true,
+          drawerEnabled: true,
+          autoOpenCashSale: true,
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/peripherals/receipts/${saleId}/prints`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'peripheral-print-retry')
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              receipt: { saleId },
+              operation: { status: 'COMPLETED', deviceId: 'SIM-POS-1' },
+            },
+            meta: { idempotentReplay: false },
+          });
+        });
+
+      const [principal] = await dataSource.query<
+        Array<{ tenant_id: string; role_id: string }>
+      >(
+        `SELECT user.tenant_id, user_role.role_id FROM users user
+         INNER JOIN user_roles user_role
+           ON user_role.user_id = user.id AND user_role.tenant_id = user.tenant_id
+         WHERE user.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'CASH_DRAWER_OPEN'`,
+        [principal.role_id, principal.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/peripherals/cash-drawer/openings')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'drawer-without-permission')
+        .send({ trigger: 'CASH_SALE_COMPLETED', saleId })
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'CASH_DRAWER_OPEN')`,
+        [principal.role_id, principal.tenant_id],
+      );
+
+      for (const replay of [false, true]) {
+        await request(app.getHttpServer())
+          .post('/api/v1/pos/peripherals/cash-drawer/openings')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', 'drawer-after-cash-sale')
+          .send({ trigger: 'CASH_SALE_COMPLETED', saleId })
+          .expect(201)
+          .expect(
+            ({
+              body,
+            }: {
+              body: { data: unknown; meta: { idempotentReplay: boolean } };
+            }) => {
+              expect(body.data).toMatchObject({
+                action: 'OPEN_DRAWER',
+                trigger: 'CASH_SALE_COMPLETED',
+                status: 'COMPLETED',
+                saleId,
+              });
+              expect(body.meta.idempotentReplay).toBe(replay);
+            },
+          );
+      }
+
+      const [state] = await dataSource.query<
+        Array<{
+          sales: number | string;
+          operations: number | string;
+          audits: number | string;
+          failed_device: string;
+        }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM sales WHERE id = ?) AS sales,
+           (SELECT COUNT(*) FROM pos_peripheral_operations WHERE tenant_id = ?) AS operations,
+           (SELECT COUNT(*) FROM audit_events
+             WHERE entity_type = 'POS_PERIPHERAL_OPERATION') AS audits,
+           (SELECT device_id FROM pos_peripheral_operations WHERE id = ?) AS failed_device`,
+        [saleId, principal.tenant_id, failedOperationId],
+      );
+      expect({
+        sales: Number(state.sales),
+        operations: Number(state.operations),
+        audits: Number(state.audits),
+        failedDevice: state.failed_device,
+      }).toEqual({
+        sales: 1,
+        operations: 3,
+        audits: 3,
+        failedDevice: 'FAIL-PRINTER-1',
+      });
     });
 
     it('returns sale quantities once, restores the right stock state and links an exchange', async () => {
