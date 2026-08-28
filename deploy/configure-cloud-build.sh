@@ -53,7 +53,7 @@ if ! gcloud artifacts repositories describe "$artifact_repository" --project="$p
     --quiet
 fi
 
-for account in uinventario-cloud-build uinventario-api-runtime uinventario-web-runtime; do
+for account in uinventario-cloud-build uinventario-api-runtime uinventario-web-runtime uinventario-backup-runtime; do
   if ! gcloud iam service-accounts describe "${account}@${project_id}.iam.gserviceaccount.com" --project="$project_id" >/dev/null 2>&1; then
     gcloud iam service-accounts create "$account" --project="$project_id" --display-name="$account" --quiet
   fi
@@ -98,7 +98,7 @@ if gcloud storage buckets describe "$source_bucket" >/dev/null 2>&1; then
     --quiet >/dev/null
 fi
 
-for runtime in uinventario-api-runtime uinventario-web-runtime; do
+for runtime in uinventario-api-runtime uinventario-web-runtime uinventario-backup-runtime; do
   gcloud iam service-accounts add-iam-policy-binding "${runtime}@${project_id}.iam.gserviceaccount.com" \
     --project="$project_id" \
     --member="$build_member" \

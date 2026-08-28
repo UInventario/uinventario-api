@@ -1,0 +1,13 @@
+FROM gcr.io/google.com/cloudsdktool/google-cloud-cli:slim@sha256:14026c08cf391812086012d6c5f14078221ce1b46be0df419f7f31ec9f69c712
+
+RUN apt-get update \
+  && apt-get install --yes --no-install-recommends default-mysql-client \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --chown=backup:backup deploy/database-backup.py ./database-backup.py
+
+ENV CLOUDSDK_CONFIG=/tmp/.gcloud
+
+USER backup
+ENTRYPOINT ["python3", "/app/database-backup.py"]

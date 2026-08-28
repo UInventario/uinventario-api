@@ -21,6 +21,17 @@ steps:
         npm run test:ci
         npm run build
 
+  - id: verify-recovery-tooling
+    name: python:3.13-alpine
+    entrypoint: sh
+    args:
+      - -ceu
+      - |
+        python -m py_compile deploy/database-backup.py
+        sh -n deploy/provision-database-backups.sh
+        sh -n deploy/database-backup-jobs.sh
+        sh -n deploy/configure-cloud-build.sh
+
   - id: build-image
     name: gcr.io/cloud-builders/docker
     args:
@@ -42,6 +53,29 @@ steps:
           docker push "$$image"
         fi
 
+  - id: build-backup-image
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --file
+      - deploy/Dockerfile.backup
+      - --tag
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPOSITORY}/database-backup:$COMMIT_SHA
+      - .
+
+  - id: push-backup-image
+    name: gcr.io/cloud-builders/docker
+    entrypoint: sh
+    args:
+      - -ceu
+      - |
+        image="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPOSITORY}/database-backup:$COMMIT_SHA"
+        if docker manifest inspect "$$image" >/dev/null 2>&1; then
+          echo "Backup image already exists; reusing immutable commit tag."
+        else
+          docker push "$$image"
+        fi
+
   - id: deploy
     name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
     entrypoint: bash
@@ -55,6 +89,8 @@ steps:
         fi
 
         sh deploy/cloud-run.sh "${_DEPLOY_ENV}" "$$image" "$$web_origin"
+        backup_image="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPOSITORY}/database-backup:$COMMIT_SHA"
+        sh deploy/database-backup-jobs.sh "${_DEPLOY_ENV}" "$$backup_image"
 
         api_url="$$(gcloud run services describe uinventario-api --project="$PROJECT_ID" --region="${_REGION}" --format='value(status.url)')"
         if gcloud run services describe uinventario-web --project="$PROJECT_ID" --region="${_REGION}" >/dev/null 2>&1; then
