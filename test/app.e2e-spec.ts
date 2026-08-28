@@ -5838,19 +5838,107 @@ describe('UInventario API (e2e)', () => {
         .expect(({ body }: { body: { code?: string } }) => {
           expect(body.code).toBe('PAYMENT_REFERENCE_REUSED');
         });
+      const mixed = (reference: string, cardAmount = '59.90') => ({
+        lines: [{ productId, quantity: '1' }],
+        payments: [
+          { method: 'CASH', amount: '60.00', amountReceived: '70.00' },
+          { method: 'CARD', amount: cardAmount, reference },
+        ],
+      });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'mixed-invalid-fields')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          payment: {
+            method: 'CASH',
+            amountReceived: '120.00',
+            reference: 'NOT-ALLOWED',
+          },
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PAYMENT_FIELDS_INVALID');
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'mixed-total-mismatch')
+        .send(mixed('MIXED-MISMATCH', '59.89'))
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PAYMENT_TOTAL_MISMATCH');
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'mixed-retry-after-decline')
+        .send(mixed('DECLINE-MIXED'))
+        .expect(409);
+      const mixedSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'mixed-retry-after-decline')
+        .send(mixed('MIXED-CARD-001'))
+        .expect(201);
+      const mixedSaleData = mixedSale.body as {
+        data: { id: string; payments: unknown[] };
+      };
+      expect(mixedSaleData.data.payments).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            method: 'CASH',
+            amountReceived: '70.00',
+            amountApplied: '60.00',
+            change: '10.00',
+          }),
+          expect.objectContaining({
+            method: 'CARD',
+            amountApplied: '59.90',
+            reference: 'MIXED-CARD-001',
+            provider: 'SIMULATOR',
+          }),
+        ]),
+      );
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${mixedSaleData.data.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: { payments: unknown[] } } }) => {
+          expect(body.data.payments).toHaveLength(2);
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: Array<{ id: string; paymentMethod: string }> };
+          }) => {
+            expect(body.data).toContainEqual(
+              expect.objectContaining({
+                id: mixedSaleData.data.id,
+                paymentMethod: 'MIXED',
+              }),
+            );
+          },
+        );
       await request(app.getHttpServer())
         .get('/api/v1/pos/register-shifts/current/movements')
         .set('Cookie', cookie)
         .expect(200)
         .expect(({ body }: { body: unknown }) => {
-          expect(body).toMatchObject({ meta: { expectedCash: '250.00' } });
+          expect(body).toMatchObject({ meta: { expectedCash: '310.00' } });
         });
       const [balance] = await dataSource.query<Array<{ quantity: string }>>(
         `SELECT available_quantity AS quantity FROM inventory_balances
          WHERE product_id = ? AND location_id = ?`,
         [productId, locationId],
       );
-      expect(balance.quantity).toBe('2.000');
+      expect(balance.quantity).toBe('1.000');
     });
 
     it('manages tenant customers and associates an optional active customer to sales', async () => {
@@ -7682,15 +7770,18 @@ describe('UInventario API (e2e)', () => {
           fingerprint: 'f'.repeat(64),
           cashRegisterShiftId: shift.id,
           quote,
-          amountReceived: '10000000000000.00',
-          change: '0.00',
-          payment: {
-            method: 'CASH',
-            reference: null,
-            provider: 'CASH',
-            providerReference: null,
-            authorizationCode: null,
-          },
+          payments: [
+            {
+              method: 'CASH',
+              amountReceived: '10000000000000.00',
+              amountApplied: quote.totals.total,
+              change: '0.00',
+              reference: null,
+              provider: 'CASH',
+              providerReference: null,
+              authorizationCode: null,
+            },
+          ],
         }),
       ).rejects.toThrow();
       const [state] = await dataSource.query<

@@ -2,6 +2,7 @@ import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   ArrayMinSize,
+  ArrayUnique,
   IsArray,
   IsIn,
   IsOptional,
@@ -20,6 +21,11 @@ export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
 export class SalePaymentDto {
   @IsIn(PAYMENT_METHODS)
   method!: PaymentMethod;
+
+  @IsOptional()
+  @IsString()
+  @Matches(/^(0|[1-9]\d{0,11})(\.\d{1,2})?$/)
+  amount?: string;
 
   @IsOptional()
   @IsString()
@@ -50,7 +56,17 @@ export class CreateSaleDto {
   @Type(() => QuoteCartLineDto)
   lines!: QuoteCartLineDto[];
 
+  @IsOptional()
   @ValidateNested()
   @Type(() => SalePaymentDto)
-  payment!: SalePaymentDto;
+  payment?: SalePaymentDto;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMinSize(2)
+  @ArrayMaxSize(4)
+  @ArrayUnique((payment: SalePaymentDto) => payment.method)
+  @ValidateNested({ each: true })
+  @Type(() => SalePaymentDto)
+  payments?: SalePaymentDto[];
 }

@@ -295,7 +295,9 @@ export class PosController {
       entityId: result.data.id,
       correlationId: request.requestId!,
       deduplicate: true,
-      after: { paymentMethod: result.data.payment.method },
+      after: {
+        paymentMethods: result.data.payments.map((payment) => payment.method),
+      },
     });
     if (dto.reservationId) {
       await this.audit.record({

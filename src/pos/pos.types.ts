@@ -54,6 +54,17 @@ export interface OfflineCashSaleSnapshot {
 
 export type PaymentMethod = 'CASH' | 'CARD' | 'TRANSFER' | 'VOUCHER';
 
+export interface SalePaymentData {
+  method: PaymentMethod;
+  status: 'COMPLETED' | 'REVERSED';
+  amountReceived: string;
+  amountApplied: string;
+  change: string;
+  reference: string | null;
+  provider: string;
+  authorizationCode: string | null;
+}
+
 export interface CashSaleData {
   id: string;
   receiptNumber: string;
@@ -72,16 +83,8 @@ export interface CashSaleData {
     total: string;
   }>;
   totals: PosCartQuoteResponse['data']['totals'];
-  payment: {
-    method: PaymentMethod;
-    status: 'COMPLETED' | 'REVERSED';
-    amountReceived: string;
-    amountApplied: string;
-    change: string;
-    reference: string | null;
-    provider: string;
-    authorizationCode: string | null;
-  };
+  payment: SalePaymentData;
+  payments: SalePaymentData[];
   createdAt: string;
   void: {
     reason: string;
@@ -104,7 +107,7 @@ export interface SaleSummaryData {
   cashRegister: { id: string; name: string; code: string };
   currency: string;
   total: string;
-  paymentMethod: PaymentMethod;
+  paymentMethod: PaymentMethod | 'MIXED';
   createdAt: string;
 }
 
