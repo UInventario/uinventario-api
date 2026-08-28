@@ -30,6 +30,8 @@ import { CloseCashRegisterShiftDto } from './dto/close-cash-register-shift.dto';
 import { VoidSaleDto } from './dto/void-sale.dto';
 import { PermissionGuard } from '../auth/authorization/permission.guard';
 import { RequirePermissions } from '../auth/authorization/require-permissions.decorator';
+import { SalesCashReportDto } from './dto/sales-cash-report.dto';
+import { SalesCashReportService } from './sales-cash-report.service';
 
 @Controller('pos')
 @UseGuards(SessionGuard, PosAccessGuard)
@@ -40,7 +42,24 @@ export class PosController {
     private readonly cashMovements: CashRegisterMovementService,
     private readonly closures: CashRegisterClosureService,
     private readonly audit: AuditService,
+    private readonly reports: SalesCashReportService,
   ) {}
+
+  @Get('reports/sales-cash')
+  @UseGuards(PermissionGuard)
+  @RequirePermissions('SALES_MANAGE')
+  salesCashReport(
+    @Req() request: AuthenticatedRequest,
+    @Query() query: SalesCashReportDto,
+  ) {
+    const { principal } = request;
+    return this.reports.report({
+      tenantId: principal.tenant.id,
+      userId: principal.user.id,
+      administrator: principal.user.permissions.includes('TENANT_MANAGE'),
+      query,
+    });
+  }
 
   @Get('payment-options')
   paymentOptions() {
