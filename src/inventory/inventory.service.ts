@@ -171,6 +171,7 @@ export class InventoryService {
           apiVersion: '1',
           policy: INVENTORY_STOCK_POLICY,
           scope: result.scope,
+          valuation: result.valuation,
           pagination: {
             page: query.page,
             pageSize: query.pageSize,
