@@ -66,6 +66,12 @@ if gcloud secrets describe "$database_secret" --project="$project_id" >/dev/null
     --role=roles/secretmanager.secretAccessor \
     --condition=None \
     --quiet >/dev/null
+  gcloud secrets add-iam-policy-binding "$database_secret" \
+    --project="$project_id" \
+    --member="$build_member" \
+    --role=roles/secretmanager.viewer \
+    --condition=None \
+    --quiet >/dev/null
 fi
 
 for role in roles/logging.logWriter roles/run.admin roles/serviceusage.serviceUsageConsumer; do
