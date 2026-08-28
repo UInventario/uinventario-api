@@ -30,6 +30,7 @@ import { OfflineSyncModule } from './offline-sync/offline-sync.module';
 import { DataExportModule } from './data-exports/data-export.module';
 import { SecurityThrottlerGuard } from './security/security-throttler.guard';
 import { ObservabilityModule } from './observability/observability.module';
+import { PrivacyModule } from './privacy/privacy.module';
 
 @Module({
   imports: [
@@ -78,6 +79,7 @@ import { ObservabilityModule } from './observability/observability.module';
     InventoryModule,
     PosModule,
     DataExportModule,
+    PrivacyModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: SecurityThrottlerGuard }],
 })
