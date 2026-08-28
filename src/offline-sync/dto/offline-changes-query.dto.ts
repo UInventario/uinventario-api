@@ -1,8 +1,21 @@
 import { Transform, Type } from 'class-transformer';
-import { IsInt, IsString, IsUUID, Max, MaxLength, Min } from 'class-validator';
+import {
+  IsInt,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Matches,
+  Max,
+  MaxLength,
+  Min,
+} from 'class-validator';
 import { OFFLINE_SYNC_MAX_PAGE_SIZE } from '../offline-sync-v1.contract';
 
 export class OfflineChangesQueryDto {
+  @IsOptional()
+  @Matches(/^1\.\d+$/)
+  protocolVersion?: string = '1.0';
+
   @IsUUID()
   deviceId!: string;
 

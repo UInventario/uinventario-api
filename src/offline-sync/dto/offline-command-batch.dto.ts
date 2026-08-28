@@ -41,8 +41,8 @@ export class OfflineCommandScopeDto {
 }
 
 export class OfflineCommandDto {
-  @IsIn(['1.0'])
-  protocolVersion!: '1.0';
+  @Matches(/^1\.\d+$/)
+  protocolVersion!: `1.${number}`;
 
   @IsUUID()
   commandId!: string;
