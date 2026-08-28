@@ -79,6 +79,9 @@ export interface InventoryMovementData extends InventoryBalanceData {
 }
 
 export interface InventoryMovementValuation {
+  method: import('./inventory-valuation-policy.types').InventoryValuationMethod;
+  policyVersion: number;
+  effectiveAt: string;
   unitCost: string;
   valueChange: string;
   resultingInventoryValue: string | null;

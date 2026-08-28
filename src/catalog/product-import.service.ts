@@ -272,8 +272,13 @@ export class ProductImportService {
       : null;
     if (row.action === 'CREATE') {
       await manager.query(
-        `INSERT INTO products (id, tenant_id, name, sku, normalized_sku, barcode, category_id, brand_id, cost, price, active)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO products
+          (id, tenant_id, name, sku, normalized_sku, barcode, track_lots,
+           category_id, brand_id, cost, price, active)
+         VALUES (?, ?, ?, ?, ?, ?,
+           EXISTS(SELECT 1 FROM inventory_valuation_policies
+                  WHERE tenant_id = ? AND method = 'SPECIFIC_LOT'),
+           ?, ?, ?, ?, ?)`,
         [
           randomUUID(),
           tenantId,
@@ -281,6 +286,7 @@ export class ProductImportService {
           row.sku,
           this.normalize(String(row.sku)),
           row.barcode,
+          tenantId,
           categoryId,
           brandId,
           row.cost,

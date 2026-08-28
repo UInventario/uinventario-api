@@ -42,6 +42,8 @@ describe('UInventario API (e2e)', () => {
     for (const table of [
       'audit_events',
       'audit_chain_heads',
+      'inventory_valuation_policy_history',
+      'inventory_valuation_policies',
       'offline_commands',
       'offline_device_sequences',
       'offline_devices',
@@ -928,6 +930,7 @@ describe('UInventario API (e2e)', () => {
                   'INVENTORY_APPROVE',
                   'INVENTORY_COUNT',
                   'INVENTORY_TRANSFER',
+                  'INVENTORY_VALUATION_MANAGE',
                   'INVENTORY_VIEW',
                   'PRODUCTS_MANAGE',
                   'PURCHASE_ORDERS_APPROVE',
@@ -3375,6 +3378,304 @@ describe('UInventario API (e2e)', () => {
         movements: 0,
         balance: '1.000',
         returned: '0.000',
+      });
+    });
+  });
+
+  describe('tenant inventory valuation policy', () => {
+    beforeEach(resetIdentityData);
+
+    it('prevalidates, authorizes and cuts over FIFO and specific-lot valuation without rewriting history', async () => {
+      await registerAccount('valuation-policy-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Valuation SA',
+          tradeName: 'Valuation',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Central',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'General',
+          locationName: 'Piso',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja' })
+        .expect(200);
+      const product = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto valorado',
+          sku: 'VAL-1',
+          cost: '10',
+          price: '20',
+        })
+        .expect(201);
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        'SELECT id FROM locations LIMIT 1',
+      );
+      const productId = (product.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'valuation-opening-stock')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '5',
+          reason: 'Apertura',
+        })
+        .expect(201);
+
+      const [adminRole] = await dataSource.query<
+        Array<{ id: string; tenant_id: string }>
+      >("SELECT id, tenant_id FROM roles WHERE code = 'ADMIN'");
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ?
+           AND permission = 'INVENTORY_VALUATION_MANAGE'`,
+        [adminRole.id, adminRole.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/valuation-policy/preview')
+        .set('Cookie', cookie)
+        .send({ targetMethod: 'FIFO' })
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'INVENTORY_VALUATION_MANAGE')`,
+        [adminRole.id, adminRole.tenant_id],
+      );
+
+      const fifoPreview = await request(app.getHttpServer())
+        .post('/api/v1/inventory/valuation-policy/preview')
+        .set('Cookie', cookie)
+        .send({ targetMethod: 'FIFO' })
+        .expect(201);
+      expect(fifoPreview.body).toMatchObject({
+        data: {
+          current: { method: 'MOVING_AVERAGE', version: 1 },
+          targetMethod: 'FIFO',
+          allowed: true,
+          strategy: 'USE_MAINTAINED_FIFO_LAYERS',
+        },
+      });
+      const fifoPlan = fifoPreview.body as {
+        data: { planFingerprint: string };
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/valuation-policy/changes')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'valuation-fifo-invalid-plan')
+        .send({
+          targetMethod: 'FIFO',
+          expectedVersion: 1,
+          planFingerprint: '0'.repeat(64),
+        })
+        .expect(409);
+      const [[unchanged], [historyBefore]] = await Promise.all([
+        dataSource.query<Array<{ method: string; version: number | string }>>(
+          'SELECT method, version FROM inventory_valuation_policies LIMIT 1',
+        ),
+        dataSource.query<Array<{ total: number | string }>>(
+          'SELECT COUNT(*) AS total FROM inventory_valuation_policy_history',
+        ),
+      ]);
+      expect(unchanged).toMatchObject({ method: 'MOVING_AVERAGE' });
+      expect(Number(historyBefore.total)).toBe(0);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/valuation-policy/changes')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'valuation-fifo-cutover')
+        .send({
+          targetMethod: 'FIFO',
+          expectedVersion: 1,
+          planFingerprint: fifoPlan.data.planFingerprint,
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              method: 'FIFO',
+              version: 2,
+              migrationRule: 'FORWARD_ONLY_CUTOVER',
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'valuation-fifo-exit')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'EXIT',
+          quantity: '1',
+          reason: 'Salida FIFO',
+          reference: 'FIFO-1',
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { valuation: { method: 'FIFO', policyVersion: 2 } },
+          });
+        });
+
+      const lotPreview = await request(app.getHttpServer())
+        .post('/api/v1/inventory/valuation-policy/preview')
+        .set('Cookie', cookie)
+        .send({ targetMethod: 'SPECIFIC_LOT' })
+        .expect(201);
+      expect(lotPreview.body).toMatchObject({
+        data: {
+          allowed: true,
+          productsToMigrate: 1,
+          locationsToMigrate: 1,
+          strategy: 'OPENING_LOTS_AT_MOVING_AVERAGE',
+        },
+      });
+      const lotPlan = lotPreview.body as {
+        data: { planFingerprint: string };
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/valuation-policy/changes')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'valuation-specific-lot-cutover')
+        .send({
+          targetMethod: 'SPECIFIC_LOT',
+          expectedVersion: 2,
+          planFingerprint: lotPlan.data.planFingerprint,
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/valuation-policy/changes')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'valuation-fifo-cutover')
+        .send({
+          targetMethod: 'FIFO',
+          expectedVersion: 1,
+          planFingerprint: fifoPlan.data.planFingerprint,
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { method: 'FIFO', version: 2 },
+            meta: { replay: true },
+          });
+        });
+      const [cut] = await dataSource.query<
+        Array<{
+          track_lots: number | boolean;
+          lot_quantity: string;
+          history: number | string;
+          audits: number | string;
+        }>
+      >(
+        `SELECT p.track_lots,
+           (SELECT SUM(ilb.quantity) FROM inventory_lots il
+            INNER JOIN inventory_lot_balances ilb
+              ON ilb.lot_id = il.id AND ilb.tenant_id = il.tenant_id
+            WHERE il.tenant_id = p.tenant_id AND il.product_id = p.id) AS lot_quantity,
+           (SELECT COUNT(*) FROM inventory_valuation_policy_history) AS history,
+           (SELECT COUNT(*) FROM audit_events
+            WHERE action = 'INVENTORY_VALUATION_METHOD_CHANGED') AS audits
+         FROM products p WHERE p.id = ?`,
+        [productId],
+      );
+      expect({
+        trackLots: Boolean(cut.track_lots),
+        lotQuantity: cut.lot_quantity,
+        history: Number(cut.history),
+        audits: Number(cut.audits),
+      }).toEqual({
+        trackLots: true,
+        lotQuantity: '4.000',
+        history: 2,
+        audits: 2,
+      });
+      const newProduct = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({ name: 'Nuevo por lote', sku: 'VAL-2', cost: '12', price: '24' })
+        .expect(201);
+      expect(newProduct.body).toMatchObject({ data: { trackLots: true } });
+
+      const bootstrap = await request(app.getHttpServer())
+        .get('/api/v1/offline/bootstrap')
+        .set('Cookie', cookie)
+        .query({ deviceId: randomUUID(), pageSize: 50 })
+        .expect(200);
+      expect(bootstrap.body).toMatchObject({
+        data: { valuationPolicy: { method: 'SPECIFIC_LOT', version: 3 } },
+      });
+      const bootstrapData = bootstrap.body as {
+        data: {
+          identity: { tenant: { id: string }; user: { id: string } };
+          scope: {
+            deviceId: string;
+            branchId: string;
+            cashRegisterId: string;
+          };
+        };
+      };
+      const { identity, scope } = bootstrapData.data;
+      const stale = await request(app.getHttpServer())
+        .post('/api/v1/offline/commands/batch')
+        .set('Cookie', cookie)
+        .send({
+          commands: [
+            {
+              protocolVersion: '1.0',
+              commandId: randomUUID(),
+              idempotencyKey: `valuation-offline-${randomUUID()}`,
+              scope: {
+                tenantId: identity.tenant.id,
+                userId: identity.user.id,
+                deviceId: scope.deviceId,
+                branchId: scope.branchId,
+                cashRegisterId: scope.cashRegisterId,
+              },
+              sequence: 1,
+              createdAt: new Date().toISOString(),
+              valuationMethod: 'MOVING_AVERAGE',
+              valuationPolicyVersion: 1,
+              kind: 'INVENTORY_MOVEMENT',
+              payload: {
+                productId,
+                locationId: location.id,
+                type: 'ENTRY',
+                quantity: '1',
+                reason: 'Snapshot obsoleto',
+                reference: 'STALE-1',
+              },
+            },
+          ],
+        })
+        .expect(201);
+      expect(stale.body).toMatchObject({
+        data: {
+          results: [
+            {
+              status: 'ERROR',
+              error: {
+                details: { code: 'OFFLINE_VALUATION_POLICY_STALE' },
+              },
+            },
+          ],
+        },
       });
     });
   });
@@ -11155,6 +11456,8 @@ describe('UInventario API (e2e)', () => {
         scope,
         sequence: 1,
         createdAt: new Date().toISOString(),
+        valuationMethod: 'MOVING_AVERAGE',
+        valuationPolicyVersion: 1,
         kind: 'INVENTORY_MOVEMENT',
         payload: {
           productId,
@@ -11344,6 +11647,8 @@ describe('UInventario API (e2e)', () => {
         scope,
         sequence: 4,
         createdAt: new Date().toISOString(),
+        valuationMethod: 'MOVING_AVERAGE',
+        valuationPolicyVersion: 1,
         kind: 'CASH_SALE',
         payload: {
           lines: [{ productId, quantity: '3' }],
@@ -11484,6 +11789,8 @@ describe('UInventario API (e2e)', () => {
         scope: countScope,
         sequence: 1,
         createdAt: new Date().toISOString(),
+        valuationMethod: 'MOVING_AVERAGE',
+        valuationPolicyVersion: 1,
         kind: 'INVENTORY_COUNT',
         payload: {
           productId,

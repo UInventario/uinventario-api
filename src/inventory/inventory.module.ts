@@ -12,6 +12,7 @@ import { InventoryImportService } from './inventory-import.service';
 import { InventoryCountController } from './inventory-count.controller';
 import { InventoryCountRepository } from './inventory-count.repository';
 import { InventoryCountService } from './inventory-count.service';
+import { InventoryValuationPolicyService } from './inventory-valuation-policy.service';
 
 @Module({
   imports: [SessionModule],
@@ -29,8 +30,9 @@ import { InventoryCountService } from './inventory-count.service';
     InventoryImportService,
     InventoryCountRepository,
     InventoryCountService,
+    InventoryValuationPolicyService,
     PermissionGuard,
   ],
-  exports: [InventoryService],
+  exports: [InventoryService, InventoryValuationPolicyService],
 })
 export class InventoryModule {}

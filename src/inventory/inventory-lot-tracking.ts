@@ -7,6 +7,7 @@ import {
   InventoryLotNotFoundError,
   InventoryLotRequiredError,
 } from './inventory.errors';
+import { finalizeSpecificLotMovementValuation } from './inventory-valuation-policy';
 
 type SelectionMode = 'ORIGIN' | 'MANUAL' | 'AUTOMATIC' | 'RESTORE' | 'TRANSFER';
 
@@ -372,16 +373,26 @@ export async function applyInventoryLotTracking(
      WHERE im.id = ?`,
     [movementId],
   );
-  if (!movement || !movement.track_lots) return;
+  if (!movement) return;
+  if (!movement.track_lots) {
+    await finalizeSpecificLotMovementValuation(manager, movementId);
+    return;
+  }
   const [existing] = await manager.query<Array<{ total: number | string }>>(
     `SELECT COUNT(*) AS total FROM inventory_movement_lots
      WHERE tenant_id = ? AND movement_id = ?`,
     [movement.tenant_id, movement.id],
   );
-  if (Number(existing.total) > 0) return;
+  if (Number(existing.total) > 0) {
+    await finalizeSpecificLotMovementValuation(manager, movementId);
+    return;
+  }
 
   const quantityChange = units(movement.quantity_change);
-  if (quantityChange === 0n) return;
+  if (quantityChange === 0n) {
+    await finalizeSpecificLotMovementValuation(manager, movementId);
+    return;
+  }
 
   if (movement.type === 'PURCHASE_RECEIPT') {
     const [line] = await manager.query<
@@ -427,15 +438,18 @@ export async function applyInventoryLotTracking(
       currency: line.currency,
       revalue: true,
     });
+    await finalizeSpecificLotMovementValuation(manager, movementId);
     return;
   }
 
   if (movement.type === 'SALE_VOID') {
     await restoreAllocations(manager, movement, 'SALE', 'RESTORE');
+    await finalizeSpecificLotMovementValuation(manager, movementId);
     return;
   }
   if (movement.type === 'TRANSFER_IN') {
     await restoreAllocations(manager, movement, 'TRANSFER_OUT', 'TRANSFER');
+    await finalizeSpecificLotMovementValuation(manager, movementId);
     return;
   }
 
@@ -455,6 +469,7 @@ export async function applyInventoryLotTracking(
       currency,
       revalue: true,
     });
+    await finalizeSpecificLotMovementValuation(manager, movementId);
     return;
   }
 
@@ -501,4 +516,5 @@ export async function applyInventoryLotTracking(
     options.lotCode,
     costSource,
   );
+  await finalizeSpecificLotMovementValuation(manager, movementId);
 }
