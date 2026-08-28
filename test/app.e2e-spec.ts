@@ -59,6 +59,9 @@ describe('UInventario API (e2e)', () => {
       'inventory_count_session_lines',
       'inventory_count_sessions',
       'inventory_counts',
+      'inventory_movement_fifo_layers',
+      'inventory_fifo_layers',
+      'inventory_fifo_cutovers',
       'inventory_movement_lots',
       'inventory_lot_origins',
       'inventory_lot_balances',
@@ -2991,6 +2994,55 @@ describe('UInventario API (e2e)', () => {
         },
       });
 
+      const fifoResponse = await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${setup.productId}/fifo-layers`)
+        .set('Cookie', cookie)
+        .expect(200);
+      const fifoLayers = (
+        fifoResponse.body as {
+          data: Array<{
+            id: string;
+            source: { purchaseReceiptLineId: string };
+          }>;
+        }
+      ).data;
+      const fifoLayerA = fifoLayers[0];
+      const fifoLayerB = fifoLayers.find(
+        ({ source }) =>
+          source.purchaseReceiptLineId === lotBReceipt.receiptLineId,
+      )!;
+      expect(fifoResponse.body).toMatchObject({
+        data: [
+          {
+            originType: 'PURCHASE_RECEIPT',
+            originalQuantity: '3.000',
+            remainingQuantity: '3.000',
+            unitCost: '80.0000',
+            currency: 'MXN',
+            inventoryValue: '240.0000',
+          },
+          {
+            originType: 'PURCHASE_RECEIPT',
+            originalQuantity: '4.000',
+            remainingQuantity: '4.000',
+            unitCost: '120.0000',
+            currency: 'MXN',
+            inventoryValue: '480.0000',
+          },
+        ],
+        meta: {
+          method: 'FIFO',
+          cutover: {
+            migrationRule: 'OPENING_BALANCE_AT_MOVING_AVERAGE',
+          },
+          totalQuantity: '7.000',
+          layerQuantity: '7.000',
+          reconciled: true,
+          currency: 'MXN',
+          inventoryValue: '720.0000',
+        },
+      });
+
       await openCurrentCashRegister(cookie, 'lot-cost-open-shift');
       const sale = await request(app.getHttpServer())
         .post('/api/v1/pos/sales')
@@ -3021,6 +3073,21 @@ describe('UInventario API (e2e)', () => {
                     valueChange: '-240.0000',
                   },
                 ],
+                fifoValuation: {
+                  unitCost: '80.0000',
+                  valueChange: '-160.0000',
+                  resultingInventoryValue: '560.0000',
+                },
+                fifoLayers: [
+                  {
+                    layerId: fifoLayerA.id,
+                    quantityChange: '-2.000',
+                    unitCost: '80.0000',
+                    currency: 'MXN',
+                    valueChange: '-160.0000',
+                    selectionMode: 'FIFO',
+                  },
+                ],
               },
             ],
           }),
@@ -3031,6 +3098,41 @@ describe('UInventario API (e2e)', () => {
         .set('Idempotency-Key', 'lot-cost-sale-void')
         .send({ reason: 'Restaurar el costo específico del lote' })
         .expect(201);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .query({ productId: setup.productId, type: 'SALE_VOID' })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              {
+                fifoValuation: {
+                  unitCost: '80.0000',
+                  valueChange: '160.0000',
+                  resultingInventoryValue: '720.0000',
+                },
+                fifoLayers: [
+                  {
+                    layerId: fifoLayerA.id,
+                    quantityChange: '2.000',
+                    unitCost: '80.0000',
+                    selectionMode: 'RESTORE',
+                  },
+                ],
+              },
+            ],
+          });
+          const response = body as {
+            data: Array<{
+              fifoLayers: Array<{ sourceAllocationId: string | null }>;
+            }>;
+          };
+          expect(response.data[0].fifoLayers[0].sourceAllocationId).toEqual(
+            expect.any(String),
+          );
+        });
 
       await request(app.getHttpServer())
         .post(`/api/v1/purchase-orders/${lotBReceipt.orderId}/returns`)
@@ -3065,6 +3167,21 @@ describe('UInventario API (e2e)', () => {
                     valueChange: '-120.0000',
                   },
                 ],
+                fifoValuation: {
+                  unitCost: '120.0000',
+                  valueChange: '-120.0000',
+                  resultingInventoryValue: '600.0000',
+                },
+                fifoLayers: [
+                  {
+                    layerId: fifoLayerB.id,
+                    quantityChange: '-1.000',
+                    unitCost: '120.0000',
+                    currency: 'MXN',
+                    valueChange: '-120.0000',
+                    selectionMode: 'ORIGIN_RETURN',
+                  },
+                ],
               },
             ],
           }),
@@ -3088,6 +3205,32 @@ describe('UInventario API (e2e)', () => {
           }),
         );
       await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${setup.productId}/fifo-layers`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [
+              {
+                id: fifoLayerA.id,
+                remainingQuantity: '3.000',
+                inventoryValue: '240.0000',
+              },
+              {
+                id: fifoLayerB.id,
+                remainingQuantity: '3.000',
+                inventoryValue: '360.0000',
+              },
+            ],
+            meta: {
+              totalQuantity: '6.000',
+              layerQuantity: '6.000',
+              inventoryValue: '600.0000',
+              reconciled: true,
+            },
+          }),
+        );
+      await request(app.getHttpServer())
         .get('/api/v1/inventory/stock')
         .set('Cookie', cookie)
         .query({ productId: setup.productId })
@@ -3103,6 +3246,12 @@ describe('UInventario API (e2e)', () => {
                   reconciled: true,
                   currency: 'MXN',
                   inventoryValue: '600.0000',
+                },
+                fifoValuation: {
+                  quantity: '6.000',
+                  inventoryValue: '600.0000',
+                  currency: 'MXN',
+                  reconciled: true,
                 },
               },
             ],
@@ -5339,6 +5488,15 @@ describe('UInventario API (e2e)', () => {
                   quantityChange: string;
                   selectionMode: string;
                 }>;
+                fifoLayers: Array<{
+                  layerId: string;
+                  sourceAllocationId: string | null;
+                  quantityChange: string;
+                  unitCost: string;
+                  currency: string;
+                  valueChange: string;
+                  selectionMode: string;
+                }>;
               }>;
             };
           }) => {
@@ -5377,6 +5535,34 @@ describe('UInventario API (e2e)', () => {
                 currency: 'MXN',
                 valueChange: '-4.0000',
                 selectionMode: 'AUTOMATIC',
+              }),
+            ]);
+            const fifoTransferIn = body.data.find(
+              ({ type }) => type === 'TRANSFER_IN',
+            )?.fifoLayers;
+            expect(fifoTransferIn).toEqual([
+              expect.objectContaining({
+                quantityChange: '6.000',
+                unitCost: '4.0000',
+                currency: 'MXN',
+                valueChange: '24.0000',
+                selectionMode: 'TRANSFER',
+              }),
+            ]);
+            expect(fifoTransferIn?.[0].sourceAllocationId).toEqual(
+              expect.any(String),
+            );
+            expect(
+              body.data.find(({ type }) => type === 'TRANSFER_DISCREPANCY')
+                ?.fifoLayers,
+            ).toEqual([
+              expect.objectContaining({
+                layerId: fifoTransferIn![0].layerId,
+                quantityChange: '-1.000',
+                unitCost: '4.0000',
+                currency: 'MXN',
+                valueChange: '-4.0000',
+                selectionMode: 'FIFO',
               }),
             ]);
             expect(body.data.map(({ document }) => document.type)).toContain(
@@ -8631,6 +8817,9 @@ describe('UInventario API (e2e)', () => {
           balance: string;
           valuationQuantity: string;
           valuationValue: string;
+          fifoQuantity: string;
+          fifoValue: string;
+          fifoAllocations: number | string;
         }>
       >(
         `SELECT (SELECT COUNT(*) FROM sales) AS sales,
@@ -8640,8 +8829,23 @@ describe('UInventario API (e2e)', () => {
                 (SELECT quantity FROM inventory_valuations
                   WHERE product_id = ?) AS valuationQuantity,
                 (SELECT inventory_value FROM inventory_valuations
-                  WHERE product_id = ?) AS valuationValue`,
-        [productId, locationId, productId, productId],
+                  WHERE product_id = ?) AS valuationValue,
+                (SELECT COALESCE(SUM(remaining_quantity), 0)
+                  FROM inventory_fifo_layers WHERE product_id = ?) AS fifoQuantity,
+                (SELECT CAST(COALESCE(SUM(remaining_quantity * unit_cost), 0) AS DECIMAL(21,4))
+                  FROM inventory_fifo_layers WHERE product_id = ?) AS fifoValue,
+                (SELECT COUNT(*) FROM inventory_movement_fifo_layers imfl
+                  INNER JOIN inventory_movements im ON im.id = imfl.movement_id
+                  WHERE im.product_id = ? AND im.type = 'SALE') AS fifoAllocations`,
+        [
+          productId,
+          locationId,
+          productId,
+          productId,
+          productId,
+          productId,
+          productId,
+        ],
       );
       expect({
         sales: Number(state.sales),
@@ -8649,13 +8853,49 @@ describe('UInventario API (e2e)', () => {
         balance: state.balance,
         valuationQuantity: state.valuationQuantity,
         valuationValue: state.valuationValue,
+        fifoQuantity: state.fifoQuantity,
+        fifoValue: state.fifoValue,
+        fifoAllocations: Number(state.fifoAllocations),
       }).toEqual({
         sales: 1,
         saleMovements: 1,
         balance: '2.000',
         valuationQuantity: '2.000',
         valuationValue: '160.0000',
+        fifoQuantity: '2.000',
+        fifoValue: '160.0000',
+        fifoAllocations: 1,
       });
+
+      await dataSource.query(
+        `UPDATE inventory_fifo_layers SET remaining_quantity = 0
+         WHERE product_id = ?`,
+        [productId],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'pos-fifo-shortage')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: '200.00',
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVENTORY_FIFO_LAYER_SHORTAGE');
+        });
+      const [rollback] = await dataSource.query<
+        Array<{ sales: number | string; balance: string }>
+      >(
+        `SELECT (SELECT COUNT(*) FROM sales) AS sales,
+                (SELECT quantity FROM inventory_balances
+                  WHERE product_id = ? AND location_id = ?) AS balance`,
+        [productId, locationId],
+      );
+      expect({
+        sales: Number(rollback.sales),
+        balance: rollback.balance,
+      }).toEqual({ sales: 1, balance: '2.000' });
     });
 
     it('rolls back the stock decrement when payment persistence fails', async () => {

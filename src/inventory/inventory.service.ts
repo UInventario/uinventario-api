@@ -22,6 +22,8 @@ import {
   InventoryLotCurrencyMismatchError,
   InventoryLotNotFoundError,
   InventoryLotRequiredError,
+  InventoryFifoCurrencyMismatchError,
+  InventoryFifoLayerShortageError,
 } from './inventory.errors';
 import { InventoryRepository } from './inventory.repository';
 import {
@@ -34,6 +36,7 @@ import {
   InventoryStockListResponse,
   InventoryStateTransitionResponse,
   InventoryLotsResponse,
+  InventoryFifoLayersResponse,
   INVENTORY_STOCK_POLICY,
 } from './inventory.types';
 
@@ -70,6 +73,37 @@ export class InventoryService {
           totalQuantity: result.totalQuantity,
           lotQuantity: result.lotQuantity,
           reconciled: result.totalQuantity === result.lotQuantity,
+          currency: result.currency,
+          inventoryValue: result.inventoryValue,
+        },
+      };
+    } catch (error) {
+      if (error instanceof InventoryTargetNotFoundError)
+        throw new NotFoundException();
+      throw error;
+    }
+  }
+
+  async listFifoLayers(
+    tenantId: string,
+    warehouseId: string,
+    productId: string,
+  ): Promise<InventoryFifoLayersResponse> {
+    try {
+      const result = await this.inventory.listFifoLayers(
+        tenantId,
+        warehouseId,
+        productId,
+      );
+      return {
+        data: result.items,
+        meta: {
+          apiVersion: '1',
+          method: 'FIFO',
+          cutover: result.cutover,
+          totalQuantity: result.totalQuantity,
+          layerQuantity: result.layerQuantity,
+          reconciled: result.totalQuantity === result.layerQuantity,
           currency: result.currency,
           inventoryValue: result.inventoryValue,
         },
@@ -236,6 +270,19 @@ export class InventoryService {
   }
 
   private rethrowLotError(error: unknown): void {
+    if (error instanceof InventoryFifoLayerShortageError) {
+      throw new ConflictException({
+        code: 'INVENTORY_FIFO_LAYER_SHORTAGE',
+        message:
+          'Las capas FIFO no concilian con el inventario; la operaciÃ³n fue revertida.',
+      });
+    }
+    if (error instanceof InventoryFifoCurrencyMismatchError) {
+      throw new ConflictException({
+        code: 'INVENTORY_FIFO_CURRENCY_MISMATCH',
+        message: 'Las capas FIFO de un producto deben usar una sola moneda.',
+      });
+    }
     if (error instanceof InventoryLotRequiredError) {
       throw new BadRequestException({
         code: 'INVENTORY_LOT_REQUIRED',

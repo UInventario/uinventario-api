@@ -75,3 +75,15 @@ export class InventoryLotCurrencyMismatchError extends Error {
     super('INVENTORY_LOT_CURRENCY_MISMATCH');
   }
 }
+
+export class InventoryFifoLayerShortageError extends Error {
+  constructor() {
+    super('INVENTORY_FIFO_LAYER_SHORTAGE');
+  }
+}
+
+export class InventoryFifoCurrencyMismatchError extends Error {
+  constructor() {
+    super('INVENTORY_FIFO_CURRENCY_MISMATCH');
+  }
+}

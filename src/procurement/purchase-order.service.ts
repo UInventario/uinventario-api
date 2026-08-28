@@ -40,6 +40,8 @@ import {
   InventoryLotCurrencyMismatchError,
   InventoryLotNotFoundError,
   InventoryLotRequiredError,
+  InventoryFifoCurrencyMismatchError,
+  InventoryFifoLayerShortageError,
 } from '../inventory/inventory.errors';
 
 @Injectable()
@@ -363,6 +365,14 @@ export class PurchaseOrderService {
         code: 'PURCHASE_ORDER_STATE_CONFLICT',
         currentStatus: error.status,
         message: 'El estado actual de la orden no permite esta operación.',
+      });
+    }
+    if (error instanceof InventoryFifoLayerShortageError) {
+      throw new ConflictException({ code: 'INVENTORY_FIFO_LAYER_SHORTAGE' });
+    }
+    if (error instanceof InventoryFifoCurrencyMismatchError) {
+      throw new ConflictException({
+        code: 'INVENTORY_FIFO_CURRENCY_MISMATCH',
       });
     }
     if (error instanceof InventoryLotRequiredError) {

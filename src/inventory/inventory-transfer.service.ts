@@ -17,6 +17,10 @@ import {
   InventoryTransferDiscrepancyReasonRequiredError,
   InventoryTransferReceiptExceedsPendingError,
 } from './inventory-transfer.errors';
+import {
+  InventoryFifoCurrencyMismatchError,
+  InventoryFifoLayerShortageError,
+} from './inventory.errors';
 import { InventoryTransferRepository } from './inventory-transfer.repository';
 import {
   InventoryTransferListResponse,
@@ -144,6 +148,14 @@ export class InventoryTransferService {
     try {
       return await operation();
     } catch (error) {
+      if (error instanceof InventoryFifoLayerShortageError) {
+        throw new ConflictException({ code: 'INVENTORY_FIFO_LAYER_SHORTAGE' });
+      }
+      if (error instanceof InventoryFifoCurrencyMismatchError) {
+        throw new ConflictException({
+          code: 'INVENTORY_FIFO_CURRENCY_MISMATCH',
+        });
+      }
       if (error instanceof InventoryTransferNotFoundError)
         throw new NotFoundException();
       if (error instanceof InvalidInventoryTransferTargetError) {
