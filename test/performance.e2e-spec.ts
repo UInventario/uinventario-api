@@ -40,7 +40,7 @@ describe('Critical flow performance and concurrency (e2e)', () => {
     app = moduleFixture.createNestApplication();
     configureApp(app);
     await app.init();
-    tenants = await Promise.all([prepareTenant(1), prepareTenant(2)]);
+    tenants = [await prepareTenant(1), await prepareTenant(2)];
   });
 
   afterAll(async () => {
