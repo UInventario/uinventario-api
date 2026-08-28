@@ -1,6 +1,7 @@
 import { EntityManager } from 'typeorm';
 import { applyInventoryFifoValuation } from './inventory-fifo-valuation';
 import { sealInventoryMovementValuation } from './inventory-valuation-policy';
+import { assertInventoryReconciliationOperational } from './inventory-reconciliation-guard';
 
 interface MovementValuationRow {
   tenant_id: string;
@@ -116,6 +117,8 @@ export async function applyInventoryValuation(
     [movementId],
   );
   if (!movement) throw new Error('INVENTORY_MOVEMENT_NOT_FOUND_FOR_VALUATION');
+
+  await assertInventoryReconciliationOperational(manager, movement.tenant_id);
 
   await manager.query(
     `INSERT INTO inventory_valuations

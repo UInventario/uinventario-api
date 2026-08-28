@@ -34,6 +34,7 @@ import {
   ChangeInventoryValuationPolicyDto,
   PreviewInventoryValuationPolicyDto,
 } from './dto/change-inventory-valuation-policy.dto';
+import { InventoryReconciliationService } from './inventory-reconciliation.service';
 
 @Controller('inventory')
 @UseGuards(SessionGuard, PermissionGuard)
@@ -43,7 +44,37 @@ export class InventoryController {
     private readonly audit: AuditService,
     private readonly inventoryImports: InventoryImportService,
     private readonly valuationPolicy: InventoryValuationPolicyService,
+    private readonly reconciliation: InventoryReconciliationService,
   ) {}
+
+  @Get('reconciliations/latest')
+  @RequirePermissions('INVENTORY_VIEW')
+  latestReconciliation(@Req() request: AuthenticatedRequest) {
+    return this.reconciliation.latest(request.principal.tenant.id);
+  }
+
+  @Get('reconciliations/:runId')
+  @RequirePermissions('INVENTORY_VIEW')
+  getReconciliation(
+    @Req() request: AuthenticatedRequest,
+    @Param('runId', new ParseUUIDPipe()) runId: string,
+  ) {
+    return this.reconciliation.get(request.principal.tenant.id, runId);
+  }
+
+  @Post('reconciliations')
+  @RequirePermissions('INVENTORY_ADJUST')
+  runReconciliation(
+    @Req() request: AuthenticatedRequest,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+  ) {
+    return this.reconciliation.run({
+      tenantId: request.principal.tenant.id,
+      userId: request.principal.user.id,
+      idempotencyKey,
+      correlationId: request.requestId!,
+    });
+  }
 
   @Get('valuation-policy')
   @RequirePermissions('INVENTORY_VIEW')
