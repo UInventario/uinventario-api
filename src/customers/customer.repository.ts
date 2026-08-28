@@ -13,6 +13,9 @@ interface CustomerRow {
   email: string | null;
   phone: string | null;
   data_processing_consent: number | boolean;
+  privacy_status: 'ACTIVE' | 'ANONYMIZED';
+  anonymized_at: Date | string | null;
+  privacy_retention_until: Date | string | null;
   active: number | boolean;
   version: number | string;
   created_at: Date | string;
@@ -88,7 +91,9 @@ export class CustomerRepository {
 
   async findActive(tenantId: string, id: string): Promise<CustomerData | null> {
     const customer = await this.findById(tenantId, id);
-    return customer?.active ? customer : null;
+    return customer?.active && customer.privacyStatus === 'ACTIVE'
+      ? customer
+      : null;
   }
 
   async list(tenantId: string, query: ListCustomersDto) {
@@ -286,6 +291,7 @@ export class CustomerRepository {
 
   private select() {
     return `SELECT id, name, identifier, email, phone, data_processing_consent,
+                   privacy_status, anonymized_at, privacy_retention_until,
                    active, version, created_at, updated_at FROM customers`;
   }
 
@@ -297,6 +303,13 @@ export class CustomerRepository {
       email: row.email,
       phone: row.phone,
       dataProcessingConsent: Boolean(row.data_processing_consent),
+      privacyStatus: row.privacy_status,
+      anonymizedAt: row.anonymized_at
+        ? new Date(row.anonymized_at).toISOString()
+        : null,
+      privacyRetentionUntil: row.privacy_retention_until
+        ? new Date(row.privacy_retention_until).toISOString()
+        : null,
       active: Boolean(row.active),
       version: Number(row.version),
       createdAt: new Date(row.created_at).toISOString(),

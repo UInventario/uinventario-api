@@ -43,6 +43,9 @@ describe('UInventario API (e2e)', () => {
     for (const table of [
       'audit_events',
       'audit_chain_heads',
+      'privacy_requests',
+      'privacy_legal_holds',
+      'privacy_policies',
       'inventory_reconciliation_guards',
       'inventory_reconciliation_findings',
       'inventory_reconciliation_runs',
@@ -940,6 +943,7 @@ describe('UInventario API (e2e)', () => {
                   'INVENTORY_TRANSFER',
                   'INVENTORY_VALUATION_MANAGE',
                   'INVENTORY_VIEW',
+                  'PRIVACY_MANAGE',
                   'PRODUCTS_MANAGE',
                   'PURCHASE_ORDERS_APPROVE',
                   'PURCHASE_ORDERS_MANAGE',
@@ -7694,6 +7698,329 @@ describe('UInventario API (e2e)', () => {
         .get(`/api/v1/customers/${customer.id}/history`)
         .set('Cookie', otherCookie)
         .expect(404);
+    });
+
+    it('exports, protects and anonymizes customer PII without deleting transactions', async () => {
+      const { cookie, productId } = await preparePos();
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({
+          name: 'María Privada',
+          identifier: 'PRIV-001',
+          email: 'maria.privacy@example.com',
+          phone: '+52 55 9876 5432',
+          dataProcessingConsent: true,
+        })
+        .expect(201);
+      const customerId = (customerResponse.body as { data: { id: string } })
+        .data.id;
+
+      await request(app.getHttpServer())
+        .get('/api/v1/privacy/classification')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          const data = (
+            body as {
+              data: {
+                version: number;
+                deletionMode: string;
+                classes: Array<{ code: string }>;
+              };
+            }
+          ).data;
+          expect(data.version).toBe(1);
+          expect(data.deletionMode).toBe('CONTROLLED_ANONYMIZATION');
+          expect(data.classes.map(({ code }) => code)).toContain(
+            'CUSTOMER_PII',
+          );
+        });
+      const policyResponse = await request(app.getHttpServer())
+        .get('/api/v1/privacy/policy')
+        .set('Cookie', cookie)
+        .expect(200);
+      const policy = (
+        policyResponse.body as {
+          data: { version: number; minimumTransactionRetentionDays: number };
+        }
+      ).data;
+      expect(policy.minimumTransactionRetentionDays).toBe(1825);
+      await request(app.getHttpServer())
+        .patch('/api/v1/privacy/policy')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'privacy-policy-below-minimum')
+        .send({
+          expectedVersion: policy.version,
+          transactionRetentionDays: 1824,
+          reason: 'Prueba del mínimo legal',
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PRIVACY_RETENTION_BELOW_COUNTRY_MINIMUM');
+        });
+      const updatedPolicy = await request(app.getHttpServer())
+        .patch('/api/v1/privacy/policy')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'privacy-policy-increase')
+        .send({
+          expectedVersion: policy.version,
+          transactionRetentionDays: 2000,
+          reason: 'Política interna ampliada',
+        })
+        .expect(200);
+      expect(updatedPolicy.body).toMatchObject({
+        data: { transactionRetentionDays: 2000, version: policy.version + 1 },
+      });
+      await request(app.getHttpServer())
+        .patch('/api/v1/privacy/policy')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'privacy-policy-increase')
+        .send({
+          expectedVersion: policy.version,
+          transactionRetentionDays: 2000,
+          reason: 'Política interna ampliada',
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { version: policy.version + 1 } });
+        });
+
+      const saleResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'privacy-customer-sale')
+        .send({
+          customerId,
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: '120.00',
+        })
+        .expect(201);
+      const saleId = (saleResponse.body as { data: { id: string } }).data.id;
+
+      await request(app.getHttpServer())
+        .get(`/api/v1/privacy/customers/${customerId}/report`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              subject: {
+                id: customerId,
+                email: 'maria.privacy@example.com',
+                privacyStatus: 'ACTIVE',
+              },
+              transactions: {
+                count: 1,
+                disposition: 'PRESERVED_WITHOUT_CASCADE_DELETE',
+              },
+              policy: { transactionRetentionDays: 2000 },
+              activeLegalHold: null,
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get(`/api/v1/privacy/customers/${customerId}/export`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect('Content-Type', /application\/json/)
+        .expect('Content-Disposition', /attachment/);
+
+      const [adminRole] = await dataSource.query<
+        Array<{ role_id: string; tenant_id: string }>
+      >(
+        `SELECT r.id AS role_id, r.tenant_id FROM roles r
+         INNER JOIN users u ON u.tenant_id = r.tenant_id
+         WHERE r.code = 'ADMIN' AND u.normalized_email = ?`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'PRIVACY_MANAGE'`,
+        [adminRole.role_id, adminRole.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/privacy/classification')
+        .set('Cookie', cookie)
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'PRIVACY_MANAGE')`,
+        [adminRole.role_id, adminRole.tenant_id],
+      );
+
+      const other = {
+        organizationName: 'Tenant privacidad ajeno',
+        email: 'other-privacy@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'other-privacy-registration')
+        .send(other)
+        .expect(201);
+      const otherCookie = await createPersistedSession(other.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Tenant privacidad ajeno Legal',
+          tradeName: other.organizationName,
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Sucursal privacidad',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega privacidad',
+          locationName: 'General privacidad',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Caja privacidad' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/privacy/customers/${customerId}/report`)
+        .set('Cookie', otherCookie)
+        .expect(404);
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/privacy/customers/${customerId}/legal-holds`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'privacy-hold-create')
+        .send({
+          reason: 'Investigación legal simulada',
+          requestReference: 'LEGAL-2026-001',
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { active: true } });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/privacy/customers/${customerId}/anonymization`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'privacy-anonymize-blocked')
+        .send({
+          reason: 'Solicitud de cancelación del titular',
+          requestReference: 'ARCO-2026-001',
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe(
+            'CUSTOMER_ANONYMIZATION_BLOCKED_BY_LEGAL_HOLD',
+          );
+        });
+      await request(app.getHttpServer())
+        .get(`/api/v1/customers/${customerId}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { email: 'maria.privacy@example.com' },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/privacy/customers/${customerId}/legal-holds/release`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'privacy-hold-release')
+        .send({ reason: 'Investigación legal concluida' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { released: true } });
+        });
+      const anonymizationBody = {
+        reason: 'Solicitud de cancelación verificada',
+        requestReference: 'ARCO-2026-001',
+      };
+      await request(app.getHttpServer())
+        .post(`/api/v1/privacy/customers/${customerId}/anonymization`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'privacy-anonymize-complete')
+        .send(anonymizationBody)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { anonymized: true, privacyStatus: 'ANONYMIZED' },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/privacy/customers/${customerId}/anonymization`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'privacy-anonymize-complete')
+        .send(anonymizationBody)
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .get(`/api/v1/customers/${customerId}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              id: customerId,
+              identifier: null,
+              email: null,
+              phone: null,
+              active: false,
+              privacyStatus: 'ANONYMIZED',
+            },
+          });
+          expect(JSON.stringify(body)).not.toContain(
+            'maria.privacy@example.com',
+          );
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/customers')
+        .query({
+          q: 'maria.privacy@example.com',
+          status: 'ALL',
+          page: 1,
+          pageSize: 10,
+        })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toEqual([]);
+        });
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${saleId}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              id: saleId,
+              customer: { id: customerId, identifier: null },
+            },
+          });
+          expect(JSON.stringify(body)).not.toContain(
+            'maria.privacy@example.com',
+          );
+        });
+      const [decisions] = await dataSource.query<
+        Array<{ blocked: number | string; completed: number | string }>
+      >(
+        `SELECT SUM(status = 'BLOCKED') AS blocked,
+                SUM(status = 'COMPLETED') AS completed
+         FROM privacy_requests WHERE tenant_id = ? AND customer_id = ?`,
+        [adminRole.tenant_id, customerId],
+      );
+      expect(Number(decisions.blocked)).toBe(1);
+      expect(Number(decisions.completed)).toBeGreaterThanOrEqual(4);
+      const [audit] = await dataSource.query<Array<{ total: number | string }>>(
+        `SELECT COUNT(*) AS total FROM audit_events
+         WHERE tenant_id = ? AND entity_id = ?
+           AND action IN (
+             'CUSTOMER_ANONYMIZATION_BLOCKED', 'CUSTOMER_PII_ANONYMIZED'
+           )`,
+        [adminRole.tenant_id, customerId],
+      );
+      expect(Number(audit.total)).toBe(2);
     });
 
     it('creates customer reservations atomically, idempotently and without over-reserving', async () => {

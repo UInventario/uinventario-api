@@ -88,6 +88,7 @@ export class RegistrationRepository {
         (?, ?, 'CASH_REGISTER_MOVE'),
         (?, ?, 'ACCESS_MANAGE'),
         (?, ?, 'AUDIT_VIEW'), (?, ?, 'AUDIT_EXPORT'),
+        (?, ?, 'PRIVACY_MANAGE'),
         (?, ?, 'SUPPLIERS_MANAGE'),
         (?, ?, 'PURCHASE_ORDERS_MANAGE'),
         (?, ?, 'PURCHASE_ORDERS_APPROVE'),
@@ -96,7 +97,14 @@ export class RegistrationRepository {
         (?, ?, 'INVENTORY_TRANSFER'), (?, ?, 'INVENTORY_COUNT'),
         (?, ?, 'INVENTORY_APPROVE'),
         (?, ?, 'INVENTORY_VALUATION_MANAGE')`,
-      Array.from({ length: 22 }, () => [role.id, tenant.id]).flat(),
+      Array.from({ length: 23 }, () => [role.id, tenant.id]).flat(),
+    );
+    await manager.query(
+      `INSERT INTO privacy_policies
+        (tenant_id, country_code, minimum_transaction_retention_days,
+         transaction_retention_days, policy_code, version)
+       VALUES (?, 'DEFAULT', 365, 365, 'DEFAULT_CONSERVATIVE', 1)`,
+      [tenant.id],
     );
     await manager.query(
       `INSERT INTO inventory_valuation_policies

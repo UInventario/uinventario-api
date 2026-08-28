@@ -1,7 +1,8 @@
-import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { ListAuditEventsDto } from './dto/list-audit-events.dto';
+import { StructuredTelemetryService } from '../observability/structured-telemetry.service';
 
 export type AuditOrigin =
   'APPLICATION' | 'ADMIN_CONSOLE' | 'SYSTEM' | 'INTEGRATION';
@@ -70,9 +71,10 @@ const SENSITIVE_KEY =
 
 @Injectable()
 export class AuditService {
-  private readonly logger = new Logger(AuditService.name);
-
-  constructor(private readonly dataSource: DataSource) {}
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly telemetry: StructuredTelemetryService,
+  ) {}
 
   async record(input: RecordAuditEvent): Promise<void> {
     try {
@@ -81,16 +83,14 @@ export class AuditService {
       );
     } catch (error) {
       if (this.isDuplicate(error)) return;
-      this.logger.error(
-        JSON.stringify({
-          event: 'audit_write_failed',
-          tenantId: input.tenantId,
-          actorUserId: input.actorUserId,
-          action: input.action,
-          correlationId: input.correlationId,
-          errorType: error instanceof Error ? error.name : 'UnknownError',
-        }),
-      );
+      this.telemetry.emit({
+        severity: 'ERROR',
+        event: 'audit_write_failed',
+        tenantRef: this.telemetry.tenantRef(input.tenantId),
+        action: input.action,
+        correlationId: input.correlationId,
+        errorType: error instanceof Error ? error.name : 'UnknownError',
+      });
     }
   }
 

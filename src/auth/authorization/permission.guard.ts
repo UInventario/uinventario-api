@@ -34,12 +34,15 @@ export class PermissionGuard implements CanActivate {
       requiredAny.some((permission) =>
         request.principal.user.permissions.includes(permission),
       );
-    const auditOnly =
+    const governanceOnly =
       required?.length &&
-      required.every((permission) => permission.startsWith('AUDIT_'));
+      required.every(
+        (permission) =>
+          permission.startsWith('AUDIT_') || permission.startsWith('PRIVACY_'),
+      );
     if (
       request.principal.nextStep !== 'APPLICATION' ||
-      (!auditOnly &&
+      (!governanceOnly &&
         (!request.principal.context.branch ||
           !request.principal.context.warehouse)) ||
       !hasAll ||
