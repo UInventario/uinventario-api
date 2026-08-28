@@ -14,6 +14,7 @@ import {
 import { SessionGuard } from '../auth/session/session.guard';
 import type { AuthenticatedRequest } from '../auth/session/session.types';
 import { CreateCashSaleDto } from './dto/create-cash-sale.dto';
+import { CreateSaleDto } from './dto/create-sale.dto';
 import { ListSalesDto } from './dto/list-sales.dto';
 import { QuoteCartDto } from './dto/quote-cart.dto';
 import { PosAccessGuard } from './pos-access.guard';
@@ -40,6 +41,11 @@ export class PosController {
     private readonly closures: CashRegisterClosureService,
     private readonly audit: AuditService,
   ) {}
+
+  @Get('payment-options')
+  paymentOptions() {
+    return this.pos.paymentOptions();
+  }
 
   @Get('register-shifts/current')
   currentShift(@Req() request: AuthenticatedRequest) {
@@ -249,6 +255,47 @@ export class PosController {
       entityId: result.data.id,
       correlationId: request.requestId!,
       deduplicate: true,
+    });
+    if (dto.reservationId) {
+      await this.audit.record({
+        tenantId: principal.tenant.id,
+        actorUserId: principal.user.id,
+        action: 'PRODUCT_RESERVATION_CONSUMED',
+        entityType: 'PRODUCT_RESERVATION',
+        entityId: dto.reservationId,
+        correlationId: request.requestId!,
+        deduplicate: true,
+        after: { status: 'CONSUMED', saleId: result.data.id },
+      });
+    }
+    return result;
+  }
+
+  @Post('sales')
+  async createSale(
+    @Req() request: AuthenticatedRequest,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: CreateSaleDto,
+  ) {
+    const { principal } = request;
+    const result = await this.pos.createSale({
+      tenantId: principal.tenant.id,
+      branchId: principal.context.branch!.id,
+      warehouseId: principal.context.warehouse!.id,
+      cashRegisterId: principal.context.cashRegister!.id,
+      userId: principal.user.id,
+      idempotencyKey,
+      dto,
+    });
+    await this.audit.record({
+      tenantId: principal.tenant.id,
+      actorUserId: principal.user.id,
+      action: 'SALE_COMPLETED',
+      entityType: 'SALE',
+      entityId: result.data.id,
+      correlationId: request.requestId!,
+      deduplicate: true,
+      after: { paymentMethod: result.data.payment.method },
     });
     if (dto.reservationId) {
       await this.audit.record({

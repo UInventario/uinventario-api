@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import {
   PosIdempotencyConflictError,
+  PaymentReferenceConflictError,
   PosCustomerNotAvailableError,
   PosInsufficientStockError,
   PosReservationNotAvailableError,
@@ -17,6 +18,7 @@ import {
   SaleDetailData,
   SaleSummaryData,
 } from './pos.types';
+import type { PaymentMethod } from './dto/create-sale.dto';
 import { AuditService } from '../audit/audit.service';
 
 interface SaleRow {
@@ -45,6 +47,10 @@ interface SaleRow {
   amount_applied: string;
   change_amount: string;
   payment_status: 'COMPLETED' | 'REVERSED';
+  payment_method: PaymentMethod;
+  external_reference: string | null;
+  payment_provider: string;
+  authorization_code: string | null;
   voided_by_user_id: string | null;
   voided_by_email: string | null;
   void_reason: string | null;
@@ -109,6 +115,7 @@ export class SalesRepository {
           currency: string;
           total: string;
           created_at: Date | string;
+          payment_method: PaymentMethod;
         }>
       >(
         `SELECT s.id, s.receipt_number, s.status,
@@ -116,7 +123,9 @@ export class SalesRepository {
                 c.id AS customer_id, c.name AS customer_name,
                 c.identifier AS customer_identifier,
                 cr.id AS cash_register_id, cr.name AS cash_register_name,
-                cr.code AS cash_register_code, s.currency, s.total, s.created_at
+                cr.code AS cash_register_code, s.currency, s.total, s.created_at,
+                (SELECT sp.method FROM sale_payments sp
+                 WHERE sp.sale_id = s.id AND sp.tenant_id = s.tenant_id LIMIT 1) AS payment_method
          FROM sales s
          INNER JOIN users u ON u.id = s.created_by_user_id AND u.tenant_id = s.tenant_id
          LEFT JOIN customers c ON c.id = s.customer_id AND c.tenant_id = s.tenant_id
@@ -150,7 +159,7 @@ export class SalesRepository {
         },
         currency: row.currency,
         total: this.decimal(row.total, 2),
-        paymentMethod: 'CASH',
+        paymentMethod: row.payment_method,
         createdAt: new Date(row.created_at).toISOString(),
       })),
       total: Number(countRows[0]?.total ?? 0),
@@ -462,7 +471,7 @@ export class SalesRepository {
     }
   }
 
-  async persistCashSale(input: {
+  async persistSale(input: {
     tenantId: string;
     userId: string;
     idempotencyKey: string;
@@ -473,6 +482,13 @@ export class SalesRepository {
     quote: PosCartQuoteResponse['data'];
     amountReceived: string;
     change: string;
+    payment: {
+      method: PaymentMethod;
+      reference: string | null;
+      provider: string;
+      providerReference: string | null;
+      authorizationCode: string | null;
+    };
   }): Promise<{ sale: CashSaleData; replay: boolean }> {
     try {
       return await this.dataSource.transaction(
@@ -766,13 +782,19 @@ export class SalesRepository {
           }
           await manager.query(
             `INSERT INTO sale_payments
-            (id, tenant_id, sale_id, method, currency, amount_received,
-             amount_applied, change_amount)
-           VALUES (?, ?, ?, 'CASH', ?, ?, ?, ?)`,
+            (id, tenant_id, sale_id, method, provider, external_reference,
+             provider_reference, authorization_code, authorization_status,
+             currency, amount_received, amount_applied, change_amount)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'APPROVED', ?, ?, ?, ?)`,
             [
               randomUUID(),
               input.tenantId,
               saleId,
+              input.payment.method,
+              input.payment.provider,
+              input.payment.reference,
+              input.payment.providerReference,
+              input.payment.authorizationCode,
               input.quote.currency,
               input.amountReceived,
               input.quote.totals.total,
@@ -804,7 +826,7 @@ export class SalesRepository {
             input.tenantId,
             input.idempotencyKey,
           );
-          if (!created) throw new Error('CREATED_CASH_SALE_NOT_FOUND');
+          if (!created) throw new Error('CREATED_SALE_NOT_FOUND');
           return { sale: created.sale, replay: false };
         },
       );
@@ -814,7 +836,8 @@ export class SalesRepository {
         input.tenantId,
         input.idempotencyKey,
       );
-      if (!replay || replay.fingerprint !== input.fingerprint)
+      if (!replay) throw new PaymentReferenceConflictError();
+      if (replay.fingerprint !== input.fingerprint)
         throw new PosIdempotencyConflictError();
       return { sale: replay.sale, replay: true };
     }
@@ -836,13 +859,15 @@ export class SalesRepository {
               w.id AS warehouse_id, w.name AS warehouse_name,
               cr.id AS cash_register_id, cr.name AS cash_register_name,
               cr.code AS cash_register_code,
+              sp.method AS payment_method, sp.external_reference,
+              sp.provider AS payment_provider, sp.authorization_code,
               sp.amount_received, sp.amount_applied, sp.change_amount,
               sp.status AS payment_status
        FROM sales s
        INNER JOIN branches b ON b.id = s.branch_id AND b.tenant_id = s.tenant_id
        INNER JOIN warehouses w ON w.id = s.warehouse_id AND w.tenant_id = s.tenant_id
        INNER JOIN cash_registers cr ON cr.id = s.cash_register_id AND cr.tenant_id = s.tenant_id
-       INNER JOIN sale_payments sp ON sp.sale_id = s.id AND sp.tenant_id = s.tenant_id AND sp.method = 'CASH'
+       INNER JOIN sale_payments sp ON sp.sale_id = s.id AND sp.tenant_id = s.tenant_id
        LEFT JOIN users vu ON vu.id = s.voided_by_user_id AND vu.tenant_id = s.tenant_id
        LEFT JOIN customers c ON c.id = s.customer_id AND c.tenant_id = s.tenant_id
        WHERE s.tenant_id = ? AND s.idempotency_key = ? LIMIT 1`,
@@ -910,11 +935,14 @@ export class SalesRepository {
           total: this.decimal(row.total, 2),
         },
         payment: {
-          method: 'CASH',
+          method: row.payment_method,
           status: row.payment_status,
           amountReceived: this.decimal(row.amount_received, 2),
           amountApplied: this.decimal(row.amount_applied, 2),
           change: this.decimal(row.change_amount, 2),
+          reference: row.external_reference,
+          provider: row.payment_provider,
+          authorizationCode: row.authorization_code,
         },
         createdAt: new Date(row.created_at).toISOString(),
         void:

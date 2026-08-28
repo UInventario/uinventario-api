@@ -29,8 +29,11 @@ describe('PosService', () => {
       {
         requireCurrent: jest.fn().mockResolvedValue({ id: 'shift' }),
       } as unknown as CashRegisterShiftService,
+      { enabledMethods: jest.fn().mockReturnValue(['CASH']) } as never,
       {
         taxRates: { MX: '0.1600', CL: '0.1900', DEFAULT: '0.0000' },
+        nonCashProvider: 'DISABLED',
+        paymentMethods: ['CASH'],
       },
     );
 
