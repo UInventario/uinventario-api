@@ -27,6 +27,7 @@ import { ProcurementModule } from './procurement/procurement.module';
 import { CustomerModule } from './customers/customer.module';
 import { ProductReservationModule } from './reservations/product-reservation.module';
 import { OfflineSyncModule } from './offline-sync/offline-sync.module';
+import { DataExportModule } from './data-exports/data-export.module';
 
 @Module({
   imports: [
@@ -73,6 +74,7 @@ import { OfflineSyncModule } from './offline-sync/offline-sync.module';
     OfflineSyncModule,
     InventoryModule,
     PosModule,
+    DataExportModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })

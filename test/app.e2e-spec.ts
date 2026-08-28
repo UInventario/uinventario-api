@@ -6099,6 +6099,192 @@ describe('UInventario API (e2e)', () => {
         .expect(400);
     });
 
+    it('exports filtered operational data asynchronously without formulas or tenant leakage', async () => {
+      const { cookie, productId } = await preparePos();
+      await dataSource.query('UPDATE products SET name = ? WHERE id = ?', [
+        '=2+2 producto',
+        productId,
+      ]);
+      const exportSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'export-sale')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: '120.00',
+        })
+        .expect(201);
+      const exportSaleData = exportSale.body as {
+        data: { id: string; receiptNumber: string };
+      };
+      const exportSaleId = exportSaleData.data.id;
+      await dataSource.query(
+        `UPDATE sales SET created_at = '2026-01-02 05:30:00' WHERE id = ?`,
+        [exportSaleId],
+      );
+
+      const waitForExport = async (id: string) => {
+        for (let attempt = 0; attempt < 30; attempt += 1) {
+          const response = await request(app.getHttpServer())
+            .get(`/api/v1/data-exports/${id}`)
+            .set('Cookie', cookie)
+            .expect(200);
+          const body = response.body as { data: { status: string } };
+          if (!['PENDING', 'PROCESSING'].includes(body.data.status))
+            return body;
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        throw new Error('Export did not complete');
+      };
+      const createExport = async (body: Record<string, unknown>) => {
+        const created = await request(app.getHttpServer())
+          .post('/api/v1/data-exports')
+          .set('Cookie', cookie)
+          .send(body)
+          .expect(202);
+        const id = (created.body as { data: { id: string } }).data.id;
+        const completed = (await waitForExport(id)) as {
+          data: {
+            status: string;
+            rowCount: number;
+            excludedColumns: string[];
+          };
+        };
+        expect(completed.data.status).toBe('COMPLETED');
+        return { id, data: completed.data };
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/data-exports')
+        .set('Cookie', cookie)
+        .send({ dataset: 'SALES', format: 'CSV', dateFrom: '2026-99-99' })
+        .expect(400);
+
+      const productsExport = await createExport({
+        dataset: 'PRODUCTS',
+        format: 'CSV',
+        q: 'producto',
+        productStatus: 'ALL',
+      });
+      expect(productsExport.data).toMatchObject({ rowCount: 1 });
+      expect(productsExport.data.excludedColumns).toContain('customer');
+      const productsFile = await request(app.getHttpServer())
+        .get(`/api/v1/data-exports/${productsExport.id}/download`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect('Content-Type', /text\/csv/);
+      const csv = Buffer.isBuffer(productsFile.body)
+        ? productsFile.body.toString('utf8')
+        : String(productsFile.text);
+      expect(csv).toContain("'=2+2 producto");
+      expect(csv).toContain('80.00');
+
+      const stockExport = await createExport({
+        dataset: 'STOCK',
+        format: 'XLSX',
+        productId,
+      });
+      const stockFile = await request(app.getHttpServer())
+        .get(`/api/v1/data-exports/${stockExport.id}/download`)
+        .set('Cookie', cookie)
+        .buffer(true)
+        .parse((response, callback) => {
+          const chunks: Buffer[] = [];
+          response.on('data', (chunk: Buffer) =>
+            chunks.push(Buffer.from(chunk)),
+          );
+          response.on('end', () => callback(null, Buffer.concat(chunks)));
+        })
+        .expect(200)
+        .expect('Content-Type', /spreadsheetml/);
+      const workbook = new ExcelJS.Workbook();
+      const workbookBuffer = stockFile.body as unknown as Buffer;
+      await workbook.xlsx.load(
+        workbookBuffer as unknown as Parameters<typeof workbook.xlsx.load>[0],
+      );
+      expect(workbook.worksheets[0].getCell('D2').value).toBe(4);
+
+      const salesExport = await createExport({
+        dataset: 'SALES',
+        format: 'CSV',
+        saleStatus: 'COMPLETED',
+        q: exportSaleData.data.receiptNumber,
+        dateFrom: '2026-01-01',
+        dateTo: '2026-01-01',
+      });
+      expect(salesExport.data.rowCount).toBe(1);
+      const movementsExport = await createExport({
+        dataset: 'MOVEMENTS',
+        format: 'CSV',
+        q: 'producto',
+      });
+      expect(movementsExport.data.rowCount).toBeGreaterThanOrEqual(2);
+
+      const [adminRole] = await dataSource.query<
+        Array<{ role_id: string; tenant_id: string }>
+      >(
+        `SELECT r.id AS role_id, r.tenant_id FROM roles r
+         INNER JOIN users u ON u.tenant_id = r.tenant_id
+         WHERE r.code = 'ADMIN' AND u.normalized_email = ?`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions WHERE role_id = ? AND tenant_id = ?
+         AND permission IN ('TENANT_MANAGE', 'PRODUCTS_MANAGE')`,
+        [adminRole.role_id, adminRole.tenant_id],
+      );
+      const restrictedStock = await createExport({
+        dataset: 'STOCK',
+        format: 'CSV',
+      });
+      expect(restrictedStock.data.excludedColumns).toContain('inventoryValue');
+      await request(app.getHttpServer())
+        .post('/api/v1/data-exports')
+        .set('Cookie', cookie)
+        .send({ dataset: 'PRODUCTS', format: 'CSV' })
+        .expect(403);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'export-other-tenant')
+        .send({
+          organizationName: 'Otra empresa',
+          email: 'other-export@example.com',
+          password: registrationPayload.password,
+        })
+        .expect(201);
+      const otherCookie = await createPersistedSession(
+        'other-export@example.com',
+      );
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Otra empresa legal',
+          tradeName: 'Otra empresa',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Otra sucursal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Otra bodega',
+          locationName: 'Otra ubicación',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Otra caja' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/data-exports/${productsExport.id}`)
+        .set('Cookie', otherCookie)
+        .expect(404);
+    });
+
     it('manages tenant customers and associates an optional active customer to sales', async () => {
       const { cookie, productId } = await preparePos();
       await request(app.getHttpServer())
