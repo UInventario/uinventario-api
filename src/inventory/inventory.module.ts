@@ -9,10 +9,17 @@ import { InventoryTransferRepository } from './inventory-transfer.repository';
 import { InventoryTransferService } from './inventory-transfer.service';
 import { InventoryImportRepository } from './inventory-import.repository';
 import { InventoryImportService } from './inventory-import.service';
+import { InventoryCountController } from './inventory-count.controller';
+import { InventoryCountRepository } from './inventory-count.repository';
+import { InventoryCountService } from './inventory-count.service';
 
 @Module({
   imports: [SessionModule],
-  controllers: [InventoryController, InventoryTransferController],
+  controllers: [
+    InventoryController,
+    InventoryTransferController,
+    InventoryCountController,
+  ],
   providers: [
     InventoryRepository,
     InventoryService,
@@ -20,6 +27,8 @@ import { InventoryImportService } from './inventory-import.service';
     InventoryTransferService,
     InventoryImportRepository,
     InventoryImportService,
+    InventoryCountRepository,
+    InventoryCountService,
     PermissionGuard,
   ],
   exports: [InventoryService],

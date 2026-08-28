@@ -55,6 +55,9 @@ describe('UInventario API (e2e)', () => {
       'product_reservation_lines',
       'product_reservations',
       'customers',
+      'inventory_count_attempts',
+      'inventory_count_session_lines',
+      'inventory_count_sessions',
       'inventory_counts',
       'inventory_movements',
       'inventory_import_rows',
@@ -5489,6 +5492,210 @@ describe('UInventario API (e2e)', () => {
         [registrationPayload.email, importId],
       );
       expect(Number(importMovements)).toBe(2);
+    });
+
+    it('records blind recounts and closes physical counts without overwriting concurrent stock', async () => {
+      await registerAccount('physical-count-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeInventoryOnboarding(registrationPayload.email, cookie);
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto contado',
+          sku: 'COUNT-1',
+          cost: '5.00',
+          price: '9.00',
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'physical-count-initial-stock')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '10',
+          reason: 'Existencia inicial',
+        })
+        .expect(201);
+
+      const created = await request(app.getHttpServer())
+        .post('/api/v1/inventory/count-sessions')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'physical-count-session')
+        .send({ locationId: location.id, productIds: [productId], blind: true })
+        .expect(201);
+      const sessionId = (
+        created.body as {
+          data: {
+            id: string;
+            lines: Array<{ snapshotQuantity: string | null }>;
+          };
+        }
+      ).data.id;
+      expect(created.body).toMatchObject({
+        data: {
+          status: 'OPEN',
+          blind: true,
+          lines: [{ snapshotQuantity: null, attemptCount: 0 }],
+        },
+      });
+
+      await request(app.getHttpServer())
+        .put(`/api/v1/inventory/count-sessions/${sessionId}/lines/${productId}`)
+        .set('Cookie', cookie)
+        .send({ countedQuantity: '8', expectedAttempt: 0 })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  countedQuantity: '8.000',
+                  snapshotQuantity: null,
+                  varianceQuantity: null,
+                  attemptCount: 1,
+                  attempts: [{ attempt: 1, countedQuantity: '8.000' }],
+                },
+              ],
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .put(`/api/v1/inventory/count-sessions/${sessionId}/lines/${productId}`)
+        .set('Cookie', cookie)
+        .send({ countedQuantity: '9', expectedAttempt: 0 })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVENTORY_COUNT_ATTEMPT_CONFLICT');
+        });
+      await request(app.getHttpServer())
+        .put(`/api/v1/inventory/count-sessions/${sessionId}/lines/${productId}`)
+        .set('Cookie', cookie)
+        .send({ countedQuantity: '9', expectedAttempt: 1 })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  countedQuantity: '9.000',
+                  attemptCount: 2,
+                  attempts: [
+                    { attempt: 1, countedQuantity: '8.000' },
+                    { attempt: 2, countedQuantity: '9.000' },
+                  ],
+                },
+              ],
+            },
+          });
+        });
+
+      const [adminRole] = await dataSource.query<
+        Array<{ role_id: string; tenant_id: string }>
+      >(
+        `SELECT r.id AS role_id, r.tenant_id FROM roles r
+         INNER JOIN users u ON u.tenant_id = r.tenant_id
+         WHERE r.code = 'ADMIN' AND u.normalized_email = ?`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'INVENTORY_APPROVE'`,
+        [adminRole.role_id, adminRole.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/count-sessions/${sessionId}/close`)
+        .set('Cookie', cookie)
+        .send({ reason: 'Conteo mensual', reference: 'COUNT-AUG-2026' })
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'INVENTORY_APPROVE')`,
+        [adminRole.role_id, adminRole.tenant_id],
+      );
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/count-sessions/${sessionId}/close`)
+        .set('Cookie', cookie)
+        .send({ reason: 'Conteo mensual', reference: 'COUNT-AUG-2026' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              status: 'CLOSED',
+              lines: [
+                {
+                  snapshotQuantity: '10.000',
+                  countedQuantity: '9.000',
+                  varianceQuantity: '-1.000',
+                  attemptCount: 2,
+                },
+              ],
+            },
+          });
+        });
+
+      const stale = await request(app.getHttpServer())
+        .post('/api/v1/inventory/count-sessions')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'physical-count-stale-session')
+        .send({
+          locationId: location.id,
+          productIds: [productId],
+          blind: false,
+        })
+        .expect(201);
+      const staleSessionId = (stale.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .put(
+          `/api/v1/inventory/count-sessions/${staleSessionId}/lines/${productId}`,
+        )
+        .set('Cookie', cookie)
+        .send({ countedQuantity: '7', expectedAttempt: 0 })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'physical-count-concurrent-entry')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'ENTRY',
+          quantity: '1',
+          reason: 'Recepción concurrente',
+          reference: 'RC-1',
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/count-sessions/${staleSessionId}/close`)
+        .set('Cookie', cookie)
+        .send({
+          reason: 'No debe sobrescribir una recepción',
+          reference: 'COUNT-STALE',
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVENTORY_COUNT_STOCK_CHANGED');
+        });
+
+      const [balance] = await dataSource.query<Array<{ quantity: string }>>(
+        `SELECT available_quantity AS quantity FROM inventory_balances
+         WHERE product_id = ? AND location_id = ?`,
+        [productId, location.id],
+      );
+      expect(balance.quantity).toBe('10.000');
     });
   });
 
