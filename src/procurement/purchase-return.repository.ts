@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { applyInventoryValuation } from '../inventory/inventory-valuation';
+import { applyInventoryLotTracking } from '../inventory/inventory-lot-tracking';
 import { ReturnPurchaseReceiptDto } from './dto/return-purchase-receipt.dto';
 import {
   InvalidPurchaseReturnError,
@@ -260,6 +261,7 @@ export class PurchaseReturnRepository {
               ],
             );
             await applyInventoryValuation(manager, movementId);
+            await applyInventoryLotTracking(manager, movementId);
           }
           return { returnId, replay: false };
         },

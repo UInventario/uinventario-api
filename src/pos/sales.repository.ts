@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { applyInventoryValuation } from '../inventory/inventory-valuation';
+import { applyInventoryLotTracking } from '../inventory/inventory-lot-tracking';
 import {
   PosIdempotencyConflictError,
   PaymentReferenceConflictError,
@@ -404,6 +405,7 @@ export class SalesRepository {
               ],
             );
             await applyInventoryValuation(manager, voidMovementId);
+            await applyInventoryLotTracking(manager, voidMovementId);
           }
           const paymentUpdate = await manager.query<{ affectedRows?: number }>(
             `UPDATE sale_payments
@@ -599,15 +601,27 @@ export class SalesRepository {
                 quantity: string;
                 available_quantity: string;
                 reserved_quantity: string;
+                lot_quantity: string | null;
               }>
             >(
-              `SELECT ib.location_id, ib.quantity, ib.available_quantity, ib.reserved_quantity
+              `SELECT ib.location_id, ib.quantity, ib.available_quantity, ib.reserved_quantity,
+                      CASE WHEN ? IS NULL THEN NULL ELSE COALESCE((
+                        SELECT ilb.quantity FROM inventory_lot_balances ilb
+                        INNER JOIN inventory_lots il
+                          ON il.id = ilb.lot_id AND il.tenant_id = ilb.tenant_id
+                        WHERE ilb.tenant_id = ib.tenant_id
+                          AND ilb.location_id = ib.location_id
+                          AND il.product_id = ib.product_id AND il.id = ?
+                      ), 0) END AS lot_quantity
+
              FROM inventory_balances ib
              INNER JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
              WHERE ib.tenant_id = ? AND ib.product_id = ? AND l.warehouse_id = ?
                AND (? IS NULL OR ib.location_id = ?)
              ORDER BY l.created_at, l.id FOR UPDATE`,
               [
+                line.lotId,
+                line.lotId,
                 input.tenantId,
                 line.product.id,
                 input.quote.context.warehouse.id,
@@ -624,6 +638,10 @@ export class SalesRepository {
                   ? balance.reserved_quantity
                   : balance.available_quantity,
               );
+              const lotAvailable =
+                line.lotId && balance.lot_quantity !== null
+                  ? this.toQuantityUnits(balance.lot_quantity)
+                  : available;
               const total = this.toQuantityUnits(balance.quantity);
               const currentAvailable = this.toQuantityUnits(
                 balance.available_quantity,
@@ -631,7 +649,10 @@ export class SalesRepository {
               const currentReserved = this.toQuantityUnits(
                 balance.reserved_quantity,
               );
-              const taken = available < remaining ? available : remaining;
+              const effectiveAvailable =
+                available < lotAvailable ? available : lotAvailable;
+              const taken =
+                effectiveAvailable < remaining ? effectiveAvailable : remaining;
               if (taken === 0n) continue;
               lineAllocations.push({
                 locationId: balance.location_id,
@@ -778,6 +799,9 @@ export class SalesRepository {
                 ],
               );
               await applyInventoryValuation(manager, movementId);
+              await applyInventoryLotTracking(manager, movementId, {
+                preferredLotId: line.lotId ?? undefined,
+              });
             }
           }
           for (const payment of input.payments) {

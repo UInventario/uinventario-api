@@ -83,6 +83,36 @@ export interface InventoryMovementValuation {
   averageUnitCost: string | null;
 }
 
+export interface InventoryLotAllocation {
+  id: string;
+  code: string;
+  quantityChange: string;
+  selectionMode: 'ORIGIN' | 'MANUAL' | 'AUTOMATIC' | 'RESTORE' | 'TRANSFER';
+}
+
+export interface InventoryLotData {
+  id: string;
+  code: string;
+  product: { id: string; name: string; sku: string };
+  quantity: string;
+  createdAt: string;
+  balances: Array<{
+    location: InventoryLocationData;
+    quantity: string;
+  }>;
+}
+
+export interface InventoryLotsResponse {
+  data: InventoryLotData[];
+  meta: {
+    apiVersion: '1';
+    tracked: boolean;
+    totalQuantity: string;
+    lotQuantity: string;
+    reconciled: boolean;
+  };
+}
+
 export interface InventoryLocationsResponse {
   data: InventoryLocationData[];
   meta: { apiVersion: '1' };
@@ -166,6 +196,7 @@ export interface InventoryMovementHistoryItem {
     quantity: string;
   } | null;
   valuation: InventoryMovementValuation | null;
+  lots: InventoryLotAllocation[];
 }
 
 export interface InventoryMovementListResponse {
@@ -183,7 +214,13 @@ export interface InventoryMovementListResponse {
 }
 
 export interface InventoryStockItem {
-  product: { id: string; name: string; sku: string; active: boolean };
+  product: {
+    id: string;
+    name: string;
+    sku: string;
+    active: boolean;
+    trackLots: boolean;
+  };
   availableQuantity: string;
   totalQuantity: string;
   states: InventoryStateQuantity[];
@@ -196,6 +233,10 @@ export interface InventoryStockItem {
     valueReconciled: boolean;
     reconciled: boolean;
   };
+  lotTracking: {
+    lotQuantity: string;
+    reconciled: boolean;
+  } | null;
 }
 
 export interface InventoryStateTransitionResponse {

@@ -22,6 +22,7 @@ describe('PosService', () => {
           availableQuantity: '5.000',
         },
       ]),
+      getSelectedLotAvailability: jest.fn().mockResolvedValue(new Map()),
     };
     const service = new PosService(
       repository as unknown as PosRepository,

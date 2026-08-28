@@ -8,6 +8,7 @@ import {
   ProductCodeAmbiguousError,
   ProductIdentifierConflictError,
   ProductVersionConflictError,
+  ProductLotTrackingLockedError,
 } from './catalog.errors';
 import {
   CatalogClassificationData,
@@ -26,6 +27,7 @@ interface ProductRow {
   name: string;
   sku: string;
   barcode: string | null;
+  track_lots: number | boolean;
   cost: string;
   price: string;
   active: number | boolean;
@@ -65,8 +67,9 @@ export class CatalogRepository {
         const id = randomUUID();
         await manager.query(
           `INSERT INTO products
-            (id, tenant_id, name, sku, normalized_sku, barcode, category_id, brand_id, cost, price)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            (id, tenant_id, name, sku, normalized_sku, barcode, track_lots,
+             category_id, brand_id, cost, price)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             id,
             tenantId,
@@ -74,6 +77,7 @@ export class CatalogRepository {
             dto.sku,
             this.normalize(dto.sku),
             dto.barcode ?? null,
+            dto.trackLots ?? false,
             categoryId,
             brandId,
             dto.cost,
@@ -117,6 +121,26 @@ export class CatalogRepository {
   ): Promise<ProductData | null> {
     try {
       return await this.dataSource.transaction(async (manager) => {
+        const [currentTracking] = await manager.query<
+          Array<{
+            track_lots: number | boolean;
+            has_movements: number | string;
+          }>
+        >(
+          `SELECT p.track_lots,
+                  EXISTS(SELECT 1 FROM inventory_movements im
+                         WHERE im.tenant_id = p.tenant_id AND im.product_id = p.id) AS has_movements
+           FROM products p WHERE p.id = ? AND p.tenant_id = ? LIMIT 1 FOR UPDATE`,
+          [id, tenantId],
+        );
+        if (!currentTracking) return null;
+        if (
+          dto.trackLots !== undefined &&
+          dto.trackLots !== Boolean(currentTracking.track_lots) &&
+          Number(currentTracking.has_movements) === 1
+        ) {
+          throw new ProductLotTrackingLockedError();
+        }
         const categoryId = dto.categoryName
           ? await this.findOrCreateClassification(
               manager,
@@ -136,6 +160,7 @@ export class CatalogRepository {
         const result = await manager.query<ResultSetHeader>(
           `UPDATE products
            SET name = ?, sku = ?, normalized_sku = ?, barcode = ?,
+               track_lots = COALESCE(?, track_lots),
                category_id = ?, brand_id = ?, cost = ?, price = ?, version = version + 1
            WHERE id = ? AND tenant_id = ? AND version = ?`,
           [
@@ -143,6 +168,7 @@ export class CatalogRepository {
             dto.sku,
             this.normalize(dto.sku),
             dto.barcode ?? null,
+            dto.trackLots ?? null,
             categoryId,
             brandId,
             dto.cost,
@@ -493,7 +519,7 @@ export class CatalogRepository {
   }
 
   private productSelect(): string {
-    return `SELECT p.id, p.name, p.sku, p.barcode, p.cost, p.price, p.active, p.version,
+    return `SELECT p.id, p.name, p.sku, p.barcode, p.track_lots, p.cost, p.price, p.active, p.version,
                    c.id AS category_id, c.name AS category_name,
                    b.id AS brand_id, b.name AS brand_name
             FROM products p
@@ -546,6 +572,7 @@ export class CatalogRepository {
       name: row.name,
       sku: row.sku,
       barcode: row.barcode,
+      trackLots: Boolean(row.track_lots),
       category:
         row.category_id && row.category_name
           ? { id: row.category_id, name: row.category_name }

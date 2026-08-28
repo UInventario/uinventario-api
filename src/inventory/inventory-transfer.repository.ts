@@ -15,6 +15,7 @@ import {
   InventoryTransferReceiptExceedsPendingError,
 } from './inventory-transfer.errors';
 import { applyInventoryValuation } from './inventory-valuation';
+import { applyInventoryLotTracking } from './inventory-lot-tracking';
 import {
   InventoryTransferData,
   InventoryTransferLineData,
@@ -1139,6 +1140,7 @@ export class InventoryTransferRepository {
       ],
     );
     await applyInventoryValuation(input.manager, movementId);
+    await applyInventoryLotTracking(input.manager, movementId);
   }
 
   private async insertReceiptMovement(input: {
@@ -1201,6 +1203,7 @@ export class InventoryTransferRepository {
       ],
     );
     await applyInventoryValuation(input.manager, movementId);
+    await applyInventoryLotTracking(input.manager, movementId);
   }
 
   private toLine(line: TransferLineRow): InventoryTransferLineData {

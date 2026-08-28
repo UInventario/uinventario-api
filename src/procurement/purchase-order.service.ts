@@ -34,6 +34,12 @@ import {
   PurchaseOrderListResponse,
   PurchaseOrderResponse,
 } from './purchase-order.types';
+import {
+  InsufficientInventoryLotStockError,
+  InvalidInventoryLotCodeError,
+  InventoryLotNotFoundError,
+  InventoryLotRequiredError,
+} from '../inventory/inventory.errors';
 
 @Injectable()
 export class PurchaseOrderService {
@@ -356,6 +362,23 @@ export class PurchaseOrderService {
         code: 'PURCHASE_ORDER_STATE_CONFLICT',
         currentStatus: error.status,
         message: 'El estado actual de la orden no permite esta operación.',
+      });
+    }
+    if (error instanceof InventoryLotRequiredError) {
+      throw new BadRequestException({
+        code: 'INVENTORY_LOT_REQUIRED',
+        message: 'Indica el lote de cada producto que controla lotes.',
+      });
+    }
+    if (error instanceof InvalidInventoryLotCodeError) {
+      throw new BadRequestException({ code: 'INVALID_INVENTORY_LOT_CODE' });
+    }
+    if (error instanceof InventoryLotNotFoundError) {
+      throw new NotFoundException({ code: 'INVENTORY_LOT_NOT_FOUND' });
+    }
+    if (error instanceof InsufficientInventoryLotStockError) {
+      throw new ConflictException({
+        code: 'INSUFFICIENT_INVENTORY_LOT_STOCK',
       });
     }
     throw error;

@@ -6,6 +6,7 @@ import {
   InventoryTargetNotFoundError,
 } from './inventory.errors';
 import { applyInventoryValuation } from './inventory-valuation';
+import { applyInventoryLotTracking } from './inventory-lot-tracking';
 import {
   InventoryCountAttemptConflictError,
   InventoryCountSessionClosedError,
@@ -400,6 +401,7 @@ export class InventoryCountRepository {
             ],
           );
           await applyInventoryValuation(manager, movementId);
+          await applyInventoryLotTracking(manager, movementId);
         }
         await manager.query(
           `UPDATE inventory_count_session_lines

@@ -17,6 +17,10 @@ import {
   MovementReferenceRequiredError,
   InsufficientStockStateError,
   InvalidStockStateTransitionError,
+  InsufficientInventoryLotStockError,
+  InvalidInventoryLotCodeError,
+  InventoryLotNotFoundError,
+  InventoryLotRequiredError,
 } from './inventory.errors';
 import { InventoryRepository } from './inventory.repository';
 import {
@@ -28,6 +32,7 @@ import {
   InventoryMovementListResponse,
   InventoryStockListResponse,
   InventoryStateTransitionResponse,
+  InventoryLotsResponse,
   INVENTORY_STOCK_POLICY,
 } from './inventory.types';
 
@@ -43,6 +48,34 @@ export class InventoryService {
       data: await this.inventory.listLocations(tenantId, warehouseId),
       meta: { apiVersion: '1' },
     };
+  }
+
+  async listLots(
+    tenantId: string,
+    warehouseId: string,
+    productId: string,
+  ): Promise<InventoryLotsResponse> {
+    try {
+      const result = await this.inventory.listLots(
+        tenantId,
+        warehouseId,
+        productId,
+      );
+      return {
+        data: result.items,
+        meta: {
+          apiVersion: '1',
+          tracked: result.tracked,
+          totalQuantity: result.totalQuantity,
+          lotQuantity: result.lotQuantity,
+          reconciled: result.totalQuantity === result.lotQuantity,
+        },
+      };
+    } catch (error) {
+      if (error instanceof InventoryTargetNotFoundError)
+        throw new NotFoundException();
+      throw error;
+    }
   }
 
   async listMovements(
@@ -194,7 +227,32 @@ export class InventoryService {
           message: 'La cantidad es inválida o dejaría el saldo negativo.',
         });
       }
+      this.rethrowLotError(error);
       throw error;
+    }
+  }
+
+  private rethrowLotError(error: unknown): void {
+    if (error instanceof InventoryLotRequiredError) {
+      throw new BadRequestException({
+        code: 'INVENTORY_LOT_REQUIRED',
+        message: 'Indica el lote para este producto.',
+      });
+    }
+    if (error instanceof InvalidInventoryLotCodeError) {
+      throw new BadRequestException({
+        code: 'INVALID_INVENTORY_LOT_CODE',
+        message: 'El código de lote no tiene un formato válido.',
+      });
+    }
+    if (error instanceof InventoryLotNotFoundError) {
+      throw new NotFoundException({ code: 'INVENTORY_LOT_NOT_FOUND' });
+    }
+    if (error instanceof InsufficientInventoryLotStockError) {
+      throw new ConflictException({
+        code: 'INSUFFICIENT_INVENTORY_LOT_STOCK',
+        message: 'El lote no tiene existencias suficientes.',
+      });
     }
   }
 

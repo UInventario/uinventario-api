@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { applyInventoryValuation } from '../inventory/inventory-valuation';
+import { applyInventoryLotTracking } from '../inventory/inventory-lot-tracking';
 import { CreateProductReservationDto } from './dto/create-product-reservation.dto';
 import {
   ProductReservationIdempotencyConflictError,
@@ -207,6 +208,7 @@ export class ProductReservationRepository {
               ],
             );
             await applyInventoryValuation(manager, movementId);
+            await applyInventoryLotTracking(manager, movementId);
           }
           const reservation = await this.findById(manager, input.tenantId, id);
           if (!reservation) throw new Error('CREATED_RESERVATION_NOT_FOUND');
@@ -517,6 +519,7 @@ export class ProductReservationRepository {
         ],
       );
       await applyInventoryValuation(manager, movementId);
+      await applyInventoryLotTracking(manager, movementId);
     }
     await manager.query(
       `UPDATE product_reservations
