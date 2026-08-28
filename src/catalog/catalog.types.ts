@@ -4,6 +4,7 @@ export interface ProductData {
   sku: string;
   barcode: string | null;
   trackLots: boolean;
+  trackSerials: boolean;
   category: { id: string; name: string } | null;
   brand: { id: string; name: string } | null;
   cost: string;

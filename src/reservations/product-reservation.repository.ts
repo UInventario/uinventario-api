@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { applyInventoryValuation } from '../inventory/inventory-valuation';
 import { applyInventoryLotTracking } from '../inventory/inventory-lot-tracking';
+import { applyInventorySerialTracking } from '../inventory/inventory-serial-tracking';
 import { CreateProductReservationDto } from './dto/create-product-reservation.dto';
 import {
   ProductReservationIdempotencyConflictError,
@@ -54,6 +55,9 @@ export class ProductReservationRepository {
       .map((line) => ({
         productId: line.productId,
         quantity: this.decimal(this.units(line.quantity)),
+        serialNumbers: (line.serialNumbers ?? [])
+          .map((value) => value.trim())
+          .sort((left, right) => left.localeCompare(right)),
       }))
       .sort((left, right) => left.productId.localeCompare(right.productId));
     const fingerprint = createHash('sha256')
@@ -159,8 +163,9 @@ export class ProductReservationRepository {
             const reservationLineId = randomUUID();
             await manager.query(
               `INSERT INTO product_reservation_lines
-              (id, tenant_id, reservation_id, line_number, product_id, quantity)
-             VALUES (?, ?, ?, ?, ?, ?)`,
+              (id, tenant_id, reservation_id, line_number, product_id, quantity,
+               serial_numbers)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
               [
                 reservationLineId,
                 input.tenantId,
@@ -168,6 +173,7 @@ export class ProductReservationRepository {
                 index + 1,
                 line.productId,
                 line.quantity,
+                JSON.stringify(line.serialNumbers),
               ],
             );
             await manager.query(
@@ -209,6 +215,9 @@ export class ProductReservationRepository {
             );
             await applyInventoryValuation(manager, movementId);
             await applyInventoryLotTracking(manager, movementId);
+            await applyInventorySerialTracking(manager, movementId, {
+              serialNumbers: line.serialNumbers,
+            });
           }
           const reservation = await this.findById(manager, input.tenantId, id);
           if (!reservation) throw new Error('CREATED_RESERVATION_NOT_FOUND');
@@ -357,9 +366,11 @@ export class ProductReservationRepository {
         product_name: string;
         product_sku: string;
         quantity: string;
+        serial_numbers: string | string[] | null;
       }>
     >(
-      `SELECT rl.id, rl.product_id, p.name AS product_name, p.sku AS product_sku, rl.quantity
+      `SELECT rl.id, rl.product_id, p.name AS product_name, p.sku AS product_sku,
+              rl.quantity, rl.serial_numbers
        FROM product_reservation_lines rl
        INNER JOIN products p ON p.id = rl.product_id AND p.tenant_id = rl.tenant_id
        WHERE rl.reservation_id = ? AND rl.tenant_id = ? ORDER BY rl.line_number`,
@@ -399,6 +410,7 @@ export class ProductReservationRepository {
           sku: line.product_sku,
         },
         quantity: this.decimal(this.units(line.quantity)),
+        serialNumbers: this.serialNumbers(line.serial_numbers),
       })),
     };
   }
@@ -458,9 +470,14 @@ export class ProductReservationRepository {
       throw new ProductReservationNotActiveError(reservation.status);
     }
     const lines = await manager.query<
-      Array<{ id: string; product_id: string; quantity: string }>
+      Array<{
+        id: string;
+        product_id: string;
+        quantity: string;
+        serial_numbers: string | string[] | null;
+      }>
     >(
-      `SELECT id, product_id, quantity FROM product_reservation_lines
+      `SELECT id, product_id, quantity, serial_numbers FROM product_reservation_lines
        WHERE reservation_id = ? AND tenant_id = ? ORDER BY product_id FOR UPDATE`,
       [reservation.id, input.tenantId],
     );
@@ -520,6 +537,9 @@ export class ProductReservationRepository {
       );
       await applyInventoryValuation(manager, movementId);
       await applyInventoryLotTracking(manager, movementId);
+      await applyInventorySerialTracking(manager, movementId, {
+        serialNumbers: this.serialNumbers(line.serial_numbers),
+      });
     }
     await manager.query(
       `UPDATE product_reservations
@@ -557,6 +577,15 @@ export class ProductReservationRepository {
   private units(value: string): bigint {
     const [whole, fraction = ''] = value.split('.');
     return BigInt(whole) * 1000n + BigInt(fraction.padEnd(3, '0'));
+  }
+
+  private serialNumbers(value: string | string[] | null): string[] {
+    if (Array.isArray(value)) return value;
+    if (!value) return [];
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === 'string')
+      : [];
   }
 
   private decimal(units: bigint): string {

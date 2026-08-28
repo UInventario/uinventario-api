@@ -153,6 +153,49 @@ export interface InventoryLotsResponse {
   };
 }
 
+export interface InventorySerialData {
+  id: string;
+  serialNumber: string;
+  status:
+    | 'AVAILABLE'
+    | 'RESERVED'
+    | 'DAMAGED'
+    | 'IN_TRANSIT'
+    | 'SOLD'
+    | 'RETURNED_TO_SUPPLIER'
+    | 'REMOVED';
+  product: { id: string; name: string; sku: string };
+  currentLocation: InventoryLocationData | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface InventorySerialEventData {
+  id: string;
+  movement: {
+    id: string;
+    type: InventoryMovementType;
+    reference: string | null;
+    reason: string;
+  };
+  fromStatus: InventorySerialData['status'] | null;
+  toStatus: InventorySerialData['status'];
+  fromLocation: InventoryLocationData | null;
+  toLocation: InventoryLocationData | null;
+  responsible: { id: string; email: string };
+  createdAt: string;
+}
+
+export interface InventorySerialsResponse {
+  data: InventorySerialData[];
+  meta: { apiVersion: '1'; tracked: boolean };
+}
+
+export interface InventorySerialHistoryResponse {
+  data: { serial: InventorySerialData; events: InventorySerialEventData[] };
+  meta: { apiVersion: '1' };
+}
+
 export interface InventoryFifoLayerData {
   id: string;
   product: { id: string; name: string; sku: string };

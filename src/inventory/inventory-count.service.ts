@@ -16,6 +16,10 @@ import {
 } from './inventory-count.errors';
 import { InventoryCountRepository } from './inventory-count.repository';
 import {
+  InventorySerialQuantityError,
+  InventorySerialRequiredError,
+} from './inventory-serial-tracking';
+import {
   IdempotencyConflictError,
   InventoryTargetNotFoundError,
 } from './inventory.errors';
@@ -150,6 +154,16 @@ export class InventoryCountService {
       throw new ConflictException({
         code: 'IDEMPOTENCY_KEY_REUSED',
         message: 'La clave de idempotencia ya fue usada con otros datos.',
+      });
+    }
+    if (
+      error instanceof InventorySerialRequiredError ||
+      error instanceof InventorySerialQuantityError
+    ) {
+      throw new BadRequestException({
+        code: 'INVENTORY_SERIALS_REQUIRED',
+        message:
+          'El conteo de un producto serializado requiere identificar cada unidad.',
       });
     }
     throw error;

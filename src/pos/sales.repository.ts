@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { applyInventoryValuation } from '../inventory/inventory-valuation';
 import { applyInventoryLotTracking } from '../inventory/inventory-lot-tracking';
+import { applyInventorySerialTracking } from '../inventory/inventory-serial-tracking';
 import {
   PosIdempotencyConflictError,
   PaymentReferenceConflictError,
@@ -59,6 +60,7 @@ interface StockAllocation {
   resultingAvailableQuantity: string;
   resultingReservedQuantity: string;
   reservationLineId?: string;
+  serialNumbers?: string[];
 }
 
 @Injectable()
@@ -406,6 +408,7 @@ export class SalesRepository {
             );
             await applyInventoryValuation(manager, voidMovementId);
             await applyInventoryLotTracking(manager, voidMovementId);
+            await applyInventorySerialTracking(manager, voidMovementId);
           }
           const paymentUpdate = await manager.query<{ affectedRows?: number }>(
             `UPDATE sale_payments
@@ -595,6 +598,33 @@ export class SalesRepository {
           for (const line of [...input.quote.lines].sort((left, right) =>
             left.product.id.localeCompare(right.product.id),
           )) {
+            const serialsByLocation = new Map<string, string[]>();
+            if (line.serialNumbers.length > 0) {
+              const placeholders = line.serialNumbers.map(() => '?').join(',');
+              const serialRows = await manager.query<
+                Array<{ serial_number: string; current_location_id: string }>
+              >(
+                `SELECT serial_number, current_location_id FROM inventory_serials
+                 WHERE tenant_id = ? AND product_id = ?
+                   AND status = ?
+                   AND normalized_serial IN (${placeholders})
+                 ORDER BY normalized_serial FOR UPDATE`,
+                [
+                  input.tenantId,
+                  line.product.id,
+                  input.reservationId ? 'RESERVED' : 'AVAILABLE',
+                  ...line.serialNumbers.map((value) =>
+                    value.trim().toUpperCase(),
+                  ),
+                ],
+              );
+              for (const serial of serialRows) {
+                serialsByLocation.set(serial.current_location_id, [
+                  ...(serialsByLocation.get(serial.current_location_id) ?? []),
+                  serial.serial_number,
+                ]);
+              }
+            }
             const balances = await manager.query<
               Array<{
                 location_id: string;
@@ -651,8 +681,18 @@ export class SalesRepository {
               );
               const effectiveAvailable =
                 available < lotAvailable ? available : lotAvailable;
+              const serialNumbers = serialsByLocation.get(balance.location_id);
+              const serialAvailable = line.serialNumbers.length
+                ? BigInt(serialNumbers?.length ?? 0) * 1000n
+                : effectiveAvailable;
+              const selectableAvailable =
+                effectiveAvailable < serialAvailable
+                  ? effectiveAvailable
+                  : serialAvailable;
               const taken =
-                effectiveAvailable < remaining ? effectiveAvailable : remaining;
+                selectableAvailable < remaining
+                  ? selectableAvailable
+                  : remaining;
               if (taken === 0n) continue;
               lineAllocations.push({
                 locationId: balance.location_id,
@@ -669,7 +709,14 @@ export class SalesRepository {
                     : currentReserved,
                 ),
                 reservationLineId: reservationLines.get(line.product.id)?.id,
+                serialNumbers: serialNumbers?.slice(0, Number(taken / 1000n)),
               });
+              if (serialNumbers) {
+                serialsByLocation.set(
+                  balance.location_id,
+                  serialNumbers.slice(Number(taken / 1000n)),
+                );
+              }
               remaining -= taken;
             }
             allocations.set(line.product.id, lineAllocations);
@@ -801,6 +848,9 @@ export class SalesRepository {
               await applyInventoryValuation(manager, movementId);
               await applyInventoryLotTracking(manager, movementId, {
                 preferredLotId: line.lotId ?? undefined,
+              });
+              await applyInventorySerialTracking(manager, movementId, {
+                serialNumbers: allocation.serialNumbers,
               });
             }
           }

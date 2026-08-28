@@ -2,8 +2,10 @@ import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   ArrayMinSize,
+  ArrayUnique,
   IsArray,
   IsInt,
+  IsOptional,
   IsString,
   IsUUID,
   Matches,
@@ -19,6 +21,13 @@ export class CreateProductReservationLineDto {
   @IsString()
   @Matches(/^(?=.*[1-9])(0|[1-9]\d{0,11})(\.\d{1,3})?$/)
   quantity!: string;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(1000)
+  @ArrayUnique((value: string) => value.trim().toUpperCase())
+  @IsString({ each: true })
+  serialNumbers?: string[];
 }
 
 export class CreateProductReservationDto {

@@ -2,6 +2,7 @@ import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   ArrayMinSize,
+  ArrayUnique,
   IsArray,
   IsOptional,
   IsString,
@@ -29,6 +30,22 @@ export class ReceiveInventoryTransferLineDto {
   @IsString()
   @Matches(quantityPattern)
   discrepancyQuantity!: string;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(1000)
+  @ArrayUnique((value: string) => value.trim().toUpperCase())
+  @IsString({ each: true })
+  @MaxLength(120, { each: true })
+  receivedSerialNumbers?: string[];
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(1000)
+  @ArrayUnique((value: string) => value.trim().toUpperCase())
+  @IsString({ each: true })
+  @MaxLength(120, { each: true })
+  discrepancySerialNumbers?: string[];
 }
 
 export class ReceiveInventoryTransferDto {

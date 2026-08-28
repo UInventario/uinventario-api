@@ -71,10 +71,11 @@ export class PosRepository {
           price: string;
           active: number | boolean;
           track_lots: number | boolean;
+          track_serials: number | boolean;
           available_quantity: string;
         }>
       >(
-        `SELECT p.id, p.name, p.sku, p.price, p.active, p.track_lots,
+        `SELECT p.id, p.name, p.sku, p.price, p.active, p.track_lots, p.track_serials,
                 rl.quantity AS available_quantity
          FROM product_reservations r
          INNER JOIN product_reservation_lines rl
@@ -92,6 +93,7 @@ export class PosRepository {
         price: row.price,
         active: Boolean(row.active),
         trackLots: Boolean(row.track_lots),
+        trackSerials: Boolean(row.track_serials),
         availableQuantity: this.normalizeQuantity(row.available_quantity),
       }));
     }
@@ -103,16 +105,17 @@ export class PosRepository {
         price: string;
         active: number | boolean;
         track_lots: number | boolean;
+        track_serials: number | boolean;
         available_quantity: string;
       }>
     >(
-      `SELECT p.id, p.name, p.sku, p.price, p.active, p.track_lots,
+      `SELECT p.id, p.name, p.sku, p.price, p.active, p.track_lots, p.track_serials,
               COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.available_quantity ELSE 0 END), 0) AS available_quantity
        FROM products p
        LEFT JOIN inventory_balances ib ON ib.product_id = p.id AND ib.tenant_id = p.tenant_id
        LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
        WHERE p.tenant_id = ? AND p.id IN (${placeholders})
-       GROUP BY p.id, p.name, p.sku, p.price, p.active, p.track_lots`,
+       GROUP BY p.id, p.name, p.sku, p.price, p.active, p.track_lots, p.track_serials`,
       [warehouseId, tenantId, ...productIds],
     );
     return rows.map((row) => ({
@@ -122,6 +125,7 @@ export class PosRepository {
       price: row.price,
       active: Boolean(row.active),
       trackLots: Boolean(row.track_lots),
+      trackSerials: Boolean(row.track_serials),
       availableQuantity: this.normalizeQuantity(row.available_quantity),
     }));
   }

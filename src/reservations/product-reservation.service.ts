@@ -13,6 +13,12 @@ import {
   ProductReservationTargetNotFoundError,
 } from './product-reservation.errors';
 import { ProductReservationRepository } from './product-reservation.repository';
+import {
+  InventorySerialNotFoundError,
+  InventorySerialQuantityError,
+  InventorySerialRequiredError,
+  InventorySerialStateConflictError,
+} from '../inventory/inventory-serial-tracking';
 
 @Injectable()
 export class ProductReservationService {
@@ -71,6 +77,7 @@ export class ProductReservationService {
           message: 'La clave de idempotencia ya fue usada con otros datos.',
         });
       }
+      this.mapSerialError(error);
       throw error;
     }
   }
@@ -145,6 +152,19 @@ export class ProductReservationService {
       });
     if (error instanceof ProductReservationIdempotencyConflictError)
       throw new ConflictException({ code: 'IDEMPOTENCY_KEY_REUSED' });
+    this.mapSerialError(error);
     throw error;
+  }
+
+  private mapSerialError(error: unknown): void {
+    if (
+      error instanceof InventorySerialRequiredError ||
+      error instanceof InventorySerialQuantityError
+    )
+      throw new BadRequestException({ code: 'INVENTORY_SERIALS_REQUIRED' });
+    if (error instanceof InventorySerialNotFoundError)
+      throw new NotFoundException({ code: 'INVENTORY_SERIAL_NOT_FOUND' });
+    if (error instanceof InventorySerialStateConflictError)
+      throw new ConflictException({ code: 'INVENTORY_SERIAL_STATE_CONFLICT' });
   }
 }

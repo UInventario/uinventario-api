@@ -27,6 +27,13 @@ import {
 } from './inventory.errors';
 import { InventoryRepository } from './inventory.repository';
 import {
+  InventorySerialDuplicateError,
+  InventorySerialNotFoundError,
+  InventorySerialQuantityError,
+  InventorySerialRequiredError,
+  InventorySerialStateConflictError,
+} from './inventory-serial-tracking';
+import {
   InventoryBalanceResponse,
   InventoryCountInput,
   InventoryCountResponse,
@@ -37,6 +44,8 @@ import {
   InventoryStateTransitionResponse,
   InventoryLotsResponse,
   InventoryFifoLayersResponse,
+  InventorySerialHistoryResponse,
+  InventorySerialsResponse,
   INVENTORY_STOCK_POLICY,
 } from './inventory.types';
 
@@ -266,6 +275,7 @@ export class InventoryService {
         });
       }
       this.rethrowLotError(error);
+      this.rethrowSerialError(error);
       throw error;
     }
   }
@@ -309,6 +319,78 @@ export class InventoryService {
       throw new ConflictException({
         code: 'INVENTORY_LOT_CURRENCY_MISMATCH',
         message: 'Los lotes de un producto deben usar una sola moneda.',
+      });
+    }
+  }
+
+  async listSerials(
+    tenantId: string,
+    warehouseId: string,
+    productId: string,
+  ): Promise<InventorySerialsResponse> {
+    try {
+      const result = await this.inventory.listSerials(
+        tenantId,
+        warehouseId,
+        productId,
+      );
+      return {
+        data: result.items,
+        meta: { apiVersion: '1', tracked: result.tracked },
+      };
+    } catch (error) {
+      if (error instanceof InventoryTargetNotFoundError)
+        throw new NotFoundException();
+      throw error;
+    }
+  }
+
+  async serialHistory(
+    tenantId: string,
+    warehouseId: string,
+    serialId: string,
+  ): Promise<InventorySerialHistoryResponse> {
+    try {
+      return {
+        data: await this.inventory.serialHistory(
+          tenantId,
+          warehouseId,
+          serialId,
+        ),
+        meta: { apiVersion: '1' },
+      };
+    } catch (error) {
+      if (error instanceof InventoryTargetNotFoundError)
+        throw new NotFoundException();
+      throw error;
+    }
+  }
+
+  private rethrowSerialError(error: unknown): void {
+    if (
+      error instanceof InventorySerialRequiredError ||
+      error instanceof InventorySerialQuantityError
+    ) {
+      throw new BadRequestException({
+        code: 'INVENTORY_SERIALS_REQUIRED',
+        message:
+          'Indica un nÃºmero de serie Ãºnico por cada unidad del producto.',
+      });
+    }
+    if (error instanceof InventorySerialNotFoundError) {
+      throw new NotFoundException({ code: 'INVENTORY_SERIAL_NOT_FOUND' });
+    }
+    if (error instanceof InventorySerialDuplicateError) {
+      throw new ConflictException({
+        code: 'INVENTORY_SERIAL_ALREADY_EXISTS',
+        message: 'Uno de los nÃºmeros de serie ya existe en la empresa.',
+      });
+    }
+    if (error instanceof InventorySerialStateConflictError) {
+      throw new ConflictException({
+        code: 'INVENTORY_SERIAL_STATE_CONFLICT',
+        message:
+          'Una serie no pertenece al producto, ubicaciÃ³n o estado requerido.',
       });
     }
   }
@@ -362,6 +444,7 @@ export class InventoryService {
           message: 'El conteo produciría un saldo total inválido.',
         });
       }
+      this.rethrowSerialError(error);
       throw error;
     }
   }
@@ -413,6 +496,7 @@ export class InventoryService {
           message: 'La clave de idempotencia ya fue usada con otros datos.',
         });
       }
+      this.rethrowSerialError(error);
       throw error;
     }
   }

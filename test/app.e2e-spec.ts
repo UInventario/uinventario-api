@@ -65,6 +65,8 @@ describe('UInventario API (e2e)', () => {
       'inventory_fifo_layers',
       'inventory_fifo_cutovers',
       'inventory_movement_lots',
+      'inventory_serial_events',
+      'inventory_serials',
       'inventory_lot_origins',
       'inventory_lot_balances',
       'inventory_lots',
@@ -12397,6 +12399,361 @@ describe('UInventario API (e2e)', () => {
       await request(app.getHttpServer())
         .get(`/api/v1/inventory/products/${productId}/lots`)
         .set('Cookie', isolatedCookie)
+        .expect(404);
+    });
+  });
+
+  describe('inventory serial traceability', () => {
+    beforeEach(resetIdentityData);
+
+    it('keeps one serial atomic through entry, concurrent sale, void and tenant-scoped history', async () => {
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'serial-registration')
+        .send(registrationPayload)
+        .expect(201);
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Series SA',
+          tradeName: 'Series',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Principal',
+          locationName: 'General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Principal' })
+        .expect(200);
+
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Terminal serializada',
+          sku: 'SER-001',
+          cost: '100.00',
+          price: '150.00',
+          trackSerials: true,
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      expect(productResponse.body).toMatchObject({
+        data: { trackSerials: true },
+      });
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-initial-missing')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '1',
+          reason: 'Alta inicial',
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code: string } }) =>
+          expect(body.code).toBe('INVENTORY_SERIALS_REQUIRED'),
+        );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-initial')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '1',
+          reason: 'Alta inicial',
+          serialNumbers: ['SN-0001'],
+        })
+        .expect(201);
+      const serialList = await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/serials`)
+        .set('Cookie', cookie)
+        .expect(200);
+      const serialId = (
+        serialList.body as { data: Array<{ id: string; serialNumber: string }> }
+      ).data[0].id;
+      expect(serialList.body).toMatchObject({
+        data: [{ serialNumber: 'SN-0001', status: 'AVAILABLE' }],
+        meta: { tracked: true },
+      });
+
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({ name: 'Cliente serial', dataProcessingConsent: false })
+        .expect(201);
+      const customerId = (customerResponse.body as { data: { id: string } })
+        .data.id;
+      const reservationResponse = await request(app.getHttpServer())
+        .post('/api/v1/reservations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-reservation')
+        .send({
+          customerId,
+          locationId: location.id,
+          expiresInHours: 24,
+          lines: [
+            {
+              productId,
+              quantity: '1',
+              serialNumbers: ['SN-0001'],
+            },
+          ],
+        })
+        .expect(201);
+      const reservationId = (
+        reservationResponse.body as { data: { id: string } }
+      ).data.id;
+      expect(reservationResponse.body).toMatchObject({
+        data: {
+          lines: [{ serialNumbers: ['SN-0001'] }],
+        },
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/reservations/${reservationId}/release`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-reservation-release')
+        .send({ reason: 'Liberar para venta concurrente' })
+        .expect(201);
+
+      await openCurrentCashRegister(cookie, 'serial-open-shift');
+      const attempts = await Promise.all(
+        ['serial-sale-a', 'serial-sale-b'].map((key) =>
+          request(app.getHttpServer())
+            .post('/api/v1/pos/sales')
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', key)
+            .send({
+              lines: [
+                {
+                  productId,
+                  quantity: '1',
+                  serialNumbers: ['sn-0001'],
+                },
+              ],
+              payment: { method: 'CASH', amountReceived: '150.00' },
+            }),
+        ),
+      );
+      expect(attempts.map(({ status }) => status).sort()).toEqual([201, 409]);
+      const successfulSale = attempts.find(({ status }) => status === 201)!;
+      const saleId = (successfulSale.body as { data: { id: string } }).data.id;
+
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/serials/${serialId}/history`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({ body }: { body: { data: { serial: { status: string } } } }) =>
+            expect(body.data.serial.status).toBe('SOLD'),
+        );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-sale-void')
+        .send({ reason: 'DevoluciÃ³n de prueba' })
+        .expect(201);
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/serials/${serialId}/history`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: {
+                serial: { status: string };
+                events: Array<{ toStatus: string; movement: { type: string } }>;
+              };
+            };
+          }) => {
+            expect(body.data.serial.status).toBe('AVAILABLE');
+            expect(
+              body.data.events.map(({ movement, toStatus }) => ({
+                type: movement.type,
+                toStatus,
+              })),
+            ).toEqual([
+              { type: 'INITIAL', toStatus: 'AVAILABLE' },
+              { type: 'STATE_TRANSITION', toStatus: 'RESERVED' },
+              { type: 'STATE_TRANSITION', toStatus: 'AVAILABLE' },
+              { type: 'SALE', toStatus: 'SOLD' },
+              { type: 'SALE_VOID', toStatus: 'AVAILABLE' },
+            ]);
+          },
+        );
+
+      const organization = await request(app.getHttpServer())
+        .get('/api/v1/organization/branches')
+        .set('Cookie', cookie)
+        .expect(200);
+      const origin = (
+        organization.body as {
+          data: Array<{
+            id: string;
+            warehouses: Array<{ id: string; locations: Array<{ id: string }> }>;
+          }>;
+        }
+      ).data[0];
+      const destinationResponse = await request(app.getHttpServer())
+        .post('/api/v1/organization/branches')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Sucursal Series Destino',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Series Destino',
+          locationName: 'RecepciÃ³n Series',
+          locationCode: 'SERDEST',
+        })
+        .expect(201);
+      const destination = (
+        destinationResponse.body as {
+          data: {
+            id: string;
+            warehouses: Array<{ id: string; locations: Array<{ id: string }> }>;
+          };
+        }
+      ).data;
+      const transferResponse = await request(app.getHttpServer())
+        .post('/api/v1/inventory/transfers')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-transfer-create')
+        .send({
+          destinationWarehouseId: destination.warehouses[0].id,
+          reference: 'SER-TR-001',
+          reason: 'Validar custodia serial',
+          lines: [
+            {
+              productId,
+              sourceLocationId: origin.warehouses[0].locations[0].id,
+              destinationLocationId: destination.warehouses[0].locations[0].id,
+              quantity: '1',
+              serialNumbers: ['SN-0001'],
+            },
+          ],
+        })
+        .expect(201);
+      const transfer = transferResponse.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${transfer.data.id}/dispatch`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-transfer-dispatch')
+        .expect(200);
+      await request(app.getHttpServer())
+        .patch('/api/v1/auth/sessions/current/context')
+        .set('Cookie', cookie)
+        .send({
+          branchId: destination.id,
+          warehouseId: destination.warehouses[0].id,
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${transfer.data.id}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-transfer-receipt')
+        .send({
+          lines: [
+            {
+              transferLineId: transfer.data.lines[0].id,
+              receivedQuantity: '1',
+              discrepancyQuantity: '0',
+              receivedSerialNumbers: ['SN-0001'],
+            },
+          ],
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/serials/${serialId}/history`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: {
+                serial: { status: string; currentLocation: { id: string } };
+                events: Array<{ movement: { type: string } }>;
+              };
+            };
+          }) => {
+            expect(body.data.serial).toMatchObject({
+              status: 'AVAILABLE',
+              currentLocation: {
+                id: destination.warehouses[0].locations[0].id,
+              },
+            });
+            expect(
+              body.data.events.slice(-2).map(({ movement }) => movement.type),
+            ).toEqual(['TRANSFER_OUT', 'TRANSFER_RECEIPT']);
+          },
+        );
+
+      const other = {
+        organizationName: 'Otro tenant series',
+        email: 'other-serial@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'serial-other-registration')
+        .send(other)
+        .expect(201);
+      const otherCookie = await createPersistedSession(other.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Otro Series',
+          tradeName: 'Otro',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Otra Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Otra Bodega',
+          locationName: 'Otra General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Otra Caja Series' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/serials/${serialId}/history`)
+        .set('Cookie', otherCookie)
         .expect(404);
     });
   });

@@ -43,6 +43,13 @@ import {
   InventoryFifoCurrencyMismatchError,
   InventoryFifoLayerShortageError,
 } from '../inventory/inventory.errors';
+import {
+  InventorySerialDuplicateError,
+  InventorySerialNotFoundError,
+  InventorySerialQuantityError,
+  InventorySerialRequiredError,
+  InventorySerialStateConflictError,
+} from '../inventory/inventory-serial-tracking';
 
 @Injectable()
 export class PurchaseOrderService {
@@ -397,6 +404,20 @@ export class PurchaseOrderService {
         code: 'INVENTORY_LOT_CURRENCY_MISMATCH',
         message: 'Los lotes de un producto deben usar una sola moneda.',
       });
+    }
+    if (
+      error instanceof InventorySerialRequiredError ||
+      error instanceof InventorySerialQuantityError
+    ) {
+      throw new BadRequestException({ code: 'INVENTORY_SERIALS_REQUIRED' });
+    }
+    if (error instanceof InventorySerialNotFoundError)
+      throw new NotFoundException({ code: 'INVENTORY_SERIAL_NOT_FOUND' });
+    if (
+      error instanceof InventorySerialDuplicateError ||
+      error instanceof InventorySerialStateConflictError
+    ) {
+      throw new ConflictException({ code: 'INVENTORY_SERIAL_STATE_CONFLICT' });
     }
     throw error;
   }
