@@ -24,6 +24,7 @@ import {
 } from './pos.types';
 import type { PaymentMethod } from './dto/create-sale.dto';
 import { AuditService } from '../audit/audit.service';
+import { SaleReceiptRepository } from './sale-receipt.repository';
 
 interface SaleRow {
   id: string;
@@ -68,6 +69,7 @@ export class SalesRepository {
   constructor(
     private readonly dataSource: DataSource,
     private readonly audit: AuditService,
+    private readonly receipts: SaleReceiptRepository,
   ) {}
 
   async listSales(
@@ -877,6 +879,7 @@ export class SalesRepository {
               ],
             );
           }
+          await this.receipts.createSnapshot(manager, input.tenantId, saleId);
           if (input.reservationId) {
             const closed = await manager.query<{ affectedRows?: number }>(
               `UPDATE product_reservations
