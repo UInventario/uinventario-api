@@ -18,6 +18,7 @@ import type { AuthenticatedRequest } from '../auth/session/session.types';
 import { AuditService } from '../audit/audit.service';
 import { CustomerService } from './customer.service';
 import { ListCustomersDto } from './dto/list-customers.dto';
+import { ListCustomerHistoryDto } from './dto/list-customer-history.dto';
 import { SaveCustomerDto, UpdateCustomerDto } from './dto/save-customer.dto';
 
 @Controller('customers')
@@ -40,6 +41,20 @@ export class CustomerController {
     @Param('id', ParseUUIDPipe) id: string,
   ) {
     return this.customers.get(request.principal.tenant.id, id);
+  }
+
+  @Get(':id/history')
+  history(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: ListCustomerHistoryDto,
+  ) {
+    return this.customers.history(
+      request.principal.tenant.id,
+      request.principal.context.branch!.id,
+      id,
+      query,
+    );
   }
 
   @Post()

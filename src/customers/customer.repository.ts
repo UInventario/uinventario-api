@@ -2,8 +2,9 @@ import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { DataSource, QueryFailedError } from 'typeorm';
 import { ListCustomersDto } from './dto/list-customers.dto';
+import { ListCustomerHistoryDto } from './dto/list-customer-history.dto';
 import { SaveCustomerDto, UpdateCustomerDto } from './dto/save-customer.dto';
-import { CustomerData } from './customer.types';
+import { CustomerData, CustomerHistoryData } from './customer.types';
 
 interface CustomerRow {
   id: string;
@@ -123,6 +124,142 @@ export class CustomerRepository {
     };
   }
 
+  async history(
+    tenantId: string,
+    branchId: string,
+    customer: CustomerData,
+    query: ListCustomerHistoryDto,
+  ): Promise<{ history: CustomerHistoryData; total: number }> {
+    const filters = ['s.tenant_id = ?', 's.branch_id = ?', 's.customer_id = ?'];
+    const parameters: unknown[] = [tenantId, branchId, customer.id];
+    if (query.dateFrom) {
+      filters.push('s.created_at >= ?');
+      parameters.push(`${query.dateFrom} 00:00:00`);
+    }
+    if (query.dateTo) {
+      filters.push('s.created_at < DATE_ADD(?, INTERVAL 1 DAY)');
+      parameters.push(`${query.dateTo} 00:00:00`);
+    }
+    if (query.status !== 'ALL') {
+      filters.push('s.status = ?');
+      parameters.push(query.status);
+    }
+    const where = filters.join(' AND ');
+    const [rows, [summary]] = await Promise.all([
+      this.dataSource.query<
+        Array<{
+          id: string;
+          receipt_number: string;
+          status: 'COMPLETED' | 'VOIDED';
+          currency: string;
+          total: string;
+          created_at: Date | string;
+          cash_register_id: string;
+          cash_register_name: string;
+          cash_register_code: string;
+          user_id: string;
+          user_email: string;
+          void_reason: string | null;
+          voided_at: Date | string | null;
+        }>
+      >(
+        `SELECT s.id, s.receipt_number, s.status, s.currency, s.total, s.created_at,
+                s.void_reason, s.voided_at,
+                cr.id AS cash_register_id, cr.name AS cash_register_name,
+                cr.code AS cash_register_code,
+                u.id AS user_id, u.email AS user_email
+         FROM sales s
+         INNER JOIN cash_registers cr ON cr.id = s.cash_register_id AND cr.tenant_id = s.tenant_id
+         INNER JOIN users u ON u.id = s.created_by_user_id AND u.tenant_id = s.tenant_id
+         WHERE ${where}
+         ORDER BY s.created_at DESC, s.id DESC LIMIT ? OFFSET ?`,
+        [...parameters, query.pageSize, (query.page - 1) * query.pageSize],
+      ),
+      this.dataSource.query<
+        Array<{
+          total: number | string;
+          completed_count: number | string;
+          voided_count: number | string;
+          completed_amount: string | null;
+          voided_amount: string | null;
+          currency: string | null;
+        }>
+      >(
+        `SELECT COUNT(*) AS total,
+                SUM(s.status = 'COMPLETED') AS completed_count,
+                SUM(s.status = 'VOIDED') AS voided_count,
+                COALESCE(SUM(CASE WHEN s.status = 'COMPLETED' THEN s.total ELSE 0 END), 0) AS completed_amount,
+                COALESCE(SUM(CASE WHEN s.status = 'VOIDED' THEN s.total ELSE 0 END), 0) AS voided_amount,
+                MAX(s.currency) AS currency
+         FROM sales s WHERE ${where}`,
+        parameters,
+      ),
+    ]);
+    const paymentRows = rows.length
+      ? await this.dataSource.query<
+          Array<{
+            sale_id: string;
+            method: string;
+            status: 'COMPLETED' | 'REVERSED';
+            amount_applied: string;
+            amount_received: string;
+            change_amount: string;
+          }>
+        >(
+          `SELECT sale_id, method, status, amount_applied, amount_received, change_amount
+           FROM sale_payments
+           WHERE tenant_id = ? AND sale_id IN (${rows.map(() => '?').join(',')})
+           ORDER BY sale_id, id`,
+          [tenantId, ...rows.map(({ id }) => id)],
+        )
+      : [];
+    const total = Number(summary?.total ?? 0);
+    return {
+      total,
+      history: {
+        customer,
+        summary: {
+          currency: summary?.currency ?? null,
+          salesCount: total,
+          completedCount: Number(summary?.completed_count ?? 0),
+          voidedCount: Number(summary?.voided_count ?? 0),
+          completedAmount: this.money(summary?.completed_amount ?? '0'),
+          voidedAmount: this.money(summary?.voided_amount ?? '0'),
+        },
+        items: rows.map((row) => ({
+          id: row.id,
+          receiptNumber: row.receipt_number,
+          status: row.status,
+          currency: row.currency,
+          total: this.money(row.total),
+          createdAt: new Date(row.created_at).toISOString(),
+          cashRegister: {
+            id: row.cash_register_id,
+            name: row.cash_register_name,
+            code: row.cash_register_code,
+          },
+          responsible: { id: row.user_id, email: row.user_email },
+          payments: paymentRows
+            .filter(({ sale_id }) => sale_id === row.id)
+            .map((payment) => ({
+              method: payment.method,
+              status: payment.status,
+              amountApplied: this.money(payment.amount_applied),
+              amountReceived: this.money(payment.amount_received),
+              change: this.money(payment.change_amount),
+            })),
+          reversal:
+            row.status === 'VOIDED' && row.void_reason && row.voided_at
+              ? {
+                  reason: row.void_reason,
+                  voidedAt: new Date(row.voided_at).toISOString(),
+                }
+              : null,
+        })),
+      },
+    };
+  }
+
   isDuplicate(error: unknown): boolean {
     return (
       error instanceof QueryFailedError &&
@@ -173,5 +310,10 @@ export class CustomerRepository {
 
   private phone(value: string): string {
     return `${value.startsWith('+') ? '+' : ''}${value.replace(/\D/g, '')}`;
+  }
+
+  private money(value: string): string {
+    const [whole, fraction = ''] = value.split('.');
+    return `${whole}.${fraction.padEnd(2, '0').slice(0, 2)}`;
   }
 }

@@ -5872,6 +5872,95 @@ describe('UInventario API (e2e)', () => {
       });
       const customerSaleId = (customerSale.body as { data: { id: string } })
         .data.id;
+      const voidedCustomerSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'customer-linked-voided-sale')
+        .send({
+          customerId: customer.id,
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: '120.00',
+        })
+        .expect(201);
+      const voidedCustomerSaleId = (
+        voidedCustomerSale.body as { data: { id: string } }
+      ).data.id;
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${voidedCustomerSaleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'customer-history-void')
+        .send({ reason: 'Cambio solicitado por el cliente' })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .get(`/api/v1/customers/${customer.id}/history`)
+        .query({
+          dateFrom: '2020-01-01',
+          dateTo: '2030-12-31',
+          status: 'ALL',
+          page: 1,
+          pageSize: 1,
+        })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              customer: { id: customer.id, name: 'Ana Pérez López' },
+              summary: {
+                salesCount: 2,
+                completedCount: 1,
+                voidedCount: 1,
+              },
+              items: [
+                {
+                  id: voidedCustomerSaleId,
+                  status: 'VOIDED',
+                  payments: [{ method: 'CASH', status: 'REVERSED' }],
+                  reversal: { reason: 'Cambio solicitado por el cliente' },
+                },
+              ],
+            },
+            meta: {
+              pagination: { page: 1, pageSize: 1, total: 2, totalPages: 2 },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get(`/api/v1/customers/${customer.id}/history`)
+        .query({ status: 'COMPLETED', page: 1, pageSize: 10 })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              summary: { salesCount: 1, completedCount: 1, voidedCount: 0 },
+              items: [{ id: customerSaleId, status: 'COMPLETED' }],
+            },
+          });
+        });
+      const [salesRole] = await dataSource.query<
+        Array<{ role_id: string; tenant_id: string }>
+      >(
+        `SELECT r.id AS role_id, r.tenant_id FROM roles r
+         INNER JOIN users u ON u.tenant_id = r.tenant_id
+         WHERE r.code = 'ADMIN' AND u.normalized_email = ?`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'SALES_MANAGE'`,
+        [salesRole.role_id, salesRole.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .get(`/api/v1/customers/${customer.id}/history`)
+        .set('Cookie', cookie)
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'SALES_MANAGE')`,
+        [salesRole.role_id, salesRole.tenant_id],
+      );
 
       await request(app.getHttpServer())
         .delete(`/api/v1/customers/${customer.id}`)
@@ -5962,6 +6051,10 @@ describe('UInventario API (e2e)', () => {
         .expect(({ body }: { body: { data: unknown[] } }) => {
           expect(body.data).toEqual([]);
         });
+      await request(app.getHttpServer())
+        .get(`/api/v1/customers/${customer.id}/history`)
+        .set('Cookie', otherCookie)
+        .expect(404);
     });
 
     it('creates customer reservations atomically, idempotently and without over-reserving', async () => {
