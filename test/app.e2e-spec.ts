@@ -42,6 +42,9 @@ describe('UInventario API (e2e)', () => {
     for (const table of [
       'audit_events',
       'audit_chain_heads',
+      'inventory_reconciliation_guards',
+      'inventory_reconciliation_findings',
+      'inventory_reconciliation_runs',
       'inventory_valuation_policy_history',
       'inventory_valuation_policies',
       'offline_commands',
@@ -12755,6 +12758,232 @@ describe('UInventario API (e2e)', () => {
         .get(`/api/v1/inventory/serials/${serialId}/history`)
         .set('Cookie', otherCookie)
         .expect(404);
+    });
+  });
+
+  describe('inventory reconciliation', () => {
+    beforeEach(resetIdentityData);
+
+    it('is tenant-scoped, idempotent and blocks operations until a critical mismatch is resolved', async () => {
+      await registerAccount('reconciliation-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Reconciliación SA',
+          tradeName: 'Reconciliación',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Principal',
+          locationName: 'General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Principal' })
+        .expect(200);
+      const product = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto conciliable',
+          sku: 'REC-001',
+          cost: '10',
+          price: '15',
+          trackLots: true,
+          trackSerials: true,
+        })
+        .expect(201);
+      const productId = (product.body as { data: { id: string } }).data.id;
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reconciliation-initial')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '2',
+          reason: 'Saldo inicial conciliado',
+          lotCode: 'LOT-REC',
+          serialNumbers: ['REC-SN-001', 'REC-SN-002'],
+        })
+        .expect(201);
+
+      const healthy = await request(app.getHttpServer())
+        .post('/api/v1/inventory/reconciliations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reconciliation-healthy')
+        .send({})
+        .expect(201);
+      expect(healthy.body).toMatchObject({
+        data: {
+          overallStatus: 'HEALTHY',
+          summary: { findings: 0, warnings: 0, critical: 0 },
+          policy: { releaseBlocked: false, operationsBlocked: false },
+          findings: [],
+        },
+        meta: { idempotentReplay: false },
+      });
+      const healthyBody = healthy.body as { data: { id: string } };
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/reconciliations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reconciliation-healthy')
+        .send({})
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: { id: string }; meta: { idempotentReplay: boolean } };
+          }) => {
+            expect(body.data.id).toBe(healthyBody.data.id);
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+
+      await dataSource.query(
+        `UPDATE inventory_balances
+         SET quantity = quantity + 1, available_quantity = available_quantity + 1
+         WHERE product_id = ? AND location_id = ?`,
+        [productId, location.id],
+      );
+      const critical = await request(app.getHttpServer())
+        .post('/api/v1/inventory/reconciliations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reconciliation-critical')
+        .send({})
+        .expect(201);
+      expect(critical.body).toMatchObject({
+        data: {
+          overallStatus: 'CRITICAL',
+          policy: { releaseBlocked: true, operationsBlocked: true },
+        },
+      });
+      const criticalBody = critical.body as {
+        data: { id: string; findings: Array<{ code: string }> };
+      };
+      expect(criticalBody.data.findings.map(({ code }) => code)).toEqual(
+        expect.arrayContaining([
+          'BALANCE_MOVEMENT_MISMATCH',
+          'VALUATION_QUANTITY_MISMATCH',
+          'LOT_BALANCE_MISMATCH',
+          'SERIAL_STATE_MISMATCH',
+        ]),
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reconciliation-blocked-movement')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'ENTRY',
+          quantity: '1',
+          reason: 'Debe bloquearse',
+          reference: 'REC-BLOCKED',
+          lotCode: 'LOT-REC',
+          serialNumbers: ['REC-SN-003'],
+        })
+        .expect(409)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { code: string; reconciliationRunId: string };
+          }) => {
+            expect(body.code).toBe('INVENTORY_RECONCILIATION_BLOCKED');
+            expect(body.reconciliationRunId).toBe(criticalBody.data.id);
+          },
+        );
+
+      const other = {
+        organizationName: 'Otro tenant reconciliación',
+        email: 'other-reconciliation@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'reconciliation-other-registration')
+        .send(other)
+        .expect(201);
+      const otherCookie = await createPersistedSession(other.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Otro tenant',
+          tradeName: 'Otro',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Otra principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Otra bodega',
+          locationName: 'Otra general',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Otra caja' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/reconciliations/latest')
+        .set('Cookie', otherCookie)
+        .expect(200)
+        .expect({ data: null, meta: { apiVersion: '1' } });
+
+      await dataSource.query(
+        `UPDATE inventory_balances
+         SET quantity = quantity - 1, available_quantity = available_quantity - 1
+         WHERE product_id = ? AND location_id = ?`,
+        [productId, location.id],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/reconciliations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reconciliation-restored')
+        .send({})
+        .expect(201)
+        .expect(({ body }: { body: { data: { overallStatus: string } } }) =>
+          expect(body.data.overallStatus).toBe('HEALTHY'),
+        );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reconciliation-unblocked-movement')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'ENTRY',
+          quantity: '1',
+          reason: 'Operación desbloqueada',
+          reference: 'REC-UNBLOCKED',
+          lotCode: 'LOT-REC',
+          serialNumbers: ['REC-SN-003'],
+        })
+        .expect(201);
     });
   });
 
