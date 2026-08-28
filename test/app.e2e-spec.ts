@@ -59,6 +59,8 @@ describe('UInventario API (e2e)', () => {
       'offline_sync_tombstones',
       'password_reset_tokens',
       'sale_receipt_snapshots',
+      'customer_credit_ledger',
+      'sale_return_settlements',
       'sale_return_lines',
       'sale_returns',
       'suspended_sale_lines',
@@ -10036,6 +10038,327 @@ describe('UInventario API (e2e)', () => {
             document: { type: 'SALE_RETURN' },
           });
         });
+    });
+
+    it('settles returns partially, credits customers and records failed provider refunds once', async () => {
+      const { cookie, productId } = await preparePos();
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Cliente con saldo',
+          identifier: 'CREDIT-001',
+          dataProcessingConsent: false,
+        })
+        .expect(201);
+      const customerId = (customerResponse.body as { data: { id: string } })
+        .data.id;
+
+      const cashSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'settlement-cash-sale')
+        .send({
+          customerId,
+          lines: [{ productId, quantity: '2' }],
+          cashReceived: '240.00',
+        })
+        .expect(201);
+      const cashSaleData = cashSale.body as {
+        data: {
+          id: string;
+          lines: Array<{ id: string }>;
+          payments: Array<{ id: string }>;
+        };
+      };
+      const cashReturn = await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${cashSaleData.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'settlement-cash-return')
+        .send({
+          reason: 'DevoluciÃ³n completa con liquidaciÃ³n mixta',
+          lines: [
+            {
+              saleLineId: cashSaleData.data.lines[0].id,
+              quantity: '2',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201);
+      const cashReturnId = (cashReturn.body as { data: { id: string } }).data
+        .id;
+      const partialPayload = {
+        mode: 'REFUND',
+        amount: '100.00',
+        originalPaymentId: cashSaleData.data.payments[0].id,
+      };
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/sales/${cashSaleData.data.id}/returns/${cashReturnId}/settlements`,
+        )
+        .set('Cookie', cookie)
+        .set('X-Request-Id', 'return-settlement-partial-audit')
+        .set('Idempotency-Key', 'return-settlement-partial')
+        .send(partialPayload)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              saleReturn: {
+                id: cashReturnId,
+                settlementStatus: 'PARTIALLY_SETTLED',
+                refundableAmount: '139.80',
+              },
+              settlement: {
+                mode: 'REFUND',
+                method: 'CASH',
+                status: 'COMPLETED',
+                amount: '100.00',
+                originalPayment: { id: cashSaleData.data.payments[0].id },
+              },
+            },
+            meta: { idempotentReplay: false },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/sales/${cashSaleData.data.id}/returns/${cashReturnId}/settlements`,
+        )
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'return-settlement-partial')
+        .send(partialPayload)
+        .expect(201)
+        .expect(
+          ({ body }: { body: { meta: { idempotentReplay: boolean } } }) => {
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/sales/${cashSaleData.data.id}/returns/${cashReturnId}/settlements`,
+        )
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'return-settlement-over-limit')
+        .send({ ...partialPayload, amount: '140.00' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SALE_RETURN_SETTLEMENT_EXCEEDS_BALANCE');
+        });
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/sales/${cashSaleData.data.id}/returns/${cashReturnId}/settlements`,
+        )
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'return-settlement-credit')
+        .send({ mode: 'STORE_CREDIT', amount: '139.80' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              saleReturn: {
+                settlementStatus: 'SETTLED',
+                refundableAmount: '0.00',
+              },
+              settlement: {
+                mode: 'STORE_CREDIT',
+                method: 'STORE_CREDIT',
+                status: 'COMPLETED',
+                amount: '139.80',
+              },
+            },
+          });
+        });
+
+      const cardSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'settlement-card-sale')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          payment: { method: 'CARD', reference: 'FAIL-REFUND-CARD-001' },
+        })
+        .expect(201);
+      const cardSaleData = cardSale.body as {
+        data: {
+          id: string;
+          lines: Array<{ id: string }>;
+          payments: Array<{ id: string }>;
+        };
+      };
+      const cardReturn = await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${cardSaleData.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'settlement-card-return')
+        .send({
+          reason: 'Proveedor simula fallo del reembolso',
+          lines: [
+            {
+              saleLineId: cardSaleData.data.lines[0].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201);
+      const cardReturnId = (cardReturn.body as { data: { id: string } }).data
+        .id;
+      const failedPayload = {
+        mode: 'REFUND',
+        amount: '119.90',
+        originalPaymentId: cardSaleData.data.payments[0].id,
+      };
+      for (const replay of [false, true]) {
+        await request(app.getHttpServer())
+          .post(
+            `/api/v1/pos/sales/${cardSaleData.data.id}/returns/${cardReturnId}/settlements`,
+          )
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', 'return-settlement-provider-failure')
+          .send(failedPayload)
+          .expect(201)
+          .expect(({ body }: { body: unknown }) => {
+            expect(body).toMatchObject({
+              data: {
+                saleReturn: {
+                  settlementStatus: 'PENDING',
+                  refundableAmount: '119.90',
+                },
+                settlement: {
+                  method: 'CARD',
+                  status: 'FAILED',
+                  failureCode: 'SIMULATED_REFUND_FAILURE',
+                },
+              },
+              meta: { idempotentReplay: replay },
+            });
+          });
+      }
+
+      const foreignEmail = 'foreign.settlement@example.com';
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'settlement-foreign-registration')
+        .send({
+          organizationName: 'Comercio externo',
+          email: foreignEmail,
+          password: registrationPayload.password,
+        })
+        .expect(201);
+      const foreignCookie = await createPersistedSession(foreignEmail);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', foreignCookie)
+        .send({
+          legalName: 'Comercio externo legal',
+          tradeName: 'Externo',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', foreignCookie)
+        .send({
+          branchName: 'Sucursal externa',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega externa',
+          locationName: 'General externa',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', foreignCookie)
+        .send({ name: 'Caja externa' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/sales/${cashSaleData.data.id}/returns/${cashReturnId}/settlements`,
+        )
+        .set('Cookie', foreignCookie)
+        .set('Idempotency-Key', 'settlement-foreign-attempt')
+        .send({ mode: 'STORE_CREDIT', amount: '1.00' })
+        .expect(404);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { expectedCash: '389.80' } });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/closure')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'return-settlement-close-shift')
+        .send({ countedAmount: '389.80' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { expectedCash: '389.80', difference: '0.00' },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/sales/${cashSaleData.data.id}/returns/${cashReturnId}/settlements`,
+        )
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'return-settlement-partial')
+        .send(partialPayload)
+        .expect(201)
+        .expect(
+          ({ body }: { body: { meta: { idempotentReplay: boolean } } }) => {
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+      const [state] = await dataSource.query<
+        Array<{
+          settlements: number | string;
+          credits: number | string;
+          credit_amount: string;
+          completed_audits: number | string;
+          failed_audits: number | string;
+        }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM sale_return_settlements) AS settlements,
+           (SELECT COUNT(*) FROM customer_credit_ledger
+             WHERE tenant_id = ? AND customer_id = ?) AS credits,
+           (SELECT COALESCE(SUM(amount), 0) FROM customer_credit_ledger
+             WHERE tenant_id = ? AND customer_id = ?) AS credit_amount,
+           (SELECT COUNT(*) FROM audit_events
+             WHERE action = 'SALE_RETURN_SETTLED') AS completed_audits,
+           (SELECT COUNT(*) FROM audit_events
+             WHERE action = 'SALE_RETURN_SETTLEMENT_FAILED') AS failed_audits`,
+        [
+          (
+            await dataSource.query<Array<{ tenant_id: string }>>(
+              'SELECT tenant_id FROM customers WHERE id = ?',
+              [customerId],
+            )
+          )[0].tenant_id,
+          customerId,
+          (
+            await dataSource.query<Array<{ tenant_id: string }>>(
+              'SELECT tenant_id FROM customers WHERE id = ?',
+              [customerId],
+            )
+          )[0].tenant_id,
+          customerId,
+        ],
+      );
+      expect({
+        settlements: Number(state.settlements),
+        credits: Number(state.credits),
+        creditAmount: state.credit_amount,
+        completedAudits: Number(state.completed_audits),
+        failedAudits: Number(state.failed_audits),
+      }).toEqual({
+        settlements: 3,
+        credits: 1,
+        creditAmount: '139.80',
+        completedAudits: 2,
+        failedAudits: 1,
+      });
     });
 
     it('voids a sale once with payment, stock, cash and audit compensation', async () => {

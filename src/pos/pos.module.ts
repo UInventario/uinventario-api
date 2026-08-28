@@ -25,6 +25,8 @@ import {
 import { SaleReturnController } from './sale-return.controller';
 import { SaleReturnRepository } from './sale-return.repository';
 import { SaleReturnService } from './sale-return.service';
+import { SaleReturnSettlementRepository } from './sale-return-settlement.repository';
+import { PaymentRefundService } from './payment-refund.service';
 import { SuspendedSaleController } from './suspended-sale.controller';
 import { SuspendedSaleRepository } from './suspended-sale.repository';
 import { SuspendedSaleService } from './suspended-sale.service';
@@ -53,7 +55,9 @@ import { SuspendedSaleService } from './suspended-sale.service';
     SaleReceiptRepository,
     SaleReceiptService,
     SaleReturnRepository,
+    SaleReturnSettlementRepository,
     SaleReturnService,
+    PaymentRefundService,
     SuspendedSaleRepository,
     SuspendedSaleService,
     SimulatorSaleReceiptEmailAdapter,
