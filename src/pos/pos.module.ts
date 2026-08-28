@@ -25,10 +25,18 @@ import {
 import { SaleReturnController } from './sale-return.controller';
 import { SaleReturnRepository } from './sale-return.repository';
 import { SaleReturnService } from './sale-return.service';
+import { SuspendedSaleController } from './suspended-sale.controller';
+import { SuspendedSaleRepository } from './suspended-sale.repository';
+import { SuspendedSaleService } from './suspended-sale.service';
 
 @Module({
   imports: [SessionModule],
-  controllers: [PosController, SaleReceiptController, SaleReturnController],
+  controllers: [
+    PosController,
+    SaleReceiptController,
+    SaleReturnController,
+    SuspendedSaleController,
+  ],
   providers: [
     PosRepository,
     SalesRepository,
@@ -46,6 +54,8 @@ import { SaleReturnService } from './sale-return.service';
     SaleReceiptService,
     SaleReturnRepository,
     SaleReturnService,
+    SuspendedSaleRepository,
+    SuspendedSaleService,
     SimulatorSaleReceiptEmailAdapter,
     {
       provide: SALE_RECEIPT_EMAIL_ADAPTER,

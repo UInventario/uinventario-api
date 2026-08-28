@@ -43,6 +43,10 @@ export class SalePaymentDto {
 export class CreateSaleDto {
   @IsOptional()
   @IsUUID()
+  suspendedSaleId?: string;
+
+  @IsOptional()
+  @IsUUID()
   customerId?: string;
 
   @IsOptional()

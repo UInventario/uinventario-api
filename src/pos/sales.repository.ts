@@ -25,6 +25,8 @@ import {
 import type { PaymentMethod } from './dto/create-sale.dto';
 import { AuditService } from '../audit/audit.service';
 import { SaleReceiptRepository } from './sale-receipt.repository';
+import { SuspendedSaleStateError } from './suspended-sale.errors';
+import type { SuspendedSaleStatus } from './suspended-sale.types';
 
 interface SaleRow {
   id: string;
@@ -490,6 +492,7 @@ export class SalesRepository {
     cashRegisterShiftId: string;
     customerId?: string | null;
     reservationId?: string | null;
+    suspendedSaleId?: string | null;
     quote: PosCartQuoteResponse['data'];
     payments: Array<{
       method: PaymentMethod;
@@ -515,6 +518,37 @@ export class SalesRepository {
             if (replay.fingerprint !== input.fingerprint)
               throw new PosIdempotencyConflictError();
             return { sale: replay.sale, replay: true };
+          }
+          if (input.suspendedSaleId) {
+            const [suspended] = await manager.query<
+              Array<{ status: SuspendedSaleStatus; expired: number | boolean }>
+            >(
+              `SELECT status, expires_at <= CURRENT_TIMESTAMP(6) AS expired
+               FROM suspended_sales
+               WHERE id = ? AND tenant_id = ? AND branch_id = ? AND warehouse_id = ?
+                 AND cash_register_id = ? AND created_by_user_id = ? LIMIT 1 FOR UPDATE`,
+              [
+                input.suspendedSaleId,
+                input.tenantId,
+                input.quote.context.branch.id,
+                input.quote.context.warehouse.id,
+                input.quote.context.cashRegister.id,
+                input.userId,
+              ],
+            );
+            if (!suspended) throw new SuspendedSaleStateError('CANCELLED');
+            if (
+              suspended.status === 'ACTIVE' &&
+              Number(suspended.expired) === 1
+            ) {
+              await manager.query(
+                `UPDATE suspended_sales SET status = 'EXPIRED' WHERE id = ? AND tenant_id = ?`,
+                [input.suspendedSaleId, input.tenantId],
+              );
+              throw new SuspendedSaleStateError('EXPIRED');
+            }
+            if (suspended.status !== 'ACTIVE')
+              throw new SuspendedSaleStateError(suspended.status);
           }
           let effectiveCustomerId = input.customerId ?? null;
           let reservedLocationId: string | null = null;
@@ -885,6 +919,16 @@ export class SalesRepository {
                 payment.change,
               ],
             );
+          }
+          if (input.suspendedSaleId) {
+            const resumed = await manager.query<{ affectedRows?: number }>(
+              `UPDATE suspended_sales
+               SET status = 'RESUMED', resumed_at = CURRENT_TIMESTAMP(6), completed_sale_id = ?
+               WHERE id = ? AND tenant_id = ? AND status = 'ACTIVE'`,
+              [saleId, input.suspendedSaleId, input.tenantId],
+            );
+            if (Number(resumed.affectedRows ?? 0) !== 1)
+              throw new SuspendedSaleStateError('CANCELLED');
           }
           await this.receipts.createSnapshot(manager, input.tenantId, saleId);
           if (input.reservationId) {
