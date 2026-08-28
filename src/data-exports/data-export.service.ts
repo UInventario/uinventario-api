@@ -358,6 +358,9 @@ export class DataExportService {
       { key: 'reserved', label: 'Reservado', type: 'number' },
       { key: 'damaged', label: 'Dañado', type: 'number' },
       { key: 'inTransit', label: 'En tránsito', type: 'number' },
+      { key: 'valuationMethod', label: 'Método de costo', type: 'text' },
+      { key: 'currency', label: 'Moneda', type: 'text' },
+      { key: 'valuationReconciled', label: 'Conciliado', type: 'boolean' },
       ...(c.includeCosts
         ? [
             {
@@ -367,19 +370,66 @@ export class DataExportService {
             },
           ]
         : []),
+      { key: 'asOf', label: 'Fecha de corte', type: 'date' },
       { key: 'updatedAt', label: 'Actualizado', type: 'date' },
     ];
     const rows = await this.dataSource.query<Array<Record<string, unknown>>>(
       `SELECT pr.name AS product, pr.sku, l.name AS location, ib.quantity,
         ib.available_quantity AS available, ib.reserved_quantity AS reserved,
         ib.damaged_quantity AS damaged, ib.in_transit_quantity AS inTransit,
-        ${c.includeCosts ? 'ROUND(ib.quantity * pr.cost, 2) AS inventoryValue,' : ''}
+        ivp.method AS valuationMethod,
+        CASE ivp.method
+          WHEN 'FIFO' THEN COALESCE(fifo.currency, CASE t.country_code WHEN 'MX' THEN 'MXN' WHEN 'CL' THEN 'CLP' ELSE 'USD' END)
+          WHEN 'SPECIFIC_LOT' THEN COALESCE(lots.currency, CASE t.country_code WHEN 'MX' THEN 'MXN' WHEN 'CL' THEN 'CLP' ELSE 'USD' END)
+          ELSE CASE t.country_code WHEN 'MX' THEN 'MXN' WHEN 'CL' THEN 'CLP' ELSE 'USD' END
+        END AS currency,
+        CASE ivp.method
+          WHEN 'FIFO' THEN ABS(ib.quantity - COALESCE(fifo.quantity, 0)) < 0.0005
+          WHEN 'SPECIFIC_LOT' THEN ABS(ib.quantity - COALESCE(lots.quantity, 0)) < 0.0005
+          ELSE ABS(COALESCE(global_balance.quantity, 0) - COALESCE(iv.quantity, 0)) < 0.0005
+            AND ABS(COALESCE(iv.inventory_value, 0) - COALESCE(iv.quantity, 0) * COALESCE(iv.average_unit_cost, 0)) < 0.00005
+        END AS valuationReconciled,
+        ${
+          c.includeCosts
+            ? `CASE ivp.method
+              WHEN 'FIFO' THEN COALESCE(fifo.inventory_value, 0)
+              WHEN 'SPECIFIC_LOT' THEN COALESCE(lots.inventory_value, 0)
+              ELSE ROUND(ib.quantity * COALESCE(iv.average_unit_cost, pr.cost), 4)
+            END AS inventoryValue,`
+            : ''
+        }
+        UTC_TIMESTAMP(6) AS asOf,
         ib.updated_at AS updatedAt
        FROM inventory_balances ib INNER JOIN products pr ON pr.id = ib.product_id AND pr.tenant_id = ib.tenant_id
        INNER JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
        INNER JOIN warehouses w ON w.id = l.warehouse_id AND w.tenant_id = l.tenant_id
+       INNER JOIN tenants t ON t.id = ib.tenant_id
+       INNER JOIN inventory_valuation_policies ivp ON ivp.tenant_id = ib.tenant_id
+       LEFT JOIN inventory_valuations iv ON iv.product_id = ib.product_id AND iv.tenant_id = ib.tenant_id
+       LEFT JOIN (
+         SELECT tenant_id, product_id, SUM(quantity) AS quantity
+         FROM inventory_balances WHERE tenant_id = ? GROUP BY tenant_id, product_id
+       ) global_balance ON global_balance.tenant_id = ib.tenant_id AND global_balance.product_id = ib.product_id
+       LEFT JOIN (
+         SELECT layer.tenant_id, layer.product_id, layer.location_id,
+                SUM(layer.remaining_quantity) AS quantity,
+                SUM(layer.remaining_quantity * layer.unit_cost) AS inventory_value,
+                CASE WHEN COUNT(DISTINCT layer.currency) = 1 THEN MIN(layer.currency) ELSE NULL END AS currency
+         FROM inventory_fifo_layers layer WHERE layer.tenant_id = ? AND layer.remaining_quantity > 0
+         GROUP BY layer.tenant_id, layer.product_id, layer.location_id
+       ) fifo ON fifo.tenant_id = ib.tenant_id AND fifo.product_id = ib.product_id AND fifo.location_id = ib.location_id
+       LEFT JOIN (
+         SELECT lot.tenant_id, lot.product_id, balance.location_id,
+                SUM(balance.quantity) AS quantity,
+                SUM(balance.quantity * lot.unit_cost) AS inventory_value,
+                CASE WHEN COUNT(DISTINCT lot.currency) = 1 THEN MIN(lot.currency) ELSE NULL END AS currency
+         FROM inventory_lots lot
+         INNER JOIN inventory_lot_balances balance ON balance.lot_id = lot.id AND balance.tenant_id = lot.tenant_id
+         WHERE lot.tenant_id = ? AND balance.quantity > 0
+         GROUP BY lot.tenant_id, lot.product_id, balance.location_id
+       ) lots ON lots.tenant_id = ib.tenant_id AND lots.product_id = ib.product_id AND lots.location_id = ib.location_id
        WHERE ${where.join(' AND ')} ORDER BY pr.name, l.name LIMIT ${MAX_ROWS + 1}`,
-      p,
+      [tenantId, tenantId, tenantId, ...p],
     );
     return { columns, rows };
   }

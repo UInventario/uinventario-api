@@ -1,6 +1,9 @@
 import { Injectable } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
+import { applyInventoryValuation } from '../inventory/inventory-valuation';
+import { applyInventoryLotTracking } from '../inventory/inventory-lot-tracking';
+import { applyInventorySerialTracking } from '../inventory/inventory-serial-tracking';
 import { ReceivePurchaseOrderDto } from './dto/receive-purchase-order.dto';
 import {
   InvalidPurchaseReceiptError,
@@ -48,6 +51,8 @@ export class PurchaseReceiptRepository {
     const lines = input.dto.lines.map((line) => ({
       purchaseOrderLineId: line.purchaseOrderLineId,
       receivedQuantity: this.fromUnits(this.toUnits(line.receivedQuantity)),
+      lotCode: line.lotCode ?? null,
+      serialNumbers: line.serialNumbers ?? [],
     }));
     const fingerprint = createHash('sha256')
       .update(
@@ -128,7 +133,13 @@ export class PurchaseReceiptRepository {
             const accumulated = this.toUnits(orderLine.received_quantity);
             const pending = ordered > accumulated ? ordered - accumulated : 0n;
             const overage = received > pending ? received - pending : 0n;
-            return { orderLine, received, overage };
+            return {
+              orderLine,
+              received,
+              overage,
+              lotCode: line.lotCode ?? null,
+              serialNumbers: line.serialNumbers,
+            };
           });
           const hasOverage = requested.some(({ overage }) => overage > 0n);
           if (hasOverage && !input.allowOverage)
@@ -157,12 +168,26 @@ export class PurchaseReceiptRepository {
           );
           for (const [index, item] of requested.entries()) {
             const receiptLineId = randomUUID();
-            const [product] = await manager.query<Array<{ cost: string }>>(
-              `SELECT cost FROM products
+            const [product] = await manager.query<
+              Array<{
+                cost: string;
+                track_lots: number | boolean;
+                track_serials: number | boolean;
+              }>
+            >(
+              `SELECT cost, track_lots, track_serials FROM products
                WHERE id = ? AND tenant_id = ? FOR UPDATE`,
               [item.orderLine.product_id, input.tenantId],
             );
             if (!product) throw new InvalidPurchaseReceiptError();
+            if (Boolean(product.track_lots) && !item.lotCode)
+              throw new InvalidPurchaseReceiptError();
+            if (
+              Boolean(product.track_serials) &&
+              BigInt(item.serialNumbers.length) * 1000n !== item.received
+            )
+              throw new InvalidPurchaseReceiptError();
+            const movementId = randomUUID();
             await manager.query(
               `INSERT INTO inventory_balances
                 (tenant_id, product_id, location_id, quantity)
@@ -207,9 +232,9 @@ export class PurchaseReceiptRepository {
             await manager.query(
               `INSERT INTO purchase_receipt_lines
                 (id, tenant_id, receipt_id, purchase_order_line_id, line_number,
-                 received_quantity, overage_quantity, unit_cost, total_cost,
+                 received_quantity, lot_code, overage_quantity, unit_cost, total_cost,
                  previous_catalog_cost, resulting_catalog_cost)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 receiptLineId,
                 input.tenantId,
@@ -217,20 +242,12 @@ export class PurchaseReceiptRepository {
                 item.orderLine.id,
                 index + 1,
                 this.fromUnits(item.received),
+                item.lotCode,
                 this.fromUnits(item.overage),
                 item.orderLine.unit_cost,
                 this.receiptCost(item.received, item.orderLine.unit_cost),
                 product.cost,
-                item.orderLine.unit_cost,
-              ],
-            );
-            await manager.query(
-              `UPDATE products SET cost = ?, version = version + 1
-               WHERE id = ? AND tenant_id = ?`,
-              [
-                item.orderLine.unit_cost,
-                item.orderLine.product_id,
-                input.tenantId,
+                product.cost,
               ],
             );
             const movementFingerprint = createHash('sha256')
@@ -253,7 +270,7 @@ export class PurchaseReceiptRepository {
                  purchase_receipt_line_id)
                VALUES (?, ?, ?, ?, 'PURCHASE_RECEIPT', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
-                randomUUID(),
+                movementId,
                 input.tenantId,
                 item.orderLine.product_id,
                 input.dto.locationId,
@@ -267,6 +284,19 @@ export class PurchaseReceiptRepository {
                 receiptId,
                 receiptLineId,
               ],
+            );
+            await applyInventoryValuation(manager, movementId);
+            await applyInventoryLotTracking(manager, movementId);
+            await applyInventorySerialTracking(manager, movementId, {
+              serialNumbers: item.serialNumbers,
+            });
+            await manager.query(
+              `UPDATE purchase_receipt_lines prl
+               INNER JOIN products p
+                 ON p.id = ? AND p.tenant_id = prl.tenant_id
+               SET prl.resulting_catalog_cost = p.cost
+               WHERE prl.id = ? AND prl.tenant_id = ?`,
+              [item.orderLine.product_id, receiptLineId, input.tenantId],
             );
           }
 

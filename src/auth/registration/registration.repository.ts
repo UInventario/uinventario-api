@@ -94,8 +94,15 @@ export class RegistrationRepository {
         (?, ?, 'PURCHASE_RECEIPTS_OVERAGE'),
         (?, ?, 'INVENTORY_VIEW'), (?, ?, 'INVENTORY_ADJUST'),
         (?, ?, 'INVENTORY_TRANSFER'), (?, ?, 'INVENTORY_COUNT'),
-        (?, ?, 'INVENTORY_APPROVE')`,
-      Array.from({ length: 21 }, () => [role.id, tenant.id]).flat(),
+        (?, ?, 'INVENTORY_APPROVE'),
+        (?, ?, 'INVENTORY_VALUATION_MANAGE')`,
+      Array.from({ length: 22 }, () => [role.id, tenant.id]).flat(),
+    );
+    await manager.query(
+      `INSERT INTO inventory_valuation_policies
+        (tenant_id, method, version, effective_at, migration_rule)
+       VALUES (?, 'MOVING_AVERAGE', 1, CURRENT_TIMESTAMP(6), 'INITIAL_DEFAULT')`,
+      [tenant.id],
     );
     await manager.update(
       RegistrationRequestEntity,

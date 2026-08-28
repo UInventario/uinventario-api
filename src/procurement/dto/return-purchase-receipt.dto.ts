@@ -2,7 +2,9 @@ import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   ArrayMinSize,
+  ArrayUnique,
   IsArray,
+  IsOptional,
   IsString,
   IsUUID,
   Matches,
@@ -23,6 +25,14 @@ export class ReturnPurchaseReceiptLineDto {
   @IsString()
   @Matches(quantityPattern)
   returnedQuantity!: string;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(1000)
+  @ArrayUnique((value: string) => value.trim().toUpperCase())
+  @IsString({ each: true })
+  @MaxLength(120, { each: true })
+  serialNumbers?: string[];
 }
 
 export class ReturnPurchaseReceiptDto {

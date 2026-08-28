@@ -38,6 +38,19 @@ import {
   PaymentDeclinedError,
   PaymentMethodUnavailableError,
 } from './payment-authorization.service';
+import {
+  InsufficientInventoryLotStockError,
+  InventoryFifoCurrencyMismatchError,
+  InventoryFifoLayerShortageError,
+  InventoryLotNotFoundError,
+} from '../inventory/inventory.errors';
+import {
+  InventorySerialDuplicateError,
+  InventorySerialNotFoundError,
+  InventorySerialQuantityError,
+  InventorySerialRequiredError,
+  InventorySerialStateConflictError,
+} from '../inventory/inventory-serial-tracking';
 
 @Injectable()
 export class PosService {
@@ -277,6 +290,38 @@ export class PosService {
           message: 'Abre un turno en la caja activa antes de registrar ventas.',
         });
       }
+      if (error instanceof InventoryLotNotFoundError) {
+        throw new NotFoundException({ code: 'INVENTORY_LOT_NOT_FOUND' });
+      }
+      if (error instanceof InsufficientInventoryLotStockError) {
+        throw new ConflictException({
+          code: 'INSUFFICIENT_INVENTORY_LOT_STOCK',
+        });
+      }
+      if (error instanceof InventoryFifoLayerShortageError) {
+        throw new ConflictException({ code: 'INVENTORY_FIFO_LAYER_SHORTAGE' });
+      }
+      if (error instanceof InventoryFifoCurrencyMismatchError) {
+        throw new ConflictException({
+          code: 'INVENTORY_FIFO_CURRENCY_MISMATCH',
+        });
+      }
+      if (
+        error instanceof InventorySerialRequiredError ||
+        error instanceof InventorySerialQuantityError
+      ) {
+        throw new BadRequestException({ code: 'INVENTORY_SERIALS_REQUIRED' });
+      }
+      if (error instanceof InventorySerialNotFoundError)
+        throw new NotFoundException({ code: 'INVENTORY_SERIAL_NOT_FOUND' });
+      if (
+        error instanceof InventorySerialDuplicateError ||
+        error instanceof InventorySerialStateConflictError
+      ) {
+        throw new ConflictException({
+          code: 'INVENTORY_SERIAL_STATE_CONFLICT',
+        });
+      }
       throw error;
     }
   }
@@ -334,6 +379,8 @@ export class PosService {
       });
       const context = await this.pos.getContext(input);
       const requested = new Map<string, bigint>();
+      const requestedLots = new Map<string, string | null>();
+      const requestedSerials = new Map<string, string[]>();
       for (const line of input.dto.lines) {
         const quantity = this.toQuantityUnits(line.quantity);
         if (quantity <= 0n) {
@@ -346,12 +393,35 @@ export class PosService {
           line.productId,
           (requested.get(line.productId) ?? 0n) + quantity,
         );
+        const previousLot = requestedLots.get(line.productId);
+        const selectedLot = line.lotId ?? null;
+        if (previousLot !== undefined && previousLot !== selectedLot) {
+          throw new BadRequestException({ code: 'MIXED_PRODUCT_LOTS' });
+        }
+        requestedLots.set(line.productId, selectedLot);
+        requestedSerials.set(line.productId, [
+          ...(requestedSerials.get(line.productId) ?? []),
+          ...(line.serialNumbers ?? []),
+        ]);
       }
       const products = await this.pos.getProducts(
         input.tenantId,
         input.warehouseId,
         [...requested.keys()],
         input.dto.reservationId,
+      );
+      const selectedLots = [...requestedLots]
+        .filter((entry): entry is [string, string] => entry[1] !== null)
+        .map(([productId, lotId]) => ({ productId, lotId }));
+      if (input.dto.reservationId && selectedLots.length > 0) {
+        throw new BadRequestException({
+          code: 'RESERVATION_LOT_SELECTION_NOT_SUPPORTED',
+        });
+      }
+      const lotAvailability = await this.pos.getSelectedLotAvailability(
+        input.tenantId,
+        input.warehouseId,
+        selectedLots,
       );
       const productMap = new Map(
         products.map((product) => [product.id, product]),
@@ -372,7 +442,24 @@ export class PosService {
           if (!product)
             throw new NotFoundException({ code: 'PRODUCT_NOT_FOUND' });
           if (!product.active) throw new PosProductNotAvailableError(productId);
-          if (quantityUnits > this.toQuantityUnits(product.availableQuantity)) {
+          const serialNumbers = requestedSerials.get(productId) ?? [];
+          if (
+            product.trackSerials &&
+            BigInt(serialNumbers.length) * 1000n !== quantityUnits
+          ) {
+            throw new BadRequestException({
+              code: 'INVENTORY_SERIALS_REQUIRED',
+              message: 'Escanea una serie por cada unidad vendida.',
+            });
+          }
+          const selectedLotId = requestedLots.get(productId) ?? null;
+          const availableQuantity = selectedLotId
+            ? lotAvailability.get(`${productId}:${selectedLotId}`)
+            : product.availableQuantity;
+          if (selectedLotId && availableQuantity === undefined) {
+            throw new InventoryLotNotFoundError();
+          }
+          if (quantityUnits > this.toQuantityUnits(availableQuantity!)) {
             throw new PosInsufficientStockError(productId);
           }
           const lineTotal = this.roundDivide(
@@ -393,7 +480,9 @@ export class PosService {
           return {
             product: { id: product.id, name: product.name, sku: product.sku },
             quantity: this.fromQuantityUnits(quantityUnits),
-            availableQuantity: product.availableQuantity,
+            lotId: requestedLots.get(productId) ?? null,
+            serialNumbers,
+            availableQuantity: availableQuantity!,
             unitPrice: this.fromMoneyCents(this.toMoneyCents(product.price)),
             subtotal: this.fromMoneyCents(lineSubtotal),
             tax: this.fromMoneyCents(lineTax),
@@ -439,6 +528,9 @@ export class PosService {
           code: 'POS_RESERVATION_NOT_AVAILABLE',
           message: 'La reserva no está activa o no coincide con este carrito.',
         });
+      }
+      if (error instanceof InventoryLotNotFoundError) {
+        throw new NotFoundException({ code: 'INVENTORY_LOT_NOT_FOUND' });
       }
       throw error;
     }
@@ -538,12 +630,24 @@ export class PosService {
 
   private saleFingerprint(dto: CreateSaleDto): string {
     const quantities = new Map<string, bigint>();
+    const lots = new Map<string, string | null>();
+    const serials = new Map<string, string[]>();
     for (const line of dto.lines) {
       quantities.set(
         line.productId,
         (quantities.get(line.productId) ?? 0n) +
           this.toQuantityUnits(line.quantity),
       );
+      const previousLot = lots.get(line.productId);
+      const lotId = line.lotId ?? null;
+      if (previousLot !== undefined && previousLot !== lotId) {
+        throw new BadRequestException({ code: 'MIXED_PRODUCT_LOTS' });
+      }
+      lots.set(line.productId, lotId);
+      serials.set(line.productId, [
+        ...(serials.get(line.productId) ?? []),
+        ...(line.serialNumbers ?? []),
+      ]);
     }
     const canonical = {
       lines: [...quantities.entries()]
@@ -551,6 +655,10 @@ export class PosService {
         .map(([productId, quantity]) => ({
           productId,
           quantity: this.fromQuantityUnits(quantity),
+          lotId: lots.get(productId) ?? null,
+          serialNumbers: (serials.get(productId) ?? [])
+            .map((value) => value.trim().toUpperCase())
+            .sort(),
         })),
       payments: (dto.payments ?? (dto.payment ? [dto.payment] : [])).map(
         (payment) => ({

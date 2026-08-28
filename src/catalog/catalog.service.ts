@@ -10,6 +10,7 @@ import {
   ProductCodeAmbiguousError,
   ProductIdentifierConflictError,
   ProductVersionConflictError,
+  ProductLotTrackingLockedError,
 } from './catalog.errors';
 import {
   CatalogOptionsResponse,
@@ -82,6 +83,13 @@ export class CatalogService {
           currentVersion: error.currentVersion,
           message:
             'El producto cambió desde que lo abriste. Recarga antes de guardar.',
+        });
+      }
+      if (error instanceof ProductLotTrackingLockedError) {
+        throw new ConflictException({
+          code: 'PRODUCT_LOT_TRACKING_LOCKED',
+          message:
+            'El control por lotes no puede cambiar después del primer movimiento de inventario.',
         });
       }
       throw error;

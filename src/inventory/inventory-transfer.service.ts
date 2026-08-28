@@ -17,7 +17,18 @@ import {
   InventoryTransferDiscrepancyReasonRequiredError,
   InventoryTransferReceiptExceedsPendingError,
 } from './inventory-transfer.errors';
+import {
+  InventoryFifoCurrencyMismatchError,
+  InventoryFifoLayerShortageError,
+} from './inventory.errors';
 import { InventoryTransferRepository } from './inventory-transfer.repository';
+import {
+  InventorySerialDuplicateError,
+  InventorySerialNotFoundError,
+  InventorySerialQuantityError,
+  InventorySerialRequiredError,
+  InventorySerialStateConflictError,
+} from './inventory-serial-tracking';
 import {
   InventoryTransferListResponse,
   InventoryTransferResponse,
@@ -144,6 +155,14 @@ export class InventoryTransferService {
     try {
       return await operation();
     } catch (error) {
+      if (error instanceof InventoryFifoLayerShortageError) {
+        throw new ConflictException({ code: 'INVENTORY_FIFO_LAYER_SHORTAGE' });
+      }
+      if (error instanceof InventoryFifoCurrencyMismatchError) {
+        throw new ConflictException({
+          code: 'INVENTORY_FIFO_CURRENCY_MISMATCH',
+        });
+      }
       if (error instanceof InventoryTransferNotFoundError)
         throw new NotFoundException();
       if (error instanceof InvalidInventoryTransferTargetError) {
@@ -192,6 +211,22 @@ export class InventoryTransferService {
         throw new ConflictException({
           code: 'TRANSFER_RECEIPT_EXCEEDS_PENDING',
           message: 'La cantidad supera lo pendiente de recibir.',
+        });
+      }
+      if (
+        error instanceof InventorySerialRequiredError ||
+        error instanceof InventorySerialQuantityError
+      ) {
+        throw new BadRequestException({ code: 'INVENTORY_SERIALS_REQUIRED' });
+      }
+      if (error instanceof InventorySerialNotFoundError)
+        throw new NotFoundException({ code: 'INVENTORY_SERIAL_NOT_FOUND' });
+      if (
+        error instanceof InventorySerialDuplicateError ||
+        error instanceof InventorySerialStateConflictError
+      ) {
+        throw new ConflictException({
+          code: 'INVENTORY_SERIAL_STATE_CONFLICT',
         });
       }
       throw error;

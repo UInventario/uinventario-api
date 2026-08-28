@@ -18,5 +18,6 @@ export interface ProductReservationData {
     id: string;
     product: { id: string; name: string; sku: string };
     quantity: string;
+    serialNumbers: string[];
   }>;
 }

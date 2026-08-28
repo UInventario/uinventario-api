@@ -1,6 +1,10 @@
 import { Transform } from 'class-transformer';
 import {
+  ArrayMaxSize,
+  ArrayUnique,
+  IsArray,
   IsIn,
+  IsOptional,
   IsString,
   IsUUID,
   Matches,
@@ -47,4 +51,12 @@ export class CreateInventoryStateTransitionDto {
   @MinLength(2)
   @MaxLength(120)
   reference!: string;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(1000)
+  @ArrayUnique((value: string) => value.trim().toUpperCase())
+  @IsString({ each: true })
+  @MaxLength(120, { each: true })
+  serialNumbers?: string[];
 }

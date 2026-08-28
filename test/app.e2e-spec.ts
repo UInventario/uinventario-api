@@ -42,6 +42,11 @@ describe('UInventario API (e2e)', () => {
     for (const table of [
       'audit_events',
       'audit_chain_heads',
+      'inventory_reconciliation_guards',
+      'inventory_reconciliation_findings',
+      'inventory_reconciliation_runs',
+      'inventory_valuation_policy_history',
+      'inventory_valuation_policies',
       'offline_commands',
       'offline_device_sequences',
       'offline_devices',
@@ -59,6 +64,16 @@ describe('UInventario API (e2e)', () => {
       'inventory_count_session_lines',
       'inventory_count_sessions',
       'inventory_counts',
+      'inventory_movement_fifo_layers',
+      'inventory_fifo_layers',
+      'inventory_fifo_cutovers',
+      'inventory_movement_lots',
+      'inventory_serial_events',
+      'inventory_serials',
+      'inventory_lot_origins',
+      'inventory_lot_balances',
+      'inventory_lots',
+      'inventory_valuations',
       'inventory_movements',
       'inventory_import_rows',
       'inventory_imports',
@@ -920,6 +935,7 @@ describe('UInventario API (e2e)', () => {
                   'INVENTORY_APPROVE',
                   'INVENTORY_COUNT',
                   'INVENTORY_TRANSFER',
+                  'INVENTORY_VALUATION_MANAGE',
                   'INVENTORY_VIEW',
                   'PRODUCTS_MANAGE',
                   'PURCHASE_ORDERS_APPROVE',
@@ -1471,6 +1487,7 @@ describe('UInventario API (e2e)', () => {
       email: string,
       cookie: string,
       suffix: string,
+      trackLots = false,
     ): Promise<{
       supplierId: string;
       supplierProductId: string;
@@ -1523,6 +1540,7 @@ describe('UInventario API (e2e)', () => {
           sku: `${suffix.toUpperCase()}-1`,
           cost: '85.40',
           price: '119.90',
+          trackLots,
         })
         .expect(201)
         .expect(({ body }: { body: { data: { id: string } } }) => {
@@ -2103,7 +2121,7 @@ describe('UInventario API (e2e)', () => {
           productId: order.lines[0].productId,
           locationId: setup.locationId,
           type: 'INITIAL',
-          quantity: '1.000',
+          quantity: '2.000',
           reason: 'Stock previo para validar costo histórico',
         })
         .expect(201);
@@ -2182,7 +2200,7 @@ describe('UInventario API (e2e)', () => {
                       unitCost: '80.00',
                       totalCost: '160.00',
                       previousCatalogCost: '85.40',
-                      resultingCatalogCost: '80.00',
+                      resultingCatalogCost: '81.80',
                     },
                   ],
                 },
@@ -2316,6 +2334,9 @@ describe('UInventario API (e2e)', () => {
           productCost: string;
           historicalSaleCost: string;
           receivedCost: string;
+          valuationQuantity: string;
+          valuationValue: string;
+          averageUnitCost: string;
           audits: number | string;
         }>
       >(
@@ -2336,6 +2357,12 @@ describe('UInventario API (e2e)', () => {
            (SELECT SUM(prl.total_cost) FROM purchase_receipt_lines prl
             INNER JOIN purchase_receipts pr ON pr.id = prl.receipt_id
             WHERE pr.purchase_order_id = ?) AS receivedCost,
+           (SELECT quantity FROM inventory_valuations
+            WHERE product_id = ?) AS valuationQuantity,
+           (SELECT inventory_value FROM inventory_valuations
+            WHERE product_id = ?) AS valuationValue,
+           (SELECT average_unit_cost FROM inventory_valuations
+            WHERE product_id = ?) AS averageUnitCost,
            (SELECT COUNT(*) FROM audit_events
             WHERE entity_id = ? AND action = 'PURCHASE_ORDER_RECEIVED') AS audits`,
         [
@@ -2347,16 +2374,22 @@ describe('UInventario API (e2e)', () => {
           order.lines[0].productId,
           order.lines[0].productId,
           order.id,
+          order.lines[0].productId,
+          order.lines[0].productId,
+          order.lines[0].productId,
           order.id,
         ],
       );
       expect(Number(counts.receipts)).toBe(3);
       expect(Number(counts.receiptLines)).toBe(3);
       expect(Number(counts.purchaseMovements)).toBe(3);
-      expect(counts.balance).toBe('6.000');
-      expect(counts.productCost).toBe('80.00');
+      expect(counts.balance).toBe('7.000');
+      expect(counts.productCost).toBe('80.77');
       expect(counts.historicalSaleCost).toBe('85.40');
       expect(counts.receivedCost).toBe('480.00');
+      expect(counts.valuationQuantity).toBe('7.000');
+      expect(counts.valuationValue).toBe('565.4000');
+      expect(counts.averageUnitCost).toBe('80.7714');
       expect(Number(counts.audits)).toBe(3);
 
       await request(app.getHttpServer())
@@ -2372,9 +2405,67 @@ describe('UInventario API (e2e)', () => {
             product: { id: order.lines[0].productId },
             location: { id: setup.locationId },
             document: { type: 'PURCHASE_RECEIPT' },
+            valuation: {
+              unitCost: '80.0000',
+              averageUnitCost: '80.7714',
+            },
           });
           expect(body.meta).toMatchObject({ pagination: { total: 3 } });
         });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: unknown[]; meta: Record<string, unknown> };
+          }) => {
+            expect(body.data).toEqual(
+              expect.arrayContaining([
+                expect.objectContaining({
+                  product: {
+                    id: order.lines[0].productId,
+                    name: 'Receipts Producto',
+                    sku: 'RECEIPTS-1',
+                    active: true,
+                    trackLots: false,
+                  },
+                  totalQuantity: '7.000',
+                  averageUnitCost: '80.7714',
+                  inventoryValue: '565.3998',
+                  costing: {
+                    method: 'MOVING_AVERAGE',
+                    currency: 'MXN',
+                    quantity: '7.000',
+                    inventoryValue: '565.3998',
+                    reconciled: true,
+                  },
+                  valuation: {
+                    quantity: '7.000',
+                    inventoryValue: '565.4000',
+                    quantityReconciled: true,
+                    valueReconciled: true,
+                    reconciled: true,
+                  },
+                }),
+              ]),
+            );
+            expect(body.meta).toMatchObject({
+              valuation: {
+                method: 'MOVING_AVERAGE',
+                policyVersion: 1,
+                currency: 'MXN',
+              },
+            });
+            expect(
+              Number.isNaN(
+                Date.parse((body.meta.valuation as { asOf: string }).asOf),
+              ),
+            ).toBe(false);
+          },
+        );
     });
 
     it('rolls back receipt, stock, cost and order state when movement persistence fails', async () => {
@@ -2451,6 +2542,7 @@ describe('UInventario API (e2e)', () => {
           receipts: number | string;
           movements: number | string;
           balances: number | string;
+          valuations: number | string;
           productCost: string;
         }>
       >(
@@ -2460,6 +2552,8 @@ describe('UInventario API (e2e)', () => {
             WHERE purchase_receipt_id IS NOT NULL) AS movements,
            (SELECT COUNT(*) FROM inventory_balances
             WHERE product_id = pol.product_id AND location_id = ?) AS balances,
+           (SELECT COUNT(*) FROM inventory_valuations
+            WHERE product_id = pol.product_id) AS valuations,
            (SELECT cost FROM products WHERE id = pol.product_id) AS productCost
          FROM purchase_orders po
          INNER JOIN purchase_order_lines pol ON pol.purchase_order_id = po.id
@@ -2473,6 +2567,7 @@ describe('UInventario API (e2e)', () => {
         receipts: Number(state.receipts),
         movements: Number(state.movements),
         balances: Number(state.balances),
+        valuations: Number(state.valuations),
         productCost: state.productCost,
       }).toEqual({
         status: 'APPROVED',
@@ -2481,6 +2576,7 @@ describe('UInventario API (e2e)', () => {
         receipts: 0,
         movements: 0,
         balances: 0,
+        valuations: 0,
         productCost: '85.40',
       });
     });
@@ -2492,6 +2588,7 @@ describe('UInventario API (e2e)', () => {
         registrationPayload.email,
         cookie,
         'SupplierReturn',
+        true,
       );
       let order!: {
         id: string;
@@ -2535,6 +2632,7 @@ describe('UInventario API (e2e)', () => {
             {
               purchaseOrderLineId: order.lines[0].id,
               receivedQuantity: '5.000',
+              lotCode: 'LOT-PROVEEDOR-100',
             },
           ],
         })
@@ -2618,7 +2716,11 @@ describe('UInventario API (e2e)', () => {
               receipts: [
                 {
                   lines: [
-                    { returnedQuantity: '2.000', returnableQuantity: '3.000' },
+                    {
+                      lotCode: 'LOT-PROVEEDOR-100',
+                      returnedQuantity: '2.000',
+                      returnableQuantity: '3.000',
+                    },
                   ],
                 },
               ],
@@ -2752,9 +2854,442 @@ describe('UInventario API (e2e)', () => {
             product: { id: setup.productId },
             location: { id: setup.locationId },
             document: { type: 'SUPPLIER_RETURN' },
+            lots: [
+              {
+                code: 'LOT-PROVEEDOR-100',
+                selectionMode: 'MANUAL',
+                unitCost: '80.0000',
+                currency: 'MXN',
+                valueChange: '-240.0000',
+              },
+            ],
           });
           expect(body.meta).toMatchObject({ pagination: { total: 2 } });
         });
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${setup.productId}/lots`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [
+              {
+                code: 'LOT-PROVEEDOR-100',
+                quantity: '0.000',
+                unitCost: '80.0000',
+                currency: 'MXN',
+                inventoryValue: '0.0000',
+                origins: [
+                  {
+                    purchaseReceiptLineId: receipt.lines[0].id,
+                    quantity: '5.000',
+                    unitCost: '80.0000',
+                    currency: 'MXN',
+                    receipt: {
+                      id: receipt.id,
+                      documentReference: 'REM-DEV-100',
+                    },
+                    purchaseOrder: { id: order.id },
+                  },
+                ],
+              },
+            ],
+            meta: {
+              totalQuantity: '0.000',
+              lotQuantity: '0.000',
+              reconciled: true,
+              currency: 'MXN',
+              inventoryValue: '0.0000',
+            },
+          }),
+        );
+    });
+
+    it('values the lot actually sold and preserves its receipt cost on void and return', async () => {
+      await registerAccount('lot-cost-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      const setup = await setupProcurement(
+        registrationPayload.email,
+        cookie,
+        'LotCost',
+        true,
+      );
+
+      const receiveLot = async (
+        suffix: string,
+        quantity: string,
+        unitCost: string,
+      ): Promise<{
+        orderId: string;
+        receiptId: string;
+        receiptLineId: string;
+      }> => {
+        let order!: { id: string; lines: Array<{ id: string }> };
+        await request(app.getHttpServer())
+          .post('/api/v1/purchase-orders')
+          .set('Cookie', cookie)
+          .send({
+            supplierId: setup.supplierId,
+            currency: 'MXN',
+            lines: [
+              {
+                supplierProductId: setup.supplierProductId,
+                quantity,
+                unitCost,
+              },
+            ],
+          })
+          .expect(201)
+          .expect(({ body }: { body: { data: typeof order } }) => {
+            order = body.data;
+          });
+        await request(app.getHttpServer())
+          .post(`/api/v1/purchase-orders/${order.id}/approve`)
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', `lot-cost-approve-${suffix}`)
+          .send({ version: 1 })
+          .expect(200);
+        let receipt!: { id: string; lines: Array<{ id: string }> };
+        await request(app.getHttpServer())
+          .post(`/api/v1/purchase-orders/${order.id}/receipts`)
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', `lot-cost-receive-${suffix}`)
+          .send({
+            version: 2,
+            locationId: setup.locationId,
+            documentReference: `REM-LOT-${suffix}`,
+            lines: [
+              {
+                purchaseOrderLineId: order.lines[0].id,
+                receivedQuantity: quantity,
+                lotCode: `LOT-${suffix}`,
+              },
+            ],
+          })
+          .expect(201)
+          .expect(
+            ({
+              body,
+            }: {
+              body: { data: { receipts: Array<typeof receipt> } };
+            }) => {
+              receipt = body.data.receipts[0];
+            },
+          );
+        return {
+          orderId: order.id,
+          receiptId: receipt.id,
+          receiptLineId: receipt.lines[0].id,
+        };
+      };
+
+      await receiveLot('A', '3.000', '80.00');
+      const lotBReceipt = await receiveLot('B', '4.000', '120.00');
+      const lotResponse = await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${setup.productId}/lots`)
+        .set('Cookie', cookie)
+        .expect(200);
+      const lots = (
+        lotResponse.body as { data: Array<{ id: string; code: string }> }
+      ).data;
+      const lotB = lots.find(({ code }) => code === 'LOT-B')!;
+      expect(lotResponse.body).toMatchObject({
+        data: [
+          {
+            code: 'LOT-A',
+            quantity: '3.000',
+            unitCost: '80.0000',
+            currency: 'MXN',
+            inventoryValue: '240.0000',
+          },
+          {
+            code: 'LOT-B',
+            quantity: '4.000',
+            unitCost: '120.0000',
+            currency: 'MXN',
+            inventoryValue: '480.0000',
+            origins: [
+              {
+                purchaseReceiptLineId: lotBReceipt.receiptLineId,
+                quantity: '4.000',
+                unitCost: '120.0000',
+                currency: 'MXN',
+              },
+            ],
+          },
+        ],
+        meta: {
+          totalQuantity: '7.000',
+          lotQuantity: '7.000',
+          reconciled: true,
+          currency: 'MXN',
+          inventoryValue: '720.0000',
+        },
+      });
+
+      const fifoResponse = await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${setup.productId}/fifo-layers`)
+        .set('Cookie', cookie)
+        .expect(200);
+      const fifoLayers = (
+        fifoResponse.body as {
+          data: Array<{
+            id: string;
+            source: { purchaseReceiptLineId: string };
+          }>;
+        }
+      ).data;
+      const fifoLayerA = fifoLayers[0];
+      const fifoLayerB = fifoLayers.find(
+        ({ source }) =>
+          source.purchaseReceiptLineId === lotBReceipt.receiptLineId,
+      )!;
+      expect(fifoResponse.body).toMatchObject({
+        data: [
+          {
+            originType: 'PURCHASE_RECEIPT',
+            originalQuantity: '3.000',
+            remainingQuantity: '3.000',
+            unitCost: '80.0000',
+            currency: 'MXN',
+            inventoryValue: '240.0000',
+          },
+          {
+            originType: 'PURCHASE_RECEIPT',
+            originalQuantity: '4.000',
+            remainingQuantity: '4.000',
+            unitCost: '120.0000',
+            currency: 'MXN',
+            inventoryValue: '480.0000',
+          },
+        ],
+        meta: {
+          method: 'FIFO',
+          cutover: {
+            migrationRule: 'OPENING_BALANCE_AT_MOVING_AVERAGE',
+          },
+          totalQuantity: '7.000',
+          layerQuantity: '7.000',
+          reconciled: true,
+          currency: 'MXN',
+          inventoryValue: '720.0000',
+        },
+      });
+
+      await openCurrentCashRegister(cookie, 'lot-cost-open-shift');
+      const sale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-cost-sale')
+        .send({
+          lines: [
+            { productId: setup.productId, lotId: lotB.id, quantity: '2' },
+          ],
+          payment: { method: 'CASH', amountReceived: '240.00' },
+        })
+        .expect(201);
+      const saleId = (sale.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .query({ productId: setup.productId, type: 'SALE' })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [
+              {
+                lots: [
+                  {
+                    id: lotB.id,
+                    unitCost: '120.0000',
+                    currency: 'MXN',
+                    valueChange: '-240.0000',
+                  },
+                ],
+                fifoValuation: {
+                  unitCost: '80.0000',
+                  valueChange: '-160.0000',
+                  resultingInventoryValue: '560.0000',
+                },
+                fifoLayers: [
+                  {
+                    layerId: fifoLayerA.id,
+                    quantityChange: '-2.000',
+                    unitCost: '80.0000',
+                    currency: 'MXN',
+                    valueChange: '-160.0000',
+                    selectionMode: 'FIFO',
+                  },
+                ],
+              },
+            ],
+          }),
+        );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-cost-sale-void')
+        .send({ reason: 'Restaurar el costo específico del lote' })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .query({ productId: setup.productId, type: 'SALE_VOID' })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              {
+                fifoValuation: {
+                  unitCost: '80.0000',
+                  valueChange: '160.0000',
+                  resultingInventoryValue: '720.0000',
+                },
+                fifoLayers: [
+                  {
+                    layerId: fifoLayerA.id,
+                    quantityChange: '2.000',
+                    unitCost: '80.0000',
+                    selectionMode: 'RESTORE',
+                  },
+                ],
+              },
+            ],
+          });
+          const response = body as {
+            data: Array<{
+              fifoLayers: Array<{ sourceAllocationId: string | null }>;
+            }>;
+          };
+          expect(response.data[0].fifoLayers[0].sourceAllocationId).toEqual(
+            expect.any(String),
+          );
+        });
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/purchase-orders/${lotBReceipt.orderId}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-cost-supplier-return')
+        .send({
+          purchaseReceiptId: lotBReceipt.receiptId,
+          documentReference: 'DEV-LOT-B',
+          reason: 'Devolución parcial del lote B',
+          lines: [
+            {
+              purchaseReceiptLineId: lotBReceipt.receiptLineId,
+              returnedQuantity: '1.000',
+            },
+          ],
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .query({ productId: setup.productId, type: 'SUPPLIER_RETURN' })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [
+              {
+                lots: [
+                  {
+                    id: lotB.id,
+                    unitCost: '120.0000',
+                    currency: 'MXN',
+                    valueChange: '-120.0000',
+                  },
+                ],
+                fifoValuation: {
+                  unitCost: '120.0000',
+                  valueChange: '-120.0000',
+                  resultingInventoryValue: '600.0000',
+                },
+                fifoLayers: [
+                  {
+                    layerId: fifoLayerB.id,
+                    quantityChange: '-1.000',
+                    unitCost: '120.0000',
+                    currency: 'MXN',
+                    valueChange: '-120.0000',
+                    selectionMode: 'ORIGIN_RETURN',
+                  },
+                ],
+              },
+            ],
+          }),
+        );
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${setup.productId}/lots`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [
+              { code: 'LOT-A', quantity: '3.000', inventoryValue: '240.0000' },
+              { code: 'LOT-B', quantity: '3.000', inventoryValue: '360.0000' },
+            ],
+            meta: {
+              totalQuantity: '6.000',
+              lotQuantity: '6.000',
+              inventoryValue: '600.0000',
+              reconciled: true,
+            },
+          }),
+        );
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${setup.productId}/fifo-layers`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [
+              {
+                id: fifoLayerA.id,
+                remainingQuantity: '3.000',
+                inventoryValue: '240.0000',
+              },
+              {
+                id: fifoLayerB.id,
+                remainingQuantity: '3.000',
+                inventoryValue: '360.0000',
+              },
+            ],
+            meta: {
+              totalQuantity: '6.000',
+              layerQuantity: '6.000',
+              inventoryValue: '600.0000',
+              reconciled: true,
+            },
+          }),
+        );
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .set('Cookie', cookie)
+        .query({ productId: setup.productId })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [
+              {
+                product: { id: setup.productId },
+                totalQuantity: '6.000',
+                lotTracking: {
+                  lotQuantity: '6.000',
+                  reconciled: true,
+                  currency: 'MXN',
+                  inventoryValue: '600.0000',
+                },
+                fifoValuation: {
+                  quantity: '6.000',
+                  inventoryValue: '600.0000',
+                  currency: 'MXN',
+                  reconciled: true,
+                },
+              },
+            ],
+          }),
+        );
     });
 
     it('rolls back supplier return, stock and credit state when movement persistence fails', async () => {
@@ -2873,6 +3408,346 @@ describe('UInventario API (e2e)', () => {
         movements: 0,
         balance: '1.000',
         returned: '0.000',
+      });
+    });
+  });
+
+  describe('tenant inventory valuation policy', () => {
+    beforeEach(resetIdentityData);
+
+    it('prevalidates, authorizes and cuts over FIFO and specific-lot valuation without rewriting history', async () => {
+      await registerAccount('valuation-policy-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Valuation SA',
+          tradeName: 'Valuation',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Central',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'General',
+          locationName: 'Piso',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja' })
+        .expect(200);
+      const product = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto valorado',
+          sku: 'VAL-1',
+          cost: '10',
+          price: '20',
+        })
+        .expect(201);
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        'SELECT id FROM locations LIMIT 1',
+      );
+      const productId = (product.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'valuation-opening-stock')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '5',
+          reason: 'Apertura',
+        })
+        .expect(201);
+
+      const [adminRole] = await dataSource.query<
+        Array<{ id: string; tenant_id: string }>
+      >("SELECT id, tenant_id FROM roles WHERE code = 'ADMIN'");
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ?
+           AND permission = 'INVENTORY_VALUATION_MANAGE'`,
+        [adminRole.id, adminRole.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/valuation-policy/preview')
+        .set('Cookie', cookie)
+        .send({ targetMethod: 'FIFO' })
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'INVENTORY_VALUATION_MANAGE')`,
+        [adminRole.id, adminRole.tenant_id],
+      );
+
+      const fifoPreview = await request(app.getHttpServer())
+        .post('/api/v1/inventory/valuation-policy/preview')
+        .set('Cookie', cookie)
+        .send({ targetMethod: 'FIFO' })
+        .expect(201);
+      expect(fifoPreview.body).toMatchObject({
+        data: {
+          current: { method: 'MOVING_AVERAGE', version: 1 },
+          targetMethod: 'FIFO',
+          allowed: true,
+          strategy: 'USE_MAINTAINED_FIFO_LAYERS',
+        },
+      });
+      const fifoPlan = fifoPreview.body as {
+        data: { planFingerprint: string };
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/valuation-policy/changes')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'valuation-fifo-invalid-plan')
+        .send({
+          targetMethod: 'FIFO',
+          expectedVersion: 1,
+          planFingerprint: '0'.repeat(64),
+        })
+        .expect(409);
+      const [[unchanged], [historyBefore]] = await Promise.all([
+        dataSource.query<Array<{ method: string; version: number | string }>>(
+          'SELECT method, version FROM inventory_valuation_policies LIMIT 1',
+        ),
+        dataSource.query<Array<{ total: number | string }>>(
+          'SELECT COUNT(*) AS total FROM inventory_valuation_policy_history',
+        ),
+      ]);
+      expect(unchanged).toMatchObject({ method: 'MOVING_AVERAGE' });
+      expect(Number(historyBefore.total)).toBe(0);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/valuation-policy/changes')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'valuation-fifo-cutover')
+        .send({
+          targetMethod: 'FIFO',
+          expectedVersion: 1,
+          planFingerprint: fifoPlan.data.planFingerprint,
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              method: 'FIFO',
+              version: 2,
+              migrationRule: 'FORWARD_ONLY_CUTOVER',
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'valuation-fifo-exit')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'EXIT',
+          quantity: '1',
+          reason: 'Salida FIFO',
+          reference: 'FIFO-1',
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { valuation: { method: 'FIFO', policyVersion: 2 } },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              {
+                costing: {
+                  method: 'FIFO',
+                  currency: 'MXN',
+                  quantity: '4.000',
+                  inventoryValue: '40.0000',
+                  reconciled: true,
+                },
+              },
+            ],
+            meta: { valuation: { method: 'FIFO', policyVersion: 2 } },
+          });
+        });
+
+      const lotPreview = await request(app.getHttpServer())
+        .post('/api/v1/inventory/valuation-policy/preview')
+        .set('Cookie', cookie)
+        .send({ targetMethod: 'SPECIFIC_LOT' })
+        .expect(201);
+      expect(lotPreview.body).toMatchObject({
+        data: {
+          allowed: true,
+          productsToMigrate: 1,
+          locationsToMigrate: 1,
+          strategy: 'OPENING_LOTS_AT_MOVING_AVERAGE',
+        },
+      });
+      const lotPlan = lotPreview.body as {
+        data: { planFingerprint: string };
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/valuation-policy/changes')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'valuation-specific-lot-cutover')
+        .send({
+          targetMethod: 'SPECIFIC_LOT',
+          expectedVersion: 2,
+          planFingerprint: lotPlan.data.planFingerprint,
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              {
+                costing: {
+                  method: 'SPECIFIC_LOT',
+                  currency: 'MXN',
+                  quantity: '4.000',
+                  inventoryValue: '40.0000',
+                  reconciled: true,
+                },
+              },
+            ],
+            meta: {
+              valuation: { method: 'SPECIFIC_LOT', policyVersion: 3 },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/valuation-policy/changes')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'valuation-fifo-cutover')
+        .send({
+          targetMethod: 'FIFO',
+          expectedVersion: 1,
+          planFingerprint: fifoPlan.data.planFingerprint,
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { method: 'FIFO', version: 2 },
+            meta: { replay: true },
+          });
+        });
+      const [cut] = await dataSource.query<
+        Array<{
+          track_lots: number | boolean;
+          lot_quantity: string;
+          history: number | string;
+          audits: number | string;
+        }>
+      >(
+        `SELECT p.track_lots,
+           (SELECT SUM(ilb.quantity) FROM inventory_lots il
+            INNER JOIN inventory_lot_balances ilb
+              ON ilb.lot_id = il.id AND ilb.tenant_id = il.tenant_id
+            WHERE il.tenant_id = p.tenant_id AND il.product_id = p.id) AS lot_quantity,
+           (SELECT COUNT(*) FROM inventory_valuation_policy_history) AS history,
+           (SELECT COUNT(*) FROM audit_events
+            WHERE action = 'INVENTORY_VALUATION_METHOD_CHANGED') AS audits
+         FROM products p WHERE p.id = ?`,
+        [productId],
+      );
+      expect({
+        trackLots: Boolean(cut.track_lots),
+        lotQuantity: cut.lot_quantity,
+        history: Number(cut.history),
+        audits: Number(cut.audits),
+      }).toEqual({
+        trackLots: true,
+        lotQuantity: '4.000',
+        history: 2,
+        audits: 2,
+      });
+      const newProduct = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({ name: 'Nuevo por lote', sku: 'VAL-2', cost: '12', price: '24' })
+        .expect(201);
+      expect(newProduct.body).toMatchObject({ data: { trackLots: true } });
+
+      const bootstrap = await request(app.getHttpServer())
+        .get('/api/v1/offline/bootstrap')
+        .set('Cookie', cookie)
+        .query({ deviceId: randomUUID(), pageSize: 50 })
+        .expect(200);
+      expect(bootstrap.body).toMatchObject({
+        data: { valuationPolicy: { method: 'SPECIFIC_LOT', version: 3 } },
+      });
+      const bootstrapData = bootstrap.body as {
+        data: {
+          identity: { tenant: { id: string }; user: { id: string } };
+          scope: {
+            deviceId: string;
+            branchId: string;
+            cashRegisterId: string;
+          };
+        };
+      };
+      const { identity, scope } = bootstrapData.data;
+      const stale = await request(app.getHttpServer())
+        .post('/api/v1/offline/commands/batch')
+        .set('Cookie', cookie)
+        .send({
+          commands: [
+            {
+              protocolVersion: '1.0',
+              commandId: randomUUID(),
+              idempotencyKey: `valuation-offline-${randomUUID()}`,
+              scope: {
+                tenantId: identity.tenant.id,
+                userId: identity.user.id,
+                deviceId: scope.deviceId,
+                branchId: scope.branchId,
+                cashRegisterId: scope.cashRegisterId,
+              },
+              sequence: 1,
+              createdAt: new Date().toISOString(),
+              valuationMethod: 'MOVING_AVERAGE',
+              valuationPolicyVersion: 1,
+              kind: 'INVENTORY_MOVEMENT',
+              payload: {
+                productId,
+                locationId: location.id,
+                type: 'ENTRY',
+                quantity: '1',
+                reason: 'Snapshot obsoleto',
+                reference: 'STALE-1',
+              },
+            },
+          ],
+        })
+        .expect(201);
+      expect(stale.body).toMatchObject({
+        data: {
+          results: [
+            {
+              status: 'ERROR',
+              error: {
+                details: { code: 'OFFLINE_VALUATION_POLICY_STALE' },
+              },
+            },
+          ],
+        },
       });
     });
   });
@@ -4550,6 +5425,7 @@ describe('UInventario API (e2e)', () => {
           sku: 'TRANSFER-1',
           cost: '4.00',
           price: '8.00',
+          trackLots: true,
         })
         .expect(201);
       const productId = (productResponse.body as { data: { id: string } }).data
@@ -4564,6 +5440,7 @@ describe('UInventario API (e2e)', () => {
           type: 'INITIAL',
           quantity: '10',
           reason: 'Stock para transferir',
+          lotCode: 'LOT-TRANSFER-1',
         })
         .expect(201);
 
@@ -4979,6 +5856,20 @@ describe('UInventario API (e2e)', () => {
                 type: string;
                 correlationId: string;
                 document: { type: string; id: string };
+                lots: Array<{
+                  code: string;
+                  quantityChange: string;
+                  selectionMode: string;
+                }>;
+                fifoLayers: Array<{
+                  layerId: string;
+                  sourceAllocationId: string | null;
+                  quantityChange: string;
+                  unitCost: string;
+                  currency: string;
+                  valueChange: string;
+                  selectionMode: string;
+                }>;
               }>;
             };
           }) => {
@@ -4994,6 +5885,59 @@ describe('UInventario API (e2e)', () => {
                 ({ correlationId }) => correlationId === transferId,
               ),
             ).toBe(true);
+            expect(
+              body.data.find(({ type }) => type === 'TRANSFER_IN')?.lots,
+            ).toEqual([
+              expect.objectContaining({
+                code: 'LOT-TRANSFER-1',
+                quantityChange: '6.000',
+                unitCost: '4.0000',
+                currency: 'MXN',
+                valueChange: '24.0000',
+                selectionMode: 'TRANSFER',
+              }),
+            ]);
+            expect(
+              body.data.find(({ type }) => type === 'TRANSFER_DISCREPANCY')
+                ?.lots,
+            ).toEqual([
+              expect.objectContaining({
+                code: 'LOT-TRANSFER-1',
+                quantityChange: '-1.000',
+                unitCost: '4.0000',
+                currency: 'MXN',
+                valueChange: '-4.0000',
+                selectionMode: 'AUTOMATIC',
+              }),
+            ]);
+            const fifoTransferIn = body.data.find(
+              ({ type }) => type === 'TRANSFER_IN',
+            )?.fifoLayers;
+            expect(fifoTransferIn).toEqual([
+              expect.objectContaining({
+                quantityChange: '6.000',
+                unitCost: '4.0000',
+                currency: 'MXN',
+                valueChange: '24.0000',
+                selectionMode: 'TRANSFER',
+              }),
+            ]);
+            expect(fifoTransferIn?.[0].sourceAllocationId).toEqual(
+              expect.any(String),
+            );
+            expect(
+              body.data.find(({ type }) => type === 'TRANSFER_DISCREPANCY')
+                ?.fifoLayers,
+            ).toEqual([
+              expect.objectContaining({
+                layerId: fifoTransferIn![0].layerId,
+                quantityChange: '-1.000',
+                unitCost: '4.0000',
+                currency: 'MXN',
+                valueChange: '-4.0000',
+                selectionMode: 'FIFO',
+              }),
+            ]);
             expect(body.data.map(({ document }) => document.type)).toContain(
               'RECEIPT',
             );
@@ -5770,6 +6714,46 @@ describe('UInventario API (e2e)', () => {
       return { cookie, productId, locationId: location.id };
     }
 
+    it('accepts the unified sale contract with one cash payment', async () => {
+      const { cookie, productId } = await preparePos();
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'single-cash-payment')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          payments: [
+            {
+              method: 'CASH',
+              amount: '119.90',
+              amountReceived: '120.00',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              payment: {
+                method: 'CASH',
+                amountReceived: '120.00',
+                amountApplied: '119.90',
+                change: '0.10',
+              },
+              payments: [
+                {
+                  method: 'CASH',
+                  amountReceived: '120.00',
+                  amountApplied: '119.90',
+                  change: '0.10',
+                },
+              ],
+            },
+          });
+        });
+    });
+
     it('authorizes card, transfer and voucher payments without affecting expected cash', async () => {
       const { cookie, productId, locationId } = await preparePos();
       await request(app.getHttpServer())
@@ -6202,6 +7186,10 @@ describe('UInventario API (e2e)', () => {
         workbookBuffer as unknown as Parameters<typeof workbook.xlsx.load>[0],
       );
       expect(workbook.worksheets[0].getCell('D2').value).toBe(4);
+      expect(workbook.worksheets[0].getCell('I2').value).toBe('MOVING_AVERAGE');
+      expect(workbook.worksheets[0].getCell('J2').value).toBe('MXN');
+      expect(workbook.worksheets[0].getCell('K2').value).toBe(true);
+      expect(workbook.worksheets[0].getCell('L2').value).toBe(320);
 
       const salesExport = await createExport({
         dataset: 'SALES',
@@ -8012,6 +9000,11 @@ describe('UInventario API (e2e)', () => {
           reversed_payments: number | string;
           sale_void_movements: number | string;
           balance: string;
+          valuationQuantity: string;
+          valuationValue: string;
+          averageUnitCost: string;
+          saleUnitCost: string;
+          voidUnitCost: string;
           audit_events: number | string;
           before_data: string | { status: string };
           after_data: string | { status: string; reason: string };
@@ -8022,10 +9015,28 @@ describe('UInventario API (e2e)', () => {
                 (SELECT COUNT(*) FROM inventory_movements WHERE type = 'SALE_VOID') AS sale_void_movements,
                 (SELECT quantity FROM inventory_balances
                   WHERE product_id = ? AND location_id = ?) AS balance,
+                (SELECT quantity FROM inventory_valuations
+                  WHERE product_id = ?) AS valuationQuantity,
+                (SELECT inventory_value FROM inventory_valuations
+                  WHERE product_id = ?) AS valuationValue,
+                (SELECT average_unit_cost FROM inventory_valuations
+                  WHERE product_id = ?) AS averageUnitCost,
+                (SELECT unit_cost FROM inventory_movements
+                  WHERE product_id = ? AND type = 'SALE' LIMIT 1) AS saleUnitCost,
+                (SELECT unit_cost FROM inventory_movements
+                  WHERE product_id = ? AND type = 'SALE_VOID' LIMIT 1) AS voidUnitCost,
                 (SELECT COUNT(*) FROM audit_events WHERE action = 'SALE_VOIDED') AS audit_events,
                 (SELECT before_data FROM audit_events WHERE action = 'SALE_VOIDED' LIMIT 1) AS before_data,
                 (SELECT after_data FROM audit_events WHERE action = 'SALE_VOIDED' LIMIT 1) AS after_data`,
-        [productId, locationId],
+        [
+          productId,
+          locationId,
+          productId,
+          productId,
+          productId,
+          productId,
+          productId,
+        ],
       );
       const before =
         typeof state.before_data === 'string'
@@ -8040,6 +9051,11 @@ describe('UInventario API (e2e)', () => {
         reversedPayments: Number(state.reversed_payments),
         saleVoidMovements: Number(state.sale_void_movements),
         balance: state.balance,
+        valuationQuantity: state.valuationQuantity,
+        valuationValue: state.valuationValue,
+        averageUnitCost: state.averageUnitCost,
+        saleUnitCost: state.saleUnitCost,
+        voidUnitCost: state.voidUnitCost,
         auditEvents: Number(state.audit_events),
         before,
         after,
@@ -8048,6 +9064,11 @@ describe('UInventario API (e2e)', () => {
         reversedPayments: 1,
         saleVoidMovements: 1,
         balance: '5.000',
+        valuationQuantity: '5.000',
+        valuationValue: '400.0000',
+        averageUnitCost: '80.0000',
+        saleUnitCost: '80.0000',
+        voidUnitCost: '80.0000',
         auditEvents: 1,
         before: { status: 'COMPLETED', paymentStatus: 'COMPLETED' },
         after: {
@@ -8078,6 +9099,12 @@ describe('UInventario API (e2e)', () => {
                 quantityChange: '2.000',
                 responsible: { email: registrationPayload.email },
                 document: { type: 'SALE', id: saleId },
+                valuation: {
+                  unitCost: '80.0000',
+                  valueChange: '160.0000',
+                  resultingInventoryValue: '400.0000',
+                  averageUnitCost: '80.0000',
+                },
               },
             ],
           });
@@ -8205,19 +9232,87 @@ describe('UInventario API (e2e)', () => {
           sales: number | string;
           sale_movements: number | string;
           balance: string;
+          valuationQuantity: string;
+          valuationValue: string;
+          fifoQuantity: string;
+          fifoValue: string;
+          fifoAllocations: number | string;
         }>
       >(
         `SELECT (SELECT COUNT(*) FROM sales) AS sales,
                 (SELECT COUNT(*) FROM inventory_movements WHERE type = 'SALE') AS sale_movements,
                 (SELECT quantity FROM inventory_balances
-                  WHERE product_id = ? AND location_id = ?) AS balance`,
-        [productId, locationId],
+                  WHERE product_id = ? AND location_id = ?) AS balance,
+                (SELECT quantity FROM inventory_valuations
+                  WHERE product_id = ?) AS valuationQuantity,
+                (SELECT inventory_value FROM inventory_valuations
+                  WHERE product_id = ?) AS valuationValue,
+                (SELECT COALESCE(SUM(remaining_quantity), 0)
+                  FROM inventory_fifo_layers WHERE product_id = ?) AS fifoQuantity,
+                (SELECT CAST(COALESCE(SUM(remaining_quantity * unit_cost), 0) AS DECIMAL(21,4))
+                  FROM inventory_fifo_layers WHERE product_id = ?) AS fifoValue,
+                (SELECT COUNT(*) FROM inventory_movement_fifo_layers imfl
+                  INNER JOIN inventory_movements im ON im.id = imfl.movement_id
+                  WHERE im.product_id = ? AND im.type = 'SALE') AS fifoAllocations`,
+        [
+          productId,
+          locationId,
+          productId,
+          productId,
+          productId,
+          productId,
+          productId,
+        ],
       );
       expect({
         sales: Number(state.sales),
         saleMovements: Number(state.sale_movements),
         balance: state.balance,
-      }).toEqual({ sales: 1, saleMovements: 1, balance: '2.000' });
+        valuationQuantity: state.valuationQuantity,
+        valuationValue: state.valuationValue,
+        fifoQuantity: state.fifoQuantity,
+        fifoValue: state.fifoValue,
+        fifoAllocations: Number(state.fifoAllocations),
+      }).toEqual({
+        sales: 1,
+        saleMovements: 1,
+        balance: '2.000',
+        valuationQuantity: '2.000',
+        valuationValue: '160.0000',
+        fifoQuantity: '2.000',
+        fifoValue: '160.0000',
+        fifoAllocations: 1,
+      });
+
+      await dataSource.query(
+        `UPDATE inventory_fifo_layers SET remaining_quantity = 0
+         WHERE product_id = ?`,
+        [productId],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'pos-fifo-shortage')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: '200.00',
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVENTORY_FIFO_LAYER_SHORTAGE');
+        });
+      const [rollback] = await dataSource.query<
+        Array<{ sales: number | string; balance: string }>
+      >(
+        `SELECT (SELECT COUNT(*) FROM sales) AS sales,
+                (SELECT quantity FROM inventory_balances
+                  WHERE product_id = ? AND location_id = ?) AS balance`,
+        [productId, locationId],
+      );
+      expect({
+        sales: Number(rollback.sales),
+        balance: rollback.balance,
+      }).toEqual({ sales: 1, balance: '2.000' });
     });
 
     it('rolls back the stock decrement when payment persistence fails', async () => {
@@ -10477,6 +11572,8 @@ describe('UInventario API (e2e)', () => {
         scope,
         sequence: 1,
         createdAt: new Date().toISOString(),
+        valuationMethod: 'MOVING_AVERAGE',
+        valuationPolicyVersion: 1,
         kind: 'INVENTORY_MOVEMENT',
         payload: {
           productId,
@@ -10666,6 +11763,8 @@ describe('UInventario API (e2e)', () => {
         scope,
         sequence: 4,
         createdAt: new Date().toISOString(),
+        valuationMethod: 'MOVING_AVERAGE',
+        valuationPolicyVersion: 1,
         kind: 'CASH_SALE',
         payload: {
           lines: [{ productId, quantity: '3' }],
@@ -10806,6 +11905,8 @@ describe('UInventario API (e2e)', () => {
         scope: countScope,
         sequence: 1,
         createdAt: new Date().toISOString(),
+        valuationMethod: 'MOVING_AVERAGE',
+        valuationPolicyVersion: 1,
         kind: 'INVENTORY_COUNT',
         payload: {
           productId,
@@ -11094,6 +12195,835 @@ describe('UInventario API (e2e)', () => {
           ],
         })
         .expect(403);
+    });
+  });
+
+  describe('inventory lot traceability', () => {
+    beforeEach(resetIdentityData);
+
+    it('tracks, selects, restores and reconciles lots without crossing tenants', async () => {
+      await registerAccount('lot-tracking-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Lotes Legal',
+          tradeName: 'Lotes',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Sucursal Lotes',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Lotes',
+          locationName: 'General Lotes',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Lotes' })
+        .expect(200);
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto por lote',
+          sku: 'LOT-001',
+          cost: '6.00',
+          price: '10.00',
+          trackLots: true,
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      expect(productResponse.body).toMatchObject({
+        data: { trackLots: true },
+      });
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-missing-code')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '3',
+          reason: 'Alta de lote',
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) =>
+          expect(body.code).toBe('INVENTORY_LOT_REQUIRED'),
+        );
+      for (const [index, lot] of ['LOT-A', 'LOT-B'].entries()) {
+        await request(app.getHttpServer())
+          .post('/api/v1/inventory/movements')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', `lot-stock-${index}`)
+          .send({
+            productId,
+            locationId: location.id,
+            type: index === 0 ? 'INITIAL' : 'ENTRY',
+            quantity: index === 0 ? '3' : '4',
+            reason: 'Alta de lote',
+            reference: index === 0 ? undefined : 'RECEPCION-LOT-B',
+            lotCode: lot,
+          })
+          .expect(201);
+      }
+      const lotsBeforeSale = await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/lots`)
+        .set('Cookie', cookie)
+        .expect(200);
+      const lots = (
+        lotsBeforeSale.body as {
+          data: Array<{
+            id: string;
+            code: string;
+            quantity: string;
+            unitCost: string;
+            currency: string;
+            inventoryValue: string;
+          }>;
+        }
+      ).data;
+      expect(lotsBeforeSale.body).toMatchObject({
+        meta: {
+          tracked: true,
+          totalQuantity: '7.000',
+          lotQuantity: '7.000',
+          reconciled: true,
+          currency: 'MXN',
+          inventoryValue: '42.0000',
+        },
+      });
+      expect(
+        lots.map(({ code, quantity, unitCost, currency, inventoryValue }) => ({
+          code,
+          quantity,
+          unitCost,
+          currency,
+          inventoryValue,
+        })),
+      ).toEqual([
+        {
+          code: 'LOT-A',
+          quantity: '3.000',
+          unitCost: '6.0000',
+          currency: 'MXN',
+          inventoryValue: '18.0000',
+        },
+        {
+          code: 'LOT-B',
+          quantity: '4.000',
+          unitCost: '6.0000',
+          currency: 'MXN',
+          inventoryValue: '24.0000',
+        },
+      ]);
+      const lotB = lots.find(({ code }) => code === 'LOT-B')!;
+
+      await openCurrentCashRegister(cookie, 'lot-open-shift');
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [{ productId, lotId: lotB.id, quantity: '5' }] })
+        .expect(409);
+      const saleResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-manual-sale')
+        .send({
+          lines: [{ productId, lotId: lotB.id, quantity: '2' }],
+          payment: { method: 'CASH', amountReceived: '20.00' },
+        })
+        .expect(201);
+      const saleId = (saleResponse.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/lots`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [
+              { code: 'LOT-A', quantity: '3.000' },
+              { code: 'LOT-B', quantity: '2.000' },
+            ],
+            meta: { totalQuantity: '5.000', reconciled: true },
+          }),
+        );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-sale-void')
+        .send({ reason: 'Prueba de restauración de lote' })
+        .expect(201);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .query({ productId, page: 1, pageSize: 20 })
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: Array<{ type: string; lots: unknown[] }> };
+          }) => {
+            expect(body.data.find(({ type }) => type === 'SALE')?.lots).toEqual(
+              [
+                expect.objectContaining({
+                  id: lotB.id,
+                  code: 'LOT-B',
+                  quantityChange: '-2.000',
+                  unitCost: '6.0000',
+                  currency: 'MXN',
+                  valueChange: '-12.0000',
+                  selectionMode: 'MANUAL',
+                }),
+              ],
+            );
+            expect(
+              body.data.find(({ type }) => type === 'SALE_VOID')?.lots,
+            ).toEqual([
+              expect.objectContaining({
+                id: lotB.id,
+                quantityChange: '2.000',
+                unitCost: '6.0000',
+                currency: 'MXN',
+                valueChange: '12.0000',
+                selectionMode: 'RESTORE',
+              }),
+            ]);
+          },
+        );
+
+      const isolated = {
+        organizationName: 'Otro tenant lotes',
+        email: 'otro-lotes@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'lot-isolated-registration')
+        .send(isolated)
+        .expect(201);
+      const isolatedCookie = await createPersistedSession(isolated.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', isolatedCookie)
+        .send({ legalName: 'Otro Lotes', tradeName: 'Otro', countryCode: 'MX' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', isolatedCookie)
+        .send({
+          branchName: 'Otra Sucursal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Otra Bodega',
+          locationName: 'Otra Ubicación',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', isolatedCookie)
+        .send({ name: 'Otra Caja' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/lots`)
+        .set('Cookie', isolatedCookie)
+        .expect(404);
+    });
+  });
+
+  describe('inventory serial traceability', () => {
+    beforeEach(resetIdentityData);
+
+    it('keeps one serial atomic through entry, concurrent sale, void and tenant-scoped history', async () => {
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'serial-registration')
+        .send(registrationPayload)
+        .expect(201);
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Series SA',
+          tradeName: 'Series',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Principal',
+          locationName: 'General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Principal' })
+        .expect(200);
+
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Terminal serializada',
+          sku: 'SER-001',
+          cost: '100.00',
+          price: '150.00',
+          trackSerials: true,
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      expect(productResponse.body).toMatchObject({
+        data: { trackSerials: true },
+      });
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-initial-missing')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '1',
+          reason: 'Alta inicial',
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code: string } }) =>
+          expect(body.code).toBe('INVENTORY_SERIALS_REQUIRED'),
+        );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-initial')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '1',
+          reason: 'Alta inicial',
+          serialNumbers: ['SN-0001'],
+        })
+        .expect(201);
+      const serialList = await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/serials`)
+        .set('Cookie', cookie)
+        .expect(200);
+      const serialId = (
+        serialList.body as { data: Array<{ id: string; serialNumber: string }> }
+      ).data[0].id;
+      expect(serialList.body).toMatchObject({
+        data: [{ serialNumber: 'SN-0001', status: 'AVAILABLE' }],
+        meta: { tracked: true },
+      });
+
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({ name: 'Cliente serial', dataProcessingConsent: false })
+        .expect(201);
+      const customerId = (customerResponse.body as { data: { id: string } })
+        .data.id;
+      const reservationResponse = await request(app.getHttpServer())
+        .post('/api/v1/reservations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-reservation')
+        .send({
+          customerId,
+          locationId: location.id,
+          expiresInHours: 24,
+          lines: [
+            {
+              productId,
+              quantity: '1',
+              serialNumbers: ['SN-0001'],
+            },
+          ],
+        })
+        .expect(201);
+      const reservationId = (
+        reservationResponse.body as { data: { id: string } }
+      ).data.id;
+      expect(reservationResponse.body).toMatchObject({
+        data: {
+          lines: [{ serialNumbers: ['SN-0001'] }],
+        },
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/reservations/${reservationId}/release`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-reservation-release')
+        .send({ reason: 'Liberar para venta concurrente' })
+        .expect(201);
+
+      await openCurrentCashRegister(cookie, 'serial-open-shift');
+      const attempts = await Promise.all(
+        ['serial-sale-a', 'serial-sale-b'].map((key) =>
+          request(app.getHttpServer())
+            .post('/api/v1/pos/sales')
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', key)
+            .send({
+              lines: [
+                {
+                  productId,
+                  quantity: '1',
+                  serialNumbers: ['sn-0001'],
+                },
+              ],
+              payment: { method: 'CASH', amountReceived: '150.00' },
+            }),
+        ),
+      );
+      expect(attempts.map(({ status }) => status).sort()).toEqual([201, 409]);
+      const successfulSale = attempts.find(({ status }) => status === 201)!;
+      const saleId = (successfulSale.body as { data: { id: string } }).data.id;
+
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/serials/${serialId}/history`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({ body }: { body: { data: { serial: { status: string } } } }) =>
+            expect(body.data.serial.status).toBe('SOLD'),
+        );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-sale-void')
+        .send({ reason: 'DevoluciÃ³n de prueba' })
+        .expect(201);
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/serials/${serialId}/history`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: {
+                serial: { status: string };
+                events: Array<{ toStatus: string; movement: { type: string } }>;
+              };
+            };
+          }) => {
+            expect(body.data.serial.status).toBe('AVAILABLE');
+            expect(
+              body.data.events.map(({ movement, toStatus }) => ({
+                type: movement.type,
+                toStatus,
+              })),
+            ).toEqual([
+              { type: 'INITIAL', toStatus: 'AVAILABLE' },
+              { type: 'STATE_TRANSITION', toStatus: 'RESERVED' },
+              { type: 'STATE_TRANSITION', toStatus: 'AVAILABLE' },
+              { type: 'SALE', toStatus: 'SOLD' },
+              { type: 'SALE_VOID', toStatus: 'AVAILABLE' },
+            ]);
+          },
+        );
+
+      const organization = await request(app.getHttpServer())
+        .get('/api/v1/organization/branches')
+        .set('Cookie', cookie)
+        .expect(200);
+      const origin = (
+        organization.body as {
+          data: Array<{
+            id: string;
+            warehouses: Array<{ id: string; locations: Array<{ id: string }> }>;
+          }>;
+        }
+      ).data[0];
+      const destinationResponse = await request(app.getHttpServer())
+        .post('/api/v1/organization/branches')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Sucursal Series Destino',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Series Destino',
+          locationName: 'RecepciÃ³n Series',
+          locationCode: 'SERDEST',
+        })
+        .expect(201);
+      const destination = (
+        destinationResponse.body as {
+          data: {
+            id: string;
+            warehouses: Array<{ id: string; locations: Array<{ id: string }> }>;
+          };
+        }
+      ).data;
+      const transferResponse = await request(app.getHttpServer())
+        .post('/api/v1/inventory/transfers')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-transfer-create')
+        .send({
+          destinationWarehouseId: destination.warehouses[0].id,
+          reference: 'SER-TR-001',
+          reason: 'Validar custodia serial',
+          lines: [
+            {
+              productId,
+              sourceLocationId: origin.warehouses[0].locations[0].id,
+              destinationLocationId: destination.warehouses[0].locations[0].id,
+              quantity: '1',
+              serialNumbers: ['SN-0001'],
+            },
+          ],
+        })
+        .expect(201);
+      const transfer = transferResponse.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${transfer.data.id}/dispatch`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-transfer-dispatch')
+        .expect(200);
+      await request(app.getHttpServer())
+        .patch('/api/v1/auth/sessions/current/context')
+        .set('Cookie', cookie)
+        .send({
+          branchId: destination.id,
+          warehouseId: destination.warehouses[0].id,
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/transfers/${transfer.data.id}/receipts`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-transfer-receipt')
+        .send({
+          lines: [
+            {
+              transferLineId: transfer.data.lines[0].id,
+              receivedQuantity: '1',
+              discrepancyQuantity: '0',
+              receivedSerialNumbers: ['SN-0001'],
+            },
+          ],
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/serials/${serialId}/history`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: {
+                serial: { status: string; currentLocation: { id: string } };
+                events: Array<{ movement: { type: string } }>;
+              };
+            };
+          }) => {
+            expect(body.data.serial).toMatchObject({
+              status: 'AVAILABLE',
+              currentLocation: {
+                id: destination.warehouses[0].locations[0].id,
+              },
+            });
+            expect(
+              body.data.events.slice(-2).map(({ movement }) => movement.type),
+            ).toEqual(['TRANSFER_OUT', 'TRANSFER_RECEIPT']);
+          },
+        );
+
+      const other = {
+        organizationName: 'Otro tenant series',
+        email: 'other-serial@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'serial-other-registration')
+        .send(other)
+        .expect(201);
+      const otherCookie = await createPersistedSession(other.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Otro Series',
+          tradeName: 'Otro',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Otra Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Otra Bodega',
+          locationName: 'Otra General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Otra Caja Series' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/serials/${serialId}/history`)
+        .set('Cookie', otherCookie)
+        .expect(404);
+    });
+  });
+
+  describe('inventory reconciliation', () => {
+    beforeEach(resetIdentityData);
+
+    it('is tenant-scoped, idempotent and blocks operations until a critical mismatch is resolved', async () => {
+      await registerAccount('reconciliation-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Reconciliación SA',
+          tradeName: 'Reconciliación',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Principal',
+          locationName: 'General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Principal' })
+        .expect(200);
+      const product = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto conciliable',
+          sku: 'REC-001',
+          cost: '10',
+          price: '15',
+          trackLots: true,
+          trackSerials: true,
+        })
+        .expect(201);
+      const productId = (product.body as { data: { id: string } }).data.id;
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reconciliation-initial')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '2',
+          reason: 'Saldo inicial conciliado',
+          lotCode: 'LOT-REC',
+          serialNumbers: ['REC-SN-001', 'REC-SN-002'],
+        })
+        .expect(201);
+
+      const healthy = await request(app.getHttpServer())
+        .post('/api/v1/inventory/reconciliations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reconciliation-healthy')
+        .send({})
+        .expect(201);
+      expect(healthy.body).toMatchObject({
+        data: {
+          overallStatus: 'HEALTHY',
+          summary: { findings: 0, warnings: 0, critical: 0 },
+          policy: { releaseBlocked: false, operationsBlocked: false },
+          findings: [],
+        },
+        meta: { idempotentReplay: false },
+      });
+      const healthyBody = healthy.body as { data: { id: string } };
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/reconciliations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reconciliation-healthy')
+        .send({})
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: { id: string }; meta: { idempotentReplay: boolean } };
+          }) => {
+            expect(body.data.id).toBe(healthyBody.data.id);
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+
+      await dataSource.query(
+        `UPDATE inventory_balances
+         SET quantity = quantity + 1, available_quantity = available_quantity + 1
+         WHERE product_id = ? AND location_id = ?`,
+        [productId, location.id],
+      );
+      const critical = await request(app.getHttpServer())
+        .post('/api/v1/inventory/reconciliations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reconciliation-critical')
+        .send({})
+        .expect(201);
+      expect(critical.body).toMatchObject({
+        data: {
+          overallStatus: 'CRITICAL',
+          policy: { releaseBlocked: true, operationsBlocked: true },
+        },
+      });
+      const criticalBody = critical.body as {
+        data: { id: string; findings: Array<{ code: string }> };
+      };
+      expect(criticalBody.data.findings.map(({ code }) => code)).toEqual(
+        expect.arrayContaining([
+          'BALANCE_MOVEMENT_MISMATCH',
+          'VALUATION_QUANTITY_MISMATCH',
+          'LOT_BALANCE_MISMATCH',
+          'SERIAL_STATE_MISMATCH',
+        ]),
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reconciliation-blocked-movement')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'ENTRY',
+          quantity: '1',
+          reason: 'Debe bloquearse',
+          reference: 'REC-BLOCKED',
+          lotCode: 'LOT-REC',
+          serialNumbers: ['REC-SN-003'],
+        })
+        .expect(409)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { code: string; reconciliationRunId: string };
+          }) => {
+            expect(body.code).toBe('INVENTORY_RECONCILIATION_BLOCKED');
+            expect(body.reconciliationRunId).toBe(criticalBody.data.id);
+          },
+        );
+
+      const other = {
+        organizationName: 'Otro tenant reconciliación',
+        email: 'other-reconciliation@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'reconciliation-other-registration')
+        .send(other)
+        .expect(201);
+      const otherCookie = await createPersistedSession(other.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Otro tenant',
+          tradeName: 'Otro',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Otra principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Otra bodega',
+          locationName: 'Otra general',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Otra caja' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/reconciliations/latest')
+        .set('Cookie', otherCookie)
+        .expect(200)
+        .expect({ data: null, meta: { apiVersion: '1' } });
+
+      await dataSource.query(
+        `UPDATE inventory_balances
+         SET quantity = quantity - 1, available_quantity = available_quantity - 1
+         WHERE product_id = ? AND location_id = ?`,
+        [productId, location.id],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/reconciliations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reconciliation-restored')
+        .send({})
+        .expect(201)
+        .expect(({ body }: { body: { data: { overallStatus: string } } }) =>
+          expect(body.data.overallStatus).toBe('HEALTHY'),
+        );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'reconciliation-unblocked-movement')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'ENTRY',
+          quantity: '1',
+          reason: 'Operación desbloqueada',
+          reference: 'REC-UNBLOCKED',
+          lotCode: 'LOT-REC',
+          serialNumbers: ['REC-SN-003'],
+        })
+        .expect(201);
     });
   });
 

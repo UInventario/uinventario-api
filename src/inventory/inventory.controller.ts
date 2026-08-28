@@ -29,6 +29,12 @@ import { AuditService } from '../audit/audit.service';
 import { PreviewInventoryImportDto } from './dto/preview-inventory-import.dto';
 import { InventoryImportService } from './inventory-import.service';
 import type { InventoryImportFile } from './inventory-import.types';
+import { InventoryValuationPolicyService } from './inventory-valuation-policy.service';
+import {
+  ChangeInventoryValuationPolicyDto,
+  PreviewInventoryValuationPolicyDto,
+} from './dto/change-inventory-valuation-policy.dto';
+import { InventoryReconciliationService } from './inventory-reconciliation.service';
 
 @Controller('inventory')
 @UseGuards(SessionGuard, PermissionGuard)
@@ -37,7 +43,72 @@ export class InventoryController {
     private readonly inventory: InventoryService,
     private readonly audit: AuditService,
     private readonly inventoryImports: InventoryImportService,
+    private readonly valuationPolicy: InventoryValuationPolicyService,
+    private readonly reconciliation: InventoryReconciliationService,
   ) {}
+
+  @Get('reconciliations/latest')
+  @RequirePermissions('INVENTORY_VIEW')
+  latestReconciliation(@Req() request: AuthenticatedRequest) {
+    return this.reconciliation.latest(request.principal.tenant.id);
+  }
+
+  @Get('reconciliations/:runId')
+  @RequirePermissions('INVENTORY_VIEW')
+  getReconciliation(
+    @Req() request: AuthenticatedRequest,
+    @Param('runId', new ParseUUIDPipe()) runId: string,
+  ) {
+    return this.reconciliation.get(request.principal.tenant.id, runId);
+  }
+
+  @Post('reconciliations')
+  @RequirePermissions('INVENTORY_ADJUST')
+  runReconciliation(
+    @Req() request: AuthenticatedRequest,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+  ) {
+    return this.reconciliation.run({
+      tenantId: request.principal.tenant.id,
+      userId: request.principal.user.id,
+      idempotencyKey,
+      correlationId: request.requestId!,
+    });
+  }
+
+  @Get('valuation-policy')
+  @RequirePermissions('INVENTORY_VIEW')
+  getValuationPolicy(@Req() request: AuthenticatedRequest) {
+    return this.valuationPolicy.current(request.principal.tenant.id);
+  }
+
+  @Post('valuation-policy/preview')
+  @RequirePermissions('INVENTORY_VALUATION_MANAGE')
+  previewValuationPolicy(
+    @Req() request: AuthenticatedRequest,
+    @Body() dto: PreviewInventoryValuationPolicyDto,
+  ) {
+    return this.valuationPolicy.preview(
+      request.principal.tenant.id,
+      dto.targetMethod,
+    );
+  }
+
+  @Post('valuation-policy/changes')
+  @RequirePermissions('INVENTORY_VALUATION_MANAGE')
+  changeValuationPolicy(
+    @Req() request: AuthenticatedRequest,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: ChangeInventoryValuationPolicyDto,
+  ) {
+    return this.valuationPolicy.change({
+      tenantId: request.principal.tenant.id,
+      userId: request.principal.user.id,
+      idempotencyKey,
+      correlationId: request.requestId!,
+      dto,
+    });
+  }
 
   @Post('imports/preview')
   @RequirePermissions('INVENTORY_ADJUST')
@@ -145,6 +216,58 @@ export class InventoryController {
       request.principal.context.warehouse!.id,
       productId,
       query.locationId,
+    );
+  }
+
+  @Get('products/:productId/lots')
+  @RequirePermissions('INVENTORY_VIEW')
+  listLots(
+    @Req() request: AuthenticatedRequest,
+    @Param('productId', new ParseUUIDPipe()) productId: string,
+  ) {
+    return this.inventory.listLots(
+      request.principal.tenant.id,
+      request.principal.context.warehouse!.id,
+      productId,
+    );
+  }
+
+  @Get('products/:productId/serials')
+  @RequirePermissions('INVENTORY_VIEW')
+  listSerials(
+    @Req() request: AuthenticatedRequest,
+    @Param('productId', new ParseUUIDPipe()) productId: string,
+  ) {
+    return this.inventory.listSerials(
+      request.principal.tenant.id,
+      request.principal.context.warehouse!.id,
+      productId,
+    );
+  }
+
+  @Get('serials/:serialId/history')
+  @RequirePermissions('INVENTORY_VIEW')
+  serialHistory(
+    @Req() request: AuthenticatedRequest,
+    @Param('serialId', new ParseUUIDPipe()) serialId: string,
+  ) {
+    return this.inventory.serialHistory(
+      request.principal.tenant.id,
+      request.principal.context.warehouse!.id,
+      serialId,
+    );
+  }
+
+  @Get('products/:productId/fifo-layers')
+  @RequirePermissions('INVENTORY_VIEW')
+  listFifoLayers(
+    @Req() request: AuthenticatedRequest,
+    @Param('productId', new ParseUUIDPipe()) productId: string,
+  ) {
+    return this.inventory.listFifoLayers(
+      request.principal.tenant.id,
+      request.principal.context.warehouse!.id,
+      productId,
     );
   }
 

@@ -4,6 +4,8 @@ export interface PosProductSnapshot {
   sku: string;
   price: string;
   active: boolean;
+  trackLots: boolean;
+  trackSerials: boolean;
   availableQuantity: string;
 }
 
@@ -19,6 +21,8 @@ export interface PosCartQuoteResponse {
     lines: Array<{
       product: { id: string; name: string; sku: string };
       quantity: string;
+      lotId: string | null;
+      serialNumbers: string[];
       availableQuantity: string;
       unitPrice: string;
       subtotal: string;

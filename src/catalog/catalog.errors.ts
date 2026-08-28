@@ -21,3 +21,9 @@ export class ProductCodeAmbiguousError extends Error {
     super('PRODUCT_CODE_AMBIGUOUS');
   }
 }
+
+export class ProductLotTrackingLockedError extends Error {
+  constructor() {
+    super('PRODUCT_LOT_TRACKING_LOCKED');
+  }
+}

@@ -23,6 +23,10 @@ import type {
   InventoryImportRowError,
 } from './inventory-import.types';
 import type { InventoryStockState } from './inventory.types';
+import {
+  InventorySerialQuantityError,
+  InventorySerialRequiredError,
+} from './inventory-serial-tracking';
 
 const REQUIRED_HEADERS = [
   'sku',
@@ -148,6 +152,16 @@ export class InventoryImportService {
         throw new ConflictException({
           code: 'IDEMPOTENCY_KEY_REUSED',
           message: 'La clave de idempotencia ya fue usada por otro lote.',
+        });
+      }
+      if (
+        error instanceof InventorySerialRequiredError ||
+        error instanceof InventorySerialQuantityError
+      ) {
+        throw new BadRequestException({
+          code: 'INVENTORY_SERIALS_REQUIRED',
+          message:
+            'La importaciÃ³n no puede ajustar productos serializados sin identificar sus unidades.',
         });
       }
       throw error;

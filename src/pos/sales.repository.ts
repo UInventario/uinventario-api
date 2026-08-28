@@ -1,6 +1,9 @@
 import { Injectable } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
+import { applyInventoryValuation } from '../inventory/inventory-valuation';
+import { applyInventoryLotTracking } from '../inventory/inventory-lot-tracking';
+import { applyInventorySerialTracking } from '../inventory/inventory-serial-tracking';
 import {
   PosIdempotencyConflictError,
   PaymentReferenceConflictError,
@@ -57,6 +60,7 @@ interface StockAllocation {
   resultingAvailableQuantity: string;
   resultingReservedQuantity: string;
   reservationLineId?: string;
+  serialNumbers?: string[];
 }
 
 @Injectable()
@@ -357,6 +361,7 @@ export class SalesRepository {
               this.toQuantityUnits(balance.quantity) + restored;
             const resultingAvailable =
               this.toQuantityUnits(balance.available_quantity) + restored;
+            const voidMovementId = randomUUID();
             await manager.query(
               `UPDATE inventory_balances
                SET quantity = ?, available_quantity = ?
@@ -386,7 +391,7 @@ export class SalesRepository {
                  request_fingerprint, created_by_user_id, sale_id, sale_line_id)
                VALUES (?, ?, ?, ?, 'SALE_VOID', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
-                randomUUID(),
+                voidMovementId,
                 input.tenantId,
                 movement.product_id,
                 movement.location_id,
@@ -401,6 +406,9 @@ export class SalesRepository {
                 movement.sale_line_id,
               ],
             );
+            await applyInventoryValuation(manager, voidMovementId);
+            await applyInventoryLotTracking(manager, voidMovementId);
+            await applyInventorySerialTracking(manager, voidMovementId);
           }
           const paymentUpdate = await manager.query<{ affectedRows?: number }>(
             `UPDATE sale_payments
@@ -590,21 +598,60 @@ export class SalesRepository {
           for (const line of [...input.quote.lines].sort((left, right) =>
             left.product.id.localeCompare(right.product.id),
           )) {
+            const serialsByLocation = new Map<string, string[]>();
+            if (line.serialNumbers.length > 0) {
+              const placeholders = line.serialNumbers.map(() => '?').join(',');
+              const serialRows = await manager.query<
+                Array<{ serial_number: string; current_location_id: string }>
+              >(
+                `SELECT serial_number, current_location_id FROM inventory_serials
+                 WHERE tenant_id = ? AND product_id = ?
+                   AND status = ?
+                   AND normalized_serial IN (${placeholders})
+                 ORDER BY normalized_serial FOR UPDATE`,
+                [
+                  input.tenantId,
+                  line.product.id,
+                  input.reservationId ? 'RESERVED' : 'AVAILABLE',
+                  ...line.serialNumbers.map((value) =>
+                    value.trim().toUpperCase(),
+                  ),
+                ],
+              );
+              for (const serial of serialRows) {
+                serialsByLocation.set(serial.current_location_id, [
+                  ...(serialsByLocation.get(serial.current_location_id) ?? []),
+                  serial.serial_number,
+                ]);
+              }
+            }
             const balances = await manager.query<
               Array<{
                 location_id: string;
                 quantity: string;
                 available_quantity: string;
                 reserved_quantity: string;
+                lot_quantity: string | null;
               }>
             >(
-              `SELECT ib.location_id, ib.quantity, ib.available_quantity, ib.reserved_quantity
+              `SELECT ib.location_id, ib.quantity, ib.available_quantity, ib.reserved_quantity,
+                      CASE WHEN ? IS NULL THEN NULL ELSE COALESCE((
+                        SELECT ilb.quantity FROM inventory_lot_balances ilb
+                        INNER JOIN inventory_lots il
+                          ON il.id = ilb.lot_id AND il.tenant_id = ilb.tenant_id
+                        WHERE ilb.tenant_id = ib.tenant_id
+                          AND ilb.location_id = ib.location_id
+                          AND il.product_id = ib.product_id AND il.id = ?
+                      ), 0) END AS lot_quantity
+
              FROM inventory_balances ib
              INNER JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
              WHERE ib.tenant_id = ? AND ib.product_id = ? AND l.warehouse_id = ?
                AND (? IS NULL OR ib.location_id = ?)
              ORDER BY l.created_at, l.id FOR UPDATE`,
               [
+                line.lotId,
+                line.lotId,
                 input.tenantId,
                 line.product.id,
                 input.quote.context.warehouse.id,
@@ -621,6 +668,10 @@ export class SalesRepository {
                   ? balance.reserved_quantity
                   : balance.available_quantity,
               );
+              const lotAvailable =
+                line.lotId && balance.lot_quantity !== null
+                  ? this.toQuantityUnits(balance.lot_quantity)
+                  : available;
               const total = this.toQuantityUnits(balance.quantity);
               const currentAvailable = this.toQuantityUnits(
                 balance.available_quantity,
@@ -628,7 +679,20 @@ export class SalesRepository {
               const currentReserved = this.toQuantityUnits(
                 balance.reserved_quantity,
               );
-              const taken = available < remaining ? available : remaining;
+              const effectiveAvailable =
+                available < lotAvailable ? available : lotAvailable;
+              const serialNumbers = serialsByLocation.get(balance.location_id);
+              const serialAvailable = line.serialNumbers.length
+                ? BigInt(serialNumbers?.length ?? 0) * 1000n
+                : effectiveAvailable;
+              const selectableAvailable =
+                effectiveAvailable < serialAvailable
+                  ? effectiveAvailable
+                  : serialAvailable;
+              const taken =
+                selectableAvailable < remaining
+                  ? selectableAvailable
+                  : remaining;
               if (taken === 0n) continue;
               lineAllocations.push({
                 locationId: balance.location_id,
@@ -645,7 +709,14 @@ export class SalesRepository {
                     : currentReserved,
                 ),
                 reservationLineId: reservationLines.get(line.product.id)?.id,
+                serialNumbers: serialNumbers?.slice(0, Number(taken / 1000n)),
               });
+              if (serialNumbers) {
+                serialsByLocation.set(
+                  balance.location_id,
+                  serialNumbers.slice(Number(taken / 1000n)),
+                );
+              }
               remaining -= taken;
             }
             allocations.set(line.product.id, lineAllocations);
@@ -723,6 +794,7 @@ export class SalesRepository {
             for (const [allocationIndex, allocation] of (
               allocations.get(line.product.id) ?? []
             ).entries()) {
+              const movementId = randomUUID();
               await manager.query(
                 `UPDATE inventory_balances
                  SET quantity = ?, available_quantity = ?, reserved_quantity = ?
@@ -756,7 +828,7 @@ export class SalesRepository {
                  reservation_id, reservation_line_id)
                VALUES (?, ?, ?, ?, 'SALE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
-                  randomUUID(),
+                  movementId,
                   input.tenantId,
                   line.product.id,
                   allocation.locationId,
@@ -773,6 +845,13 @@ export class SalesRepository {
                   allocation.reservationLineId ?? null,
                 ],
               );
+              await applyInventoryValuation(manager, movementId);
+              await applyInventoryLotTracking(manager, movementId, {
+                preferredLotId: line.lotId ?? undefined,
+              });
+              await applyInventorySerialTracking(manager, movementId, {
+                serialNumbers: allocation.serialNumbers,
+              });
             }
           }
           for (const payment of input.payments) {

@@ -14,6 +14,9 @@ import {
   InventoryTransferDiscrepancyReasonRequiredError,
   InventoryTransferReceiptExceedsPendingError,
 } from './inventory-transfer.errors';
+import { applyInventoryValuation } from './inventory-valuation';
+import { applyInventoryLotTracking } from './inventory-lot-tracking';
+import { applyInventorySerialTracking } from './inventory-serial-tracking';
 import {
   InventoryTransferData,
   InventoryTransferLineData,
@@ -68,6 +71,7 @@ interface TransferLineRow {
   quantity: string;
   received_quantity: string;
   discrepancy_quantity: string;
+  serial_numbers: string | string[] | null;
 }
 
 interface ReceiptHeaderRow {
@@ -144,6 +148,7 @@ export class InventoryTransferRepository {
     const normalizedLines = input.dto.lines.map((line) => ({
       ...line,
       quantity: this.fromUnits(this.toUnits(line.quantity)),
+      serialNumbers: (line.serialNumbers ?? []).map((value) => value.trim()),
     }));
     const fingerprint = createHash('sha256')
       .update(
@@ -217,8 +222,8 @@ export class InventoryTransferRepository {
             await manager.query(
               `INSERT INTO inventory_transfer_lines
               (id, tenant_id, transfer_id, line_number, product_id,
-               source_location_id, destination_location_id, quantity)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+               source_location_id, destination_location_id, quantity, serial_numbers)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 randomUUID(),
                 input.tenantId,
@@ -228,6 +233,7 @@ export class InventoryTransferRepository {
                 line.sourceLocationId,
                 line.destinationLocationId,
                 line.quantity,
+                JSON.stringify(line.serialNumbers),
               ],
             );
           }
@@ -460,6 +466,12 @@ export class InventoryTransferRepository {
       discrepancyQuantity: this.fromUnits(
         this.toUnits(line.discrepancyQuantity),
       ),
+      receivedSerialNumbers: (line.receivedSerialNumbers ?? []).map((value) =>
+        value.trim(),
+      ),
+      discrepancySerialNumbers: (line.discrepancySerialNumbers ?? []).map(
+        (value) => value.trim(),
+      ),
     }));
     if (
       normalizedLines.every(
@@ -556,7 +568,13 @@ export class InventoryTransferRepository {
               this.toUnits(transferLine.discrepancy_quantity);
             if (processed > pending)
               throw new InventoryTransferReceiptExceedsPendingError();
-            return { transferLine, received, discrepancy };
+            return {
+              transferLine,
+              received,
+              discrepancy,
+              receivedSerialNumbers: line.receivedSerialNumbers,
+              discrepancySerialNumbers: line.discrepancySerialNumbers,
+            };
           });
 
           const balanceKeys = [
@@ -672,6 +690,7 @@ export class InventoryTransferRepository {
                 resultingQuantity: balance.quantity,
                 reason: `Recepción ${header.reference}`,
                 reference: header.reference,
+                serialNumbers: item.receivedSerialNumbers,
               });
             }
             if (item.discrepancy > 0n) {
@@ -688,6 +707,7 @@ export class InventoryTransferRepository {
                 resultingQuantity: balance.quantity,
                 reason: input.dto.discrepancyReason!,
                 reference: header.reference,
+                serialNumbers: item.discrepancySerialNumbers,
               });
             }
           }
@@ -889,7 +909,7 @@ export class InventoryTransferRepository {
     transferId: string,
   ): Promise<TransferLineRow[]> {
     return manager.query<TransferLineRow[]>(
-      `SELECT tl.id, tl.line_number, tl.quantity,
+      `SELECT tl.id, tl.line_number, tl.quantity, tl.serial_numbers,
               tl.received_quantity, tl.discrepancy_quantity,
               p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
               p.active AS product_active,
@@ -1100,6 +1120,7 @@ export class InventoryTransferRepository {
     resultingQuantity: string;
     reason: string;
     reference: string;
+    serialNumbers?: string[];
   }): Promise<void> {
     const movementKey = `transfer:${input.transferId}:${input.line.line_number}:${input.type}`;
     const fingerprint = createHash('sha256')
@@ -1113,6 +1134,7 @@ export class InventoryTransferRepository {
         }),
       )
       .digest('hex');
+    const movementId = randomUUID();
     await input.manager.query(
       `INSERT INTO inventory_movements
         (id, tenant_id, product_id, location_id, type, quantity_change,
@@ -1120,7 +1142,7 @@ export class InventoryTransferRepository {
          request_fingerprint, created_by_user_id, transfer_id, transfer_line_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        randomUUID(),
+        movementId,
         input.tenantId,
         input.line.product_id,
         input.locationId,
@@ -1136,6 +1158,15 @@ export class InventoryTransferRepository {
         input.line.id,
       ],
     );
+    await applyInventoryValuation(input.manager, movementId);
+    await applyInventoryLotTracking(input.manager, movementId);
+    await applyInventorySerialTracking(input.manager, movementId, {
+      serialNumbers:
+        input.type === 'TRANSFER_OUT'
+          ? this.serialNumbers(input.line.serial_numbers)
+          : undefined,
+      destinationLocationId: input.line.destination_location_id,
+    });
   }
 
   private async insertReceiptMovement(input: {
@@ -1151,6 +1182,7 @@ export class InventoryTransferRepository {
     resultingQuantity: bigint;
     reason: string;
     reference: string;
+    serialNumbers?: string[];
   }): Promise<void> {
     const movementKey = `receipt:${input.receiptId}:${input.transferLine.line_number}:${input.type}`;
     const isReceipt = input.type === 'TRANSFER_RECEIPT';
@@ -1167,6 +1199,7 @@ export class InventoryTransferRepository {
         }),
       )
       .digest('hex');
+    const movementId = randomUUID();
     await input.manager.query(
       `INSERT INTO inventory_movements
         (id, tenant_id, product_id, location_id, type, from_state, to_state,
@@ -1175,7 +1208,7 @@ export class InventoryTransferRepository {
          transfer_id, transfer_line_id, receipt_id, receipt_line_id)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        randomUUID(),
+        movementId,
         input.tenantId,
         input.transferLine.product_id,
         input.transferLine.destination_location_id,
@@ -1196,6 +1229,11 @@ export class InventoryTransferRepository {
         input.receiptLineId,
       ],
     );
+    await applyInventoryValuation(input.manager, movementId);
+    await applyInventoryLotTracking(input.manager, movementId);
+    await applyInventorySerialTracking(input.manager, movementId, {
+      serialNumbers: input.serialNumbers,
+    });
   }
 
   private toLine(line: TransferLineRow): InventoryTransferLineData {
@@ -1224,7 +1262,17 @@ export class InventoryTransferRepository {
       receivedQuantity: this.fromUnits(received),
       discrepancyQuantity: this.fromUnits(discrepancy),
       pendingQuantity: this.fromUnits(pending),
+      serialNumbers: this.serialNumbers(line.serial_numbers),
     };
+  }
+
+  private serialNumbers(value: string | string[] | null): string[] {
+    if (Array.isArray(value)) return value;
+    if (!value) return [];
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === 'string')
+      : [];
   }
 
   private toUnits(value: string): bigint {

@@ -1,6 +1,9 @@
 import { Injectable } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
+import { applyInventoryValuation } from '../inventory/inventory-valuation';
+import { applyInventoryLotTracking } from '../inventory/inventory-lot-tracking';
+import { applyInventorySerialTracking } from '../inventory/inventory-serial-tracking';
 import { ReturnPurchaseReceiptDto } from './dto/return-purchase-receipt.dto';
 import {
   InvalidPurchaseReturnError,
@@ -42,6 +45,7 @@ export class PurchaseReturnRepository {
     const lines = input.dto.lines.map((line) => ({
       purchaseReceiptLineId: line.purchaseReceiptLineId,
       returnedQuantity: this.fromUnits(this.toUnits(line.returnedQuantity)),
+      serialNumbers: line.serialNumbers ?? [],
     }));
     const fingerprint = createHash('sha256')
       .update(
@@ -115,6 +119,7 @@ export class PurchaseReturnRepository {
             receiptLine: ReceiptLineRow;
             returned: bigint;
             totalCost: string;
+            serialNumbers: string[];
           }>;
           for (const line of lines) {
             const receiptLine = byId.get(line.purchaseReceiptLineId);
@@ -139,6 +144,7 @@ export class PurchaseReturnRepository {
               receiptLine,
               returned,
               totalCost: this.lineCost(returned, receiptLine.unit_cost),
+              serialNumbers: line.serialNumbers,
             });
           }
 
@@ -194,6 +200,7 @@ export class PurchaseReturnRepository {
               this.toUnits(balance.quantity) - item.returned;
             const resultingAvailable =
               this.toUnits(balance.available_quantity) - item.returned;
+            const movementId = randomUUID();
             await manager.query(
               `UPDATE inventory_balances
              SET quantity = ?, available_quantity = ?
@@ -242,7 +249,7 @@ export class PurchaseReturnRepository {
                purchase_return_line_id)
              VALUES (?, ?, ?, ?, 'SUPPLIER_RETURN', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
-                randomUUID(),
+                movementId,
                 input.tenantId,
                 item.receiptLine.product_id,
                 receipt.location_id,
@@ -257,6 +264,11 @@ export class PurchaseReturnRepository {
                 returnLineId,
               ],
             );
+            await applyInventoryValuation(manager, movementId);
+            await applyInventoryLotTracking(manager, movementId);
+            await applyInventorySerialTracking(manager, movementId, {
+              serialNumbers: item.serialNumbers,
+            });
           }
           return { returnId, replay: false };
         },

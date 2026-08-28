@@ -9,6 +9,9 @@ import {
   InventoryImportNotFoundError,
   InventoryImportStaleError,
 } from './inventory-import.errors';
+import { applyInventoryValuation } from './inventory-valuation';
+import { applyInventoryLotTracking } from './inventory-lot-tracking';
+import { applyInventorySerialTracking } from './inventory-serial-tracking';
 import type {
   InventoryImportPreviewRow,
   InventoryImportResponse,
@@ -371,6 +374,7 @@ export class InventoryImportRepository {
               ],
             );
             if (!target) throw new InventoryImportStaleError();
+            const movementId = randomUUID();
             await manager.query(
               `INSERT INTO inventory_balances (tenant_id, product_id, location_id, quantity)
            VALUES (?, ?, ?, 0) ON DUPLICATE KEY UPDATE quantity = quantity`,
@@ -435,7 +439,7 @@ export class InventoryImportRepository {
              inventory_import_row_id)
            VALUES (?, ?, ?, ?, 'IMPORT', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
-                randomUUID(),
+                movementId,
                 input.tenantId,
                 row.product.id,
                 row.location.id,
@@ -450,6 +454,9 @@ export class InventoryImportRepository {
                 row.id,
               ],
             );
+            await applyInventoryValuation(manager, movementId);
+            await applyInventoryLotTracking(manager, movementId);
+            await applyInventorySerialTracking(manager, movementId);
             movementCount += 1;
           }
           await manager.query(

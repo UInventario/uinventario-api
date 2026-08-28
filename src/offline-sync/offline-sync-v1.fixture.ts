@@ -40,6 +40,12 @@ export const OFFLINE_BOOTSTRAP_RESPONSE_V1_FIXTURE = {
       permissions: ['SALES_MANAGE', 'INVENTORY_VIEW'],
     },
   },
+  valuationPolicy: {
+    method: 'MOVING_AVERAGE',
+    version: 1,
+    effectiveAt: '2026-08-27T19:00:00.000Z',
+    migrationRule: 'INITIAL_DEFAULT',
+  },
   posPolicy: {
     kind: 'POS_POLICY',
     id: '60000000-0000-4000-8000-000000000001',

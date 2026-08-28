@@ -25,7 +25,17 @@ import {
   InventoryMovementHistoryItem,
   InventoryMovementData,
   InventoryStockItem,
+  InventoryLotData,
+  InventoryLotAllocation,
+  InventoryFifoLayerData,
+  InventoryFifoAllocation,
+  InventorySerialData,
+  InventorySerialEventData,
 } from './inventory.types';
+import { applyInventoryValuation } from './inventory-valuation';
+import { applyInventoryLotTracking } from './inventory-lot-tracking';
+import { applyInventorySerialTracking } from './inventory-serial-tracking';
+import type { InventoryValuationMethod } from './inventory-valuation-policy.types';
 
 interface MovementRow {
   id: string;
@@ -45,6 +55,16 @@ interface MovementRow {
   from_state: InventoryStockState | null;
   to_state: InventoryStockState | null;
   state_quantity: string | null;
+  unit_cost: string | null;
+  value_change: string | null;
+  resulting_inventory_value: string | null;
+  average_unit_cost: string | null;
+  valuation_method: import('./inventory-valuation-policy.types').InventoryValuationMethod;
+  valuation_policy_version: number | string;
+  valuation_effective_at: Date | string;
+  fifo_unit_cost: string | null;
+  fifo_value_change: string | null;
+  fifo_resulting_inventory_value: string | null;
 }
 
 interface CountRow {
@@ -79,6 +99,487 @@ export class InventoryRepository {
        WHERE tenant_id = ? AND warehouse_id = ? AND active = TRUE ORDER BY name, id`,
       [tenantId, warehouseId],
     );
+  }
+
+  async listSerials(
+    tenantId: string,
+    warehouseId: string,
+    productId: string,
+  ): Promise<{ items: InventorySerialData[]; tracked: boolean }> {
+    const [product] = await this.dataSource.query<
+      Array<{ id: string; name: string; sku: string; track_serials: boolean }>
+    >(
+      `SELECT id, name, sku, track_serials FROM products
+       WHERE id = ? AND tenant_id = ? LIMIT 1`,
+      [productId, tenantId],
+    );
+    if (!product) throw new InventoryTargetNotFoundError();
+    const rows = await this.dataSource.query<
+      Array<{
+        id: string;
+        serial_number: string;
+        status: InventorySerialData['status'];
+        created_at: Date | string;
+        updated_at: Date | string;
+        location_id: string | null;
+        location_name: string | null;
+        location_code: string | null;
+      }>
+    >(
+      `SELECT serial.id, serial.serial_number, serial.status,
+              serial.created_at, serial.updated_at,
+              location.id AS location_id, location.name AS location_name,
+              location.code AS location_code
+       FROM inventory_serials serial
+       LEFT JOIN locations location
+         ON location.id = serial.current_location_id
+        AND location.tenant_id = serial.tenant_id
+       WHERE serial.tenant_id = ? AND serial.product_id = ?
+         AND (
+           location.warehouse_id = ? OR EXISTS (
+             SELECT 1 FROM inventory_serial_events event
+             LEFT JOIN locations source_location
+               ON source_location.id = event.from_location_id
+              AND source_location.tenant_id = event.tenant_id
+             LEFT JOIN locations target_location
+               ON target_location.id = event.to_location_id
+              AND target_location.tenant_id = event.tenant_id
+             WHERE event.tenant_id = serial.tenant_id
+               AND event.serial_id = serial.id
+               AND (source_location.warehouse_id = ? OR target_location.warehouse_id = ?)
+           )
+         )
+       ORDER BY serial.updated_at DESC, serial.normalized_serial
+       LIMIT 500`,
+      [tenantId, productId, warehouseId, warehouseId, warehouseId],
+    );
+    return {
+      tracked: Boolean(product.track_serials),
+      items: rows.map((row) => ({
+        id: row.id,
+        serialNumber: row.serial_number,
+        status: row.status,
+        product: { id: product.id, name: product.name, sku: product.sku },
+        currentLocation:
+          row.location_id && row.location_name && row.location_code
+            ? {
+                id: row.location_id,
+                name: row.location_name,
+                code: row.location_code,
+              }
+            : null,
+        createdAt: new Date(row.created_at).toISOString(),
+        updatedAt: new Date(row.updated_at).toISOString(),
+      })),
+    };
+  }
+
+  async serialHistory(
+    tenantId: string,
+    warehouseId: string,
+    serialId: string,
+  ): Promise<{
+    serial: InventorySerialData;
+    events: InventorySerialEventData[];
+  }> {
+    const [header] = await this.dataSource.query<Array<{ product_id: string }>>(
+      `SELECT serial.product_id FROM inventory_serials serial
+       WHERE serial.id = ? AND serial.tenant_id = ?
+         AND EXISTS (
+           SELECT 1 FROM inventory_serial_events event
+           LEFT JOIN locations source_location
+             ON source_location.id = event.from_location_id
+            AND source_location.tenant_id = event.tenant_id
+           LEFT JOIN locations target_location
+             ON target_location.id = event.to_location_id
+            AND target_location.tenant_id = event.tenant_id
+           WHERE event.serial_id = serial.id AND event.tenant_id = serial.tenant_id
+             AND (source_location.warehouse_id = ? OR target_location.warehouse_id = ?)
+         ) LIMIT 1`,
+      [serialId, tenantId, warehouseId, warehouseId],
+    );
+    if (!header) throw new InventoryTargetNotFoundError();
+    const listed = await this.listSerials(
+      tenantId,
+      warehouseId,
+      header.product_id,
+    );
+    const serial = listed.items.find((item) => item.id === serialId);
+    if (!serial) throw new InventoryTargetNotFoundError();
+    const rows = await this.dataSource.query<
+      Array<{
+        id: string;
+        from_status: InventorySerialData['status'] | null;
+        to_status: InventorySerialData['status'];
+        created_at: Date | string;
+        movement_id: string;
+        movement_type: InventoryMovementType;
+        reference: string | null;
+        reason: string;
+        from_location_id: string | null;
+        from_location_name: string | null;
+        from_location_code: string | null;
+        to_location_id: string | null;
+        to_location_name: string | null;
+        to_location_code: string | null;
+        user_id: string;
+        user_email: string;
+      }>
+    >(
+      `SELECT event.id, event.from_status, event.to_status, event.created_at,
+              movement.id AS movement_id, movement.type AS movement_type,
+              movement.reference, movement.reason,
+              source.id AS from_location_id, source.name AS from_location_name,
+              source.code AS from_location_code,
+              target.id AS to_location_id, target.name AS to_location_name,
+              target.code AS to_location_code,
+              user.id AS user_id, user.email AS user_email
+       FROM inventory_serial_events event
+       INNER JOIN inventory_movements movement ON movement.id = event.movement_id
+       INNER JOIN users user
+         ON user.id = event.created_by_user_id AND user.tenant_id = event.tenant_id
+       LEFT JOIN locations source
+         ON source.id = event.from_location_id AND source.tenant_id = event.tenant_id
+       LEFT JOIN locations target
+         ON target.id = event.to_location_id AND target.tenant_id = event.tenant_id
+       WHERE event.tenant_id = ? AND event.serial_id = ?
+       ORDER BY event.created_at, event.id`,
+      [tenantId, serialId],
+    );
+    const location = (
+      id: string | null,
+      name: string | null,
+      code: string | null,
+    ) => (id && name && code ? { id, name, code } : null);
+    return {
+      serial,
+      events: rows.map((row) => ({
+        id: row.id,
+        movement: {
+          id: row.movement_id,
+          type: row.movement_type,
+          reference: row.reference,
+          reason: row.reason,
+        },
+        fromStatus: row.from_status,
+        toStatus: row.to_status,
+        fromLocation: location(
+          row.from_location_id,
+          row.from_location_name,
+          row.from_location_code,
+        ),
+        toLocation: location(
+          row.to_location_id,
+          row.to_location_name,
+          row.to_location_code,
+        ),
+        responsible: { id: row.user_id, email: row.user_email },
+        createdAt: new Date(row.created_at).toISOString(),
+      })),
+    };
+  }
+
+  async listLots(
+    tenantId: string,
+    warehouseId: string,
+    productId: string,
+  ): Promise<{
+    items: InventoryLotData[];
+    tracked: boolean;
+    totalQuantity: string;
+    lotQuantity: string;
+    currency: string | null;
+    inventoryValue: string;
+  }> {
+    const [product] = await this.dataSource.query<
+      Array<{
+        id: string;
+        name: string;
+        sku: string;
+        track_lots: number | boolean;
+        total_quantity: string;
+      }>
+    >(
+      `SELECT p.id, p.name, p.sku, p.track_lots,
+              COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.quantity ELSE 0 END), 0) AS total_quantity
+       FROM products p
+       LEFT JOIN inventory_balances ib
+         ON ib.product_id = p.id AND ib.tenant_id = p.tenant_id
+       LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
+       WHERE p.id = ? AND p.tenant_id = ?
+       GROUP BY p.id, p.name, p.sku, p.track_lots`,
+      [warehouseId, productId, tenantId],
+    );
+    if (!product) throw new InventoryTargetNotFoundError();
+    const rows = await this.dataSource.query<
+      Array<{
+        id: string;
+        code: string;
+        unit_cost: string;
+        currency: string;
+        created_at: Date | string;
+        location_id: string | null;
+        location_name: string | null;
+        location_code: string | null;
+        quantity: string | null;
+      }>
+    >(
+      `SELECT il.id, il.code, il.unit_cost, il.currency, il.created_at,
+              l.id AS location_id, l.name AS location_name, l.code AS location_code,
+              ilb.quantity
+       FROM inventory_lots il
+       LEFT JOIN inventory_lot_balances ilb
+         ON ilb.lot_id = il.id AND ilb.tenant_id = il.tenant_id
+       LEFT JOIN locations l ON l.id = ilb.location_id AND l.tenant_id = ilb.tenant_id
+         AND l.warehouse_id = ?
+       WHERE il.tenant_id = ? AND il.product_id = ?
+         AND (ilb.location_id IS NULL OR l.id IS NOT NULL)
+       ORDER BY il.created_at, il.id, l.created_at, l.id`,
+      [warehouseId, tenantId, productId],
+    );
+    const lots = new Map<string, InventoryLotData>();
+    for (const row of rows) {
+      let lot = lots.get(row.id);
+      if (!lot) {
+        lot = {
+          id: row.id,
+          code: row.code,
+          product: { id: product.id, name: product.name, sku: product.sku },
+          quantity: '0.000',
+          unitCost: this.normalizeCost(row.unit_cost),
+          currency: row.currency,
+          inventoryValue: '0.0000',
+          createdAt: new Date(row.created_at).toISOString(),
+          origins: [],
+          balances: [],
+        };
+        lots.set(row.id, lot);
+      }
+      if (row.location_id && row.quantity !== null) {
+        const quantity = this.normalizeDecimal(row.quantity);
+        lot.balances.push({
+          location: {
+            id: row.location_id,
+            name: row.location_name!,
+            code: row.location_code!,
+          },
+          quantity,
+        });
+        lot.quantity = this.fromUnits(
+          this.toUnits(lot.quantity) + this.toUnits(quantity),
+        );
+      }
+    }
+    const items = [...lots.values()];
+    if (items.length > 0) {
+      const origins = await this.dataSource.query<
+        Array<{
+          lot_id: string;
+          purchase_receipt_line_id: string;
+          quantity: string;
+          unit_cost: string;
+          currency: string;
+          receipt_id: string;
+          document_reference: string;
+          purchase_order_id: string;
+          folio: string;
+        }>
+      >(
+        `SELECT ilo.lot_id, ilo.purchase_receipt_line_id, ilo.quantity,
+                ilo.unit_cost, ilo.currency, pr.id AS receipt_id,
+                pr.document_reference, po.id AS purchase_order_id, po.folio
+         FROM inventory_lot_origins ilo
+         INNER JOIN purchase_receipt_lines prl
+           ON prl.id = ilo.purchase_receipt_line_id AND prl.tenant_id = ilo.tenant_id
+         INNER JOIN purchase_receipts pr
+           ON pr.id = prl.receipt_id AND pr.tenant_id = prl.tenant_id
+         INNER JOIN purchase_orders po
+           ON po.id = pr.purchase_order_id AND po.tenant_id = pr.tenant_id
+         WHERE ilo.tenant_id = ? AND ilo.lot_id IN (${items.map(() => '?').join(', ')})
+         ORDER BY ilo.created_at, ilo.purchase_receipt_line_id`,
+        [tenantId, ...items.map((item) => item.id)],
+      );
+      for (const origin of origins) {
+        lots.get(origin.lot_id)?.origins.push({
+          purchaseReceiptLineId: origin.purchase_receipt_line_id,
+          quantity: this.normalizeDecimal(origin.quantity),
+          unitCost: this.normalizeCost(origin.unit_cost),
+          currency: origin.currency,
+          receipt: {
+            id: origin.receipt_id,
+            documentReference: origin.document_reference,
+          },
+          purchaseOrder: {
+            id: origin.purchase_order_id,
+            folio: origin.folio,
+          },
+        });
+      }
+    }
+    for (const item of items) {
+      item.inventoryValue = this.valuationValue(item.quantity, item.unitCost);
+    }
+    const lotQuantity = this.fromUnits(
+      items.reduce((sum, lot) => sum + this.toUnits(lot.quantity), 0n),
+    );
+    const currencies = new Set(items.map((item) => item.currency));
+    const inventoryValue = this.fromCostUnits(
+      items.reduce(
+        (sum, item) => sum + this.toCostUnits(item.inventoryValue),
+        0n,
+      ),
+    );
+    return {
+      items,
+      tracked: Boolean(product.track_lots),
+      totalQuantity: this.normalizeDecimal(product.total_quantity),
+      lotQuantity,
+      currency: currencies.size === 1 ? items[0].currency : null,
+      inventoryValue,
+    };
+  }
+
+  async listFifoLayers(
+    tenantId: string,
+    warehouseId: string,
+    productId: string,
+  ): Promise<{
+    items: InventoryFifoLayerData[];
+    totalQuantity: string;
+    layerQuantity: string;
+    currency: string | null;
+    inventoryValue: string;
+    cutover: {
+      effectiveAt: string;
+      migrationRule: 'OPENING_BALANCE_AT_MOVING_AVERAGE';
+    };
+  }> {
+    const [product] = await this.dataSource.query<
+      Array<{
+        id: string;
+        name: string;
+        sku: string;
+        total_quantity: string;
+      }>
+    >(
+      `SELECT p.id, p.name, p.sku,
+              COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.quantity ELSE 0 END), 0) AS total_quantity
+       FROM products p
+       LEFT JOIN inventory_balances ib
+         ON ib.product_id = p.id AND ib.tenant_id = p.tenant_id
+       LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
+       WHERE p.id = ? AND p.tenant_id = ?
+       GROUP BY p.id, p.name, p.sku`,
+      [warehouseId, productId, tenantId],
+    );
+    if (!product) throw new InventoryTargetNotFoundError();
+    await this.dataSource.query(
+      `INSERT INTO inventory_fifo_cutovers
+         (tenant_id, effective_at, migration_rule)
+       SELECT id, CURRENT_TIMESTAMP(6), 'OPENING_BALANCE_AT_MOVING_AVERAGE'
+       FROM tenants WHERE id = ?
+       ON DUPLICATE KEY UPDATE tenant_id = VALUES(tenant_id)`,
+      [tenantId],
+    );
+    const [cutover] = await this.dataSource.query<
+      Array<{ effective_at: Date | string; migration_rule: string }>
+    >(
+      `SELECT effective_at, migration_rule FROM inventory_fifo_cutovers
+       WHERE tenant_id = ?`,
+      [tenantId],
+    );
+    if (!cutover) throw new InventoryTargetNotFoundError();
+    const rows = await this.dataSource.query<
+      Array<{
+        id: string;
+        origin_type: InventoryFifoLayerData['originType'];
+        original_quantity: string;
+        remaining_quantity: string;
+        unit_cost: string;
+        currency: string;
+        acquired_at: Date | string;
+        location_id: string;
+        location_name: string;
+        location_code: string;
+        source_movement_id: string | null;
+        source_movement_type: InventoryMovementType | null;
+        source_reference: string | null;
+        source_layer_id: string | null;
+        purchase_receipt_line_id: string | null;
+      }>
+    >(
+      `SELECT layer.id, layer.origin_type, layer.original_quantity,
+              layer.remaining_quantity, layer.unit_cost, layer.currency,
+              layer.acquired_at, l.id AS location_id, l.name AS location_name,
+              l.code AS location_code, layer.source_movement_id,
+              im.type AS source_movement_type, im.reference AS source_reference,
+              layer.source_layer_id, layer.purchase_receipt_line_id
+       FROM inventory_fifo_layers layer
+       INNER JOIN locations l
+         ON l.id = layer.location_id AND l.tenant_id = layer.tenant_id
+       LEFT JOIN inventory_movements im
+         ON im.id = layer.source_movement_id AND im.tenant_id = layer.tenant_id
+       WHERE layer.tenant_id = ? AND layer.product_id = ?
+         AND l.warehouse_id = ?
+       ORDER BY layer.acquired_at, layer.created_at, layer.id`,
+      [tenantId, productId, warehouseId],
+    );
+    const items = rows.map((row) => ({
+      id: row.id,
+      product: { id: product.id, name: product.name, sku: product.sku },
+      location: {
+        id: row.location_id,
+        name: row.location_name,
+        code: row.location_code,
+      },
+      originType: row.origin_type,
+      originalQuantity: this.normalizeDecimal(row.original_quantity),
+      remainingQuantity: this.normalizeDecimal(row.remaining_quantity),
+      unitCost: this.normalizeCost(row.unit_cost),
+      currency: row.currency,
+      inventoryValue: this.valuationValue(
+        row.remaining_quantity,
+        row.unit_cost,
+      ),
+      acquiredAt: new Date(row.acquired_at).toISOString(),
+      source: {
+        movementId: row.source_movement_id,
+        movementType: row.source_movement_type,
+        reference: row.source_reference,
+        layerId: row.source_layer_id,
+        purchaseReceiptLineId: row.purchase_receipt_line_id,
+      },
+    }));
+    const layerQuantity = this.fromUnits(
+      items.reduce(
+        (total, item) => total + this.toUnits(item.remainingQuantity),
+        0n,
+      ),
+    );
+    const inventoryValue = this.fromCostUnits(
+      items.reduce(
+        (total, item) => total + this.toCostUnits(item.inventoryValue),
+        0n,
+      ),
+    );
+    const activeCurrencies = new Set(
+      items
+        .filter((item) => this.toUnits(item.remainingQuantity) > 0n)
+        .map((item) => item.currency),
+    );
+    return {
+      items,
+      totalQuantity: this.normalizeDecimal(product.total_quantity),
+      layerQuantity,
+      currency:
+        activeCurrencies.size === 1 ? [...activeCurrencies.values()][0] : null,
+      inventoryValue,
+      cutover: {
+        effectiveAt: new Date(cutover.effective_at).toISOString(),
+        migrationRule:
+          cutover.migration_rule as 'OPENING_BALANCE_AT_MOVING_AVERAGE',
+      },
+    };
   }
 
   async listMovements(
@@ -199,6 +700,16 @@ export class InventoryRepository {
           from_state: InventoryStockState | null;
           to_state: InventoryStockState | null;
           state_quantity: string | null;
+          unit_cost: string | null;
+          value_change: string | null;
+          resulting_inventory_value: string | null;
+          average_unit_cost: string | null;
+          valuation_method: import('./inventory-valuation-policy.types').InventoryValuationMethod;
+          valuation_policy_version: number | string;
+          valuation_effective_at: Date | string;
+          fifo_unit_cost: string | null;
+          fifo_value_change: string | null;
+          fifo_resulting_inventory_value: string | null;
         }>
       >(
         `SELECT im.id, im.type, im.quantity_change, im.resulting_quantity,
@@ -206,6 +717,11 @@ export class InventoryRepository {
                 im.inventory_import_id, im.purchase_receipt_id, im.purchase_return_id,
                 im.reservation_id,
                 im.from_state, im.to_state, im.state_quantity,
+                im.unit_cost, im.value_change, im.resulting_inventory_value,
+                im.average_unit_cost, im.valuation_method,
+                im.valuation_policy_version, im.valuation_effective_at,
+                im.fifo_unit_cost, im.fifo_value_change,
+                im.fifo_resulting_inventory_value,
                 im.reason, im.reference, im.created_at,
                 p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
                 l.id AS location_id, l.name AS location_name, l.code AS location_code,
@@ -220,6 +736,86 @@ export class InventoryRepository {
         parameters,
       ),
     ]);
+    const allocations = rows.length
+      ? await this.dataSource.query<
+          Array<{
+            movement_id: string;
+            lot_id: string;
+            code: string;
+            quantity_change: string;
+            unit_cost: string;
+            currency: string;
+            value_change: string;
+            selection_mode: InventoryLotAllocation['selectionMode'];
+          }>
+        >(
+          `SELECT iml.movement_id, il.id AS lot_id, il.code,
+                  iml.quantity_change, iml.unit_cost, iml.currency,
+                  iml.value_change, iml.selection_mode
+           FROM inventory_movement_lots iml
+           INNER JOIN inventory_lots il
+             ON il.id = iml.lot_id AND il.tenant_id = iml.tenant_id
+           WHERE iml.tenant_id = ? AND iml.movement_id IN (${rows.map(() => '?').join(', ')})
+           ORDER BY iml.created_at, iml.id`,
+          [tenantId, ...rows.map((row) => row.id)],
+        )
+      : [];
+    const allocationsByMovement = new Map<string, InventoryLotAllocation[]>();
+    for (const allocation of allocations) {
+      const values = allocationsByMovement.get(allocation.movement_id) ?? [];
+      values.push({
+        id: allocation.lot_id,
+        code: allocation.code,
+        quantityChange: this.normalizeDecimal(allocation.quantity_change),
+        unitCost: this.normalizeCost(allocation.unit_cost),
+        currency: allocation.currency,
+        valueChange: this.normalizeCost(allocation.value_change),
+        selectionMode: allocation.selection_mode,
+      });
+      allocationsByMovement.set(allocation.movement_id, values);
+    }
+    const fifoAllocations = rows.length
+      ? await this.dataSource.query<
+          Array<{
+            id: string;
+            movement_id: string;
+            layer_id: string;
+            source_allocation_id: string | null;
+            quantity_change: string;
+            unit_cost: string;
+            currency: string;
+            value_change: string;
+            selection_mode: InventoryFifoAllocation['selectionMode'];
+          }>
+        >(
+          `SELECT id, movement_id, layer_id, source_allocation_id,
+                  quantity_change, unit_cost, currency, value_change,
+                  selection_mode
+           FROM inventory_movement_fifo_layers
+           WHERE tenant_id = ? AND movement_id IN (${rows.map(() => '?').join(', ')})
+           ORDER BY created_at, id`,
+          [tenantId, ...rows.map((row) => row.id)],
+        )
+      : [];
+    const fifoAllocationsByMovement = new Map<
+      string,
+      InventoryFifoAllocation[]
+    >();
+    for (const allocation of fifoAllocations) {
+      const values =
+        fifoAllocationsByMovement.get(allocation.movement_id) ?? [];
+      values.push({
+        allocationId: allocation.id,
+        layerId: allocation.layer_id,
+        sourceAllocationId: allocation.source_allocation_id,
+        quantityChange: this.normalizeDecimal(allocation.quantity_change),
+        unitCost: this.normalizeCost(allocation.unit_cost),
+        currency: allocation.currency,
+        valueChange: this.normalizeCost(allocation.value_change),
+        selectionMode: allocation.selection_mode,
+      });
+      fifoAllocationsByMovement.set(allocation.movement_id, values);
+    }
     return {
       items: rows.map((row) => ({
         id: row.id,
@@ -315,6 +911,38 @@ export class InventoryRepository {
                 quantity: this.normalizeDecimal(row.state_quantity),
               }
             : null,
+        valuation:
+          row.unit_cost !== null && row.value_change !== null
+            ? {
+                method: row.valuation_method,
+                policyVersion: Number(row.valuation_policy_version),
+                effectiveAt: new Date(row.valuation_effective_at).toISOString(),
+                unitCost: this.normalizeCost(row.unit_cost),
+                valueChange: this.normalizeCost(row.value_change),
+                resultingInventoryValue:
+                  row.resulting_inventory_value === null
+                    ? null
+                    : this.normalizeCost(row.resulting_inventory_value),
+                averageUnitCost:
+                  row.average_unit_cost === null
+                    ? null
+                    : this.normalizeCost(row.average_unit_cost),
+              }
+            : null,
+        lots: allocationsByMovement.get(row.id) ?? [],
+        fifoValuation:
+          row.fifo_unit_cost !== null &&
+          row.fifo_value_change !== null &&
+          row.fifo_resulting_inventory_value !== null
+            ? {
+                unitCost: this.normalizeCost(row.fifo_unit_cost),
+                valueChange: this.normalizeCost(row.fifo_value_change),
+                resultingInventoryValue: this.normalizeCost(
+                  row.fifo_resulting_inventory_value,
+                ),
+              }
+            : null,
+        fifoLayers: fifoAllocationsByMovement.get(row.id) ?? [],
       })),
       total: Number(countRows[0]?.total ?? 0),
       scope: { branch },
@@ -333,6 +961,13 @@ export class InventoryRepository {
       branch: { id: string; name: string };
       warehouse: { id: string; name: string };
     };
+    valuation: {
+      method: InventoryValuationMethod;
+      policyVersion: number;
+      effectiveAt: string;
+      currency: string;
+      asOf: string;
+    };
   }> {
     const scopeRows = await this.dataSource.query<
       Array<{
@@ -340,12 +975,21 @@ export class InventoryRepository {
         branch_name: string;
         warehouse_id: string;
         warehouse_name: string;
+        country_code: string;
+        valuation_method: InventoryValuationMethod;
+        valuation_version: number | string;
+        valuation_effective_at: Date | string;
       }>
     >(
       `SELECT b.id AS branch_id, b.name AS branch_name,
-              w.id AS warehouse_id, w.name AS warehouse_name
+              w.id AS warehouse_id, w.name AS warehouse_name,
+              t.country_code, ivp.method AS valuation_method,
+              ivp.version AS valuation_version,
+              ivp.effective_at AS valuation_effective_at
        FROM branches b
        INNER JOIN warehouses w ON w.branch_id = b.id AND w.tenant_id = b.tenant_id
+       INNER JOIN tenants t ON t.id = b.tenant_id
+       INNER JOIN inventory_valuation_policies ivp ON ivp.tenant_id = b.tenant_id
        WHERE b.id = ? AND w.id = ? AND b.tenant_id = ?
          AND b.active = TRUE AND w.active = TRUE LIMIT 1`,
       [branchId, warehouseId, tenantId],
@@ -375,26 +1019,95 @@ export class InventoryRepository {
           product_name: string;
           product_sku: string;
           active: number | boolean;
+          track_lots: number | boolean;
           available_quantity: string;
           reserved_quantity: string;
           damaged_quantity: string;
           in_transit_quantity: string;
           total_quantity: string;
+          global_balance_quantity: string;
+          valuation_quantity: string;
+          average_unit_cost: string;
+          total_inventory_value: string;
+          lot_quantity: string;
+          lot_inventory_value: string;
+          lot_currency: string | null;
+          fifo_quantity: string;
+          fifo_inventory_value: string;
+          fifo_currency: string | null;
         }>
       >(
-        `SELECT p.id AS product_id, p.name AS product_name, p.sku AS product_sku, p.active,
+        `SELECT p.id AS product_id, p.name AS product_name, p.sku AS product_sku, p.active, p.track_lots,
                 COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.available_quantity ELSE 0 END), 0) AS available_quantity,
                 COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.reserved_quantity ELSE 0 END), 0) AS reserved_quantity,
                 COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.damaged_quantity ELSE 0 END), 0) AS damaged_quantity,
                 COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.in_transit_quantity ELSE 0 END), 0) AS in_transit_quantity,
-                COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.quantity ELSE 0 END), 0) AS total_quantity
+                COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.quantity ELSE 0 END), 0) AS total_quantity,
+                COALESCE(SUM(ib.quantity), 0) AS global_balance_quantity,
+                COALESCE(iv.quantity, 0) AS valuation_quantity,
+                COALESCE(iv.average_unit_cost, p.cost) AS average_unit_cost,
+                COALESCE(iv.inventory_value, 0) AS total_inventory_value
+                ,(SELECT COALESCE(SUM(ilb.quantity), 0)
+                  FROM inventory_lots il
+                  INNER JOIN inventory_lot_balances ilb
+                    ON ilb.lot_id = il.id AND ilb.tenant_id = il.tenant_id
+                  INNER JOIN locations ll
+                    ON ll.id = ilb.location_id AND ll.tenant_id = ilb.tenant_id
+                  WHERE il.tenant_id = p.tenant_id AND il.product_id = p.id
+                    AND ll.warehouse_id = ?) AS lot_quantity,
+                (SELECT COALESCE(SUM(ilb.quantity * il.unit_cost), 0)
+                  FROM inventory_lots il
+                  INNER JOIN inventory_lot_balances ilb
+                    ON ilb.lot_id = il.id AND ilb.tenant_id = il.tenant_id
+                  INNER JOIN locations ll
+                    ON ll.id = ilb.location_id AND ll.tenant_id = ilb.tenant_id
+                  WHERE il.tenant_id = p.tenant_id AND il.product_id = p.id
+                    AND ll.warehouse_id = ?) AS lot_inventory_value,
+                (SELECT CASE WHEN COUNT(DISTINCT il.currency) = 1
+                             THEN MIN(il.currency) ELSE NULL END
+                  FROM inventory_lots il
+                  INNER JOIN inventory_lot_balances ilb
+                    ON ilb.lot_id = il.id AND ilb.tenant_id = il.tenant_id
+                  INNER JOIN locations ll
+                    ON ll.id = ilb.location_id AND ll.tenant_id = ilb.tenant_id
+                  WHERE il.tenant_id = p.tenant_id AND il.product_id = p.id
+                    AND ll.warehouse_id = ? AND ilb.quantity > 0) AS lot_currency,
+                (SELECT COALESCE(SUM(layer.remaining_quantity), 0)
+                  FROM inventory_fifo_layers layer
+                  INNER JOIN locations fl
+                    ON fl.id = layer.location_id AND fl.tenant_id = layer.tenant_id
+                  WHERE layer.tenant_id = p.tenant_id AND layer.product_id = p.id
+                    AND fl.warehouse_id = ?) AS fifo_quantity,
+                (SELECT CAST(COALESCE(SUM(layer.remaining_quantity * layer.unit_cost), 0)
+                  AS DECIMAL(21,4))
+                  FROM inventory_fifo_layers layer
+                  INNER JOIN locations fl
+                    ON fl.id = layer.location_id AND fl.tenant_id = layer.tenant_id
+                  WHERE layer.tenant_id = p.tenant_id AND layer.product_id = p.id
+                    AND fl.warehouse_id = ?) AS fifo_inventory_value,
+                (SELECT CASE WHEN COUNT(DISTINCT layer.currency) = 1
+                             THEN MIN(layer.currency) ELSE NULL END
+                  FROM inventory_fifo_layers layer
+                  INNER JOIN locations fl
+                    ON fl.id = layer.location_id AND fl.tenant_id = layer.tenant_id
+                  WHERE layer.tenant_id = p.tenant_id AND layer.product_id = p.id
+                    AND fl.warehouse_id = ?
+                    AND layer.remaining_quantity > 0) AS fifo_currency
          FROM products p
          LEFT JOIN inventory_balances ib ON ib.product_id = p.id AND ib.tenant_id = p.tenant_id
          LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
+         LEFT JOIN inventory_valuations iv ON iv.product_id = p.id AND iv.tenant_id = p.tenant_id
          WHERE ${where}
-         GROUP BY p.id, p.name, p.sku, p.active, p.created_at
+         GROUP BY p.id, p.name, p.sku, p.active, p.track_lots, p.cost, p.created_at,
+                  iv.quantity, iv.average_unit_cost, iv.inventory_value
          ORDER BY p.created_at DESC, p.id DESC LIMIT ? OFFSET ?`,
         [
+          warehouseId,
+          warehouseId,
+          warehouseId,
+          warehouseId,
+          warehouseId,
+          warehouseId,
           warehouseId,
           warehouseId,
           warehouseId,
@@ -410,6 +1123,7 @@ export class InventoryRepository {
         parameters,
       ),
     ]);
+    const tenantCurrency = this.currencyForCountry(scope.country_code);
     return {
       items: rows.map((row) => {
         const available = this.normalizeDecimal(row.available_quantity);
@@ -417,12 +1131,54 @@ export class InventoryRepository {
         const damaged = this.normalizeDecimal(row.damaged_quantity);
         const inTransit = this.normalizeDecimal(row.in_transit_quantity);
         const total = this.normalizeDecimal(row.total_quantity);
+        const quantityReconciled =
+          this.toUnits(row.global_balance_quantity) ===
+          this.toUnits(row.valuation_quantity);
+        const valueReconciled = this.isValuationValueReconciled(
+          row.valuation_quantity,
+          row.average_unit_cost,
+          row.total_inventory_value,
+        );
+        const movingAverageValue = this.valuationValue(
+          row.total_quantity,
+          row.average_unit_cost,
+        );
+        const movingAverageReconciled = quantityReconciled && valueReconciled;
+        const lotReconciled =
+          this.toUnits(row.lot_quantity) === this.toUnits(row.total_quantity);
+        const fifoReconciled =
+          this.toUnits(row.fifo_quantity) === this.toUnits(row.total_quantity);
+        const costing =
+          scope.valuation_method === 'FIFO'
+            ? {
+                method: scope.valuation_method,
+                currency: row.fifo_currency ?? tenantCurrency,
+                quantity: this.normalizeDecimal(row.fifo_quantity),
+                inventoryValue: this.normalizeCost(row.fifo_inventory_value),
+                reconciled: fifoReconciled,
+              }
+            : scope.valuation_method === 'SPECIFIC_LOT'
+              ? {
+                  method: scope.valuation_method,
+                  currency: row.lot_currency ?? tenantCurrency,
+                  quantity: this.normalizeDecimal(row.lot_quantity),
+                  inventoryValue: this.normalizeCost(row.lot_inventory_value),
+                  reconciled: lotReconciled,
+                }
+              : {
+                  method: scope.valuation_method,
+                  currency: tenantCurrency,
+                  quantity: total,
+                  inventoryValue: movingAverageValue,
+                  reconciled: movingAverageReconciled,
+                };
         return {
           product: {
             id: row.product_id,
             name: row.product_name,
             sku: row.product_sku,
             active: Boolean(row.active),
+            trackLots: Boolean(row.track_lots),
           },
           availableQuantity: available,
           totalQuantity: total,
@@ -432,12 +1188,43 @@ export class InventoryRepository {
             { code: 'DAMAGED', quantity: damaged },
             { code: 'IN_TRANSIT', quantity: inTransit },
           ],
+          averageUnitCost: this.normalizeCost(row.average_unit_cost),
+          inventoryValue: costing.inventoryValue,
+          costing,
+          valuation: {
+            quantity: this.normalizeDecimal(row.valuation_quantity),
+            inventoryValue: this.normalizeCost(row.total_inventory_value),
+            quantityReconciled,
+            valueReconciled,
+            reconciled: movingAverageReconciled,
+          },
+          lotTracking: row.track_lots
+            ? {
+                lotQuantity: this.normalizeDecimal(row.lot_quantity),
+                reconciled: lotReconciled,
+                currency: row.lot_currency,
+                inventoryValue: this.normalizeCost(row.lot_inventory_value),
+              }
+            : null,
+          fifoValuation: {
+            quantity: this.normalizeDecimal(row.fifo_quantity),
+            inventoryValue: this.normalizeCost(row.fifo_inventory_value),
+            currency: row.fifo_currency,
+            reconciled: fifoReconciled,
+          },
         };
       }),
       total: Number(countRows[0]?.total ?? 0),
       scope: {
         branch: { id: scope.branch_id, name: scope.branch_name },
         warehouse: { id: scope.warehouse_id, name: scope.warehouse_name },
+      },
+      valuation: {
+        method: scope.valuation_method,
+        policyVersion: Number(scope.valuation_version),
+        effectiveAt: new Date(scope.valuation_effective_at).toISOString(),
+        currency: tenantCurrency,
+        asOf: new Date().toISOString(),
       },
     };
   }
@@ -521,6 +1308,7 @@ export class InventoryRepository {
           quantity: quantityChange,
           reason: input.dto.reason,
           reference: input.dto.reference ?? null,
+          serialNumbers: input.dto.serialNumbers ?? [],
         }),
       )
       .digest('hex');
@@ -594,7 +1382,6 @@ export class InventoryRepository {
             throw new InsufficientStockError();
           const resultingQuantity = this.fromUnits(resultingUnits);
           const resultingAvailable = this.fromUnits(resultingAvailableUnits);
-          const movementId = randomUUID();
           await manager.query(
             `UPDATE inventory_balances SET quantity = ?, available_quantity = ?
            WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
@@ -606,6 +1393,7 @@ export class InventoryRepository {
               input.dto.locationId,
             ],
           );
+          const movementId = randomUUID();
           await manager.query(
             `INSERT INTO inventory_movements
             (id, tenant_id, product_id, location_id, type, quantity_change,
@@ -627,6 +1415,13 @@ export class InventoryRepository {
               input.userId,
             ],
           );
+          await applyInventoryValuation(manager, movementId);
+          await applyInventoryLotTracking(manager, movementId, {
+            lotCode: input.dto.lotCode,
+          });
+          await applyInventorySerialTracking(manager, movementId, {
+            serialNumbers: input.dto.serialNumbers,
+          });
           const movement = await this.findMovement(
             manager,
             input.tenantId,
@@ -765,6 +1560,9 @@ export class InventoryRepository {
                 input.userId,
               ],
             );
+            await applyInventoryValuation(manager, movementId);
+            await applyInventoryLotTracking(manager, movementId);
+            await applyInventorySerialTracking(manager, movementId);
           }
           await manager.query(
             `INSERT INTO inventory_counts
@@ -841,6 +1639,7 @@ export class InventoryRepository {
           quantity: normalizedQuantity,
           reason: input.dto.reason,
           reference: input.dto.reference,
+          serialNumbers: input.dto.serialNumbers ?? [],
         }),
       )
       .digest('hex');
@@ -919,6 +1718,7 @@ export class InventoryRepository {
               input.dto.locationId,
             ],
           );
+          const movementId = randomUUID();
           await manager.query(
             `INSERT INTO inventory_movements
               (id, tenant_id, product_id, location_id, type, from_state, to_state,
@@ -926,7 +1726,7 @@ export class InventoryRepository {
                idempotency_key, request_fingerprint, created_by_user_id)
              VALUES (?, ?, ?, ?, 'STATE_TRANSITION', ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)`,
             [
-              randomUUID(),
+              movementId,
               input.tenantId,
               input.dto.productId,
               input.dto.locationId,
@@ -941,6 +1741,11 @@ export class InventoryRepository {
               input.userId,
             ],
           );
+          await applyInventoryValuation(manager, movementId);
+          await applyInventoryLotTracking(manager, movementId);
+          await applyInventorySerialTracking(manager, movementId, {
+            serialNumbers: input.dto.serialNumbers,
+          });
           const movement = await this.findMovement(
             manager,
             input.tenantId,
@@ -988,6 +1793,11 @@ export class InventoryRepository {
     const rows = await manager.query<MovementRow[]>(
       `SELECT im.id, im.type, im.quantity_change, im.resulting_quantity,
               im.from_state, im.to_state, im.state_quantity,
+              im.unit_cost, im.value_change, im.resulting_inventory_value,
+              im.average_unit_cost, im.valuation_method,
+              im.valuation_policy_version, im.valuation_effective_at,
+              im.fifo_unit_cost, im.fifo_value_change,
+              im.fifo_resulting_inventory_value,
               im.reason, im.reference, im.request_fingerprint, im.created_at,
               p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
               l.id AS location_id, l.name AS location_name, l.code AS location_code
@@ -1065,6 +1875,56 @@ export class InventoryRepository {
     return this.fromUnits(this.toUnits(value));
   }
 
+  private normalizeCost(value: string): string {
+    return this.fromCostUnits(this.toCostUnits(value));
+  }
+
+  private valuationValue(quantity: string, unitCost: string): string {
+    const numerator = this.toUnits(quantity) * this.toCostUnits(unitCost);
+    const rounded =
+      numerator >= 0n ? (numerator + 500n) / 1000n : (numerator - 500n) / 1000n;
+    return this.fromCostUnits(rounded);
+  }
+
+  private currencyForCountry(countryCode: string): string {
+    return { MX: 'MXN', CL: 'CLP' }[countryCode] ?? 'USD';
+  }
+
+  private isValuationValueReconciled(
+    quantity: string,
+    averageUnitCost: string,
+    inventoryValue: string,
+  ): boolean {
+    const quantityUnits = this.toUnits(quantity);
+    const expectedValue = this.toCostUnits(
+      this.valuationValue(quantity, averageUnitCost),
+    );
+    const actualValue = this.toCostUnits(inventoryValue);
+    const difference =
+      expectedValue >= actualValue
+        ? expectedValue - actualValue
+        : actualValue - expectedValue;
+    const absoluteQuantity =
+      quantityUnits < 0n ? -quantityUnits : quantityUnits;
+    const roundingTolerance = (absoluteQuantity + 1999n) / 2000n;
+    return difference <= roundingTolerance;
+  }
+
+  private toCostUnits(value: string): bigint {
+    const negative = value.startsWith('-');
+    const unsigned = negative ? value.slice(1) : value;
+    const [whole, fraction = ''] = unsigned.split('.');
+    const units =
+      BigInt(whole) * 10000n + BigInt(fraction.padEnd(4, '0').slice(0, 4));
+    return negative ? -units : units;
+  }
+
+  private fromCostUnits(units: bigint): string {
+    const sign = units < 0n ? '-' : '';
+    const absolute = units < 0n ? -units : units;
+    return `${sign}${absolute / 10000n}.${String(absolute % 10000n).padStart(4, '0')}`;
+  }
+
   private toMovement(row: MovementRow): InventoryMovementData {
     return {
       id: row.id,
@@ -1080,6 +1940,36 @@ export class InventoryRepository {
               from: row.from_state,
               to: row.to_state,
               quantity: this.normalizeDecimal(row.state_quantity),
+            }
+          : null,
+      valuation:
+        row.unit_cost !== null && row.value_change !== null
+          ? {
+              method: row.valuation_method,
+              policyVersion: Number(row.valuation_policy_version),
+              effectiveAt: new Date(row.valuation_effective_at).toISOString(),
+              unitCost: this.normalizeCost(row.unit_cost),
+              valueChange: this.normalizeCost(row.value_change),
+              resultingInventoryValue:
+                row.resulting_inventory_value === null
+                  ? null
+                  : this.normalizeCost(row.resulting_inventory_value),
+              averageUnitCost:
+                row.average_unit_cost === null
+                  ? null
+                  : this.normalizeCost(row.average_unit_cost),
+            }
+          : null,
+      fifoValuation:
+        row.fifo_unit_cost !== null &&
+        row.fifo_value_change !== null &&
+        row.fifo_resulting_inventory_value !== null
+          ? {
+              unitCost: this.normalizeCost(row.fifo_unit_cost),
+              valueChange: this.normalizeCost(row.fifo_value_change),
+              resultingInventoryValue: this.normalizeCost(
+                row.fifo_resulting_inventory_value,
+              ),
             }
           : null,
       product: {

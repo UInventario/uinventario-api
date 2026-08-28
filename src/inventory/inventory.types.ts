@@ -1,3 +1,5 @@
+import type { InventoryValuationMethod } from './inventory-valuation-policy.types';
+
 export const INVENTORY_MOVEMENT_TYPES = [
   'INITIAL',
   'ENTRY',
@@ -73,6 +75,163 @@ export interface InventoryMovementData extends InventoryBalanceData {
     to: InventoryStockState;
     quantity: string;
   } | null;
+  valuation: InventoryMovementValuation | null;
+  fifoValuation: InventoryFifoMovementValuation | null;
+  fifoLayers?: InventoryFifoAllocation[];
+}
+
+export interface InventoryMovementValuation {
+  method: import('./inventory-valuation-policy.types').InventoryValuationMethod;
+  policyVersion: number;
+  effectiveAt: string;
+  unitCost: string;
+  valueChange: string;
+  resultingInventoryValue: string | null;
+  averageUnitCost: string | null;
+}
+
+export interface InventoryFifoMovementValuation {
+  unitCost: string;
+  valueChange: string;
+  resultingInventoryValue: string;
+}
+
+export interface InventoryFifoAllocation {
+  allocationId: string;
+  layerId: string;
+  sourceAllocationId: string | null;
+  quantityChange: string;
+  unitCost: string;
+  currency: string;
+  valueChange: string;
+  selectionMode: 'ENTRY' | 'FIFO' | 'RESTORE' | 'TRANSFER' | 'ORIGIN_RETURN';
+}
+
+export interface InventoryLotAllocation {
+  id: string;
+  code: string;
+  quantityChange: string;
+  unitCost: string;
+  currency: string;
+  valueChange: string;
+  selectionMode: 'ORIGIN' | 'MANUAL' | 'AUTOMATIC' | 'RESTORE' | 'TRANSFER';
+}
+
+export interface InventoryLotData {
+  id: string;
+  code: string;
+  product: { id: string; name: string; sku: string };
+  quantity: string;
+  unitCost: string;
+  currency: string;
+  inventoryValue: string;
+  createdAt: string;
+  origins: Array<{
+    purchaseReceiptLineId: string;
+    quantity: string;
+    unitCost: string;
+    currency: string;
+    receipt: { id: string; documentReference: string };
+    purchaseOrder: { id: string; folio: string };
+  }>;
+  balances: Array<{
+    location: InventoryLocationData;
+    quantity: string;
+  }>;
+}
+
+export interface InventoryLotsResponse {
+  data: InventoryLotData[];
+  meta: {
+    apiVersion: '1';
+    tracked: boolean;
+    totalQuantity: string;
+    lotQuantity: string;
+    reconciled: boolean;
+    currency: string | null;
+    inventoryValue: string;
+  };
+}
+
+export interface InventorySerialData {
+  id: string;
+  serialNumber: string;
+  status:
+    | 'AVAILABLE'
+    | 'RESERVED'
+    | 'DAMAGED'
+    | 'IN_TRANSIT'
+    | 'SOLD'
+    | 'RETURNED_TO_SUPPLIER'
+    | 'REMOVED';
+  product: { id: string; name: string; sku: string };
+  currentLocation: InventoryLocationData | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface InventorySerialEventData {
+  id: string;
+  movement: {
+    id: string;
+    type: InventoryMovementType;
+    reference: string | null;
+    reason: string;
+  };
+  fromStatus: InventorySerialData['status'] | null;
+  toStatus: InventorySerialData['status'];
+  fromLocation: InventoryLocationData | null;
+  toLocation: InventoryLocationData | null;
+  responsible: { id: string; email: string };
+  createdAt: string;
+}
+
+export interface InventorySerialsResponse {
+  data: InventorySerialData[];
+  meta: { apiVersion: '1'; tracked: boolean };
+}
+
+export interface InventorySerialHistoryResponse {
+  data: { serial: InventorySerialData; events: InventorySerialEventData[] };
+  meta: { apiVersion: '1' };
+}
+
+export interface InventoryFifoLayerData {
+  id: string;
+  product: { id: string; name: string; sku: string };
+  location: InventoryLocationData;
+  originType:
+    'MIGRATION_CUT' | 'ENTRY' | 'PURCHASE_RECEIPT' | 'RETURN' | 'TRANSFER';
+  originalQuantity: string;
+  remainingQuantity: string;
+  unitCost: string;
+  currency: string;
+  inventoryValue: string;
+  acquiredAt: string;
+  source: {
+    movementId: string | null;
+    movementType: InventoryMovementType | null;
+    reference: string | null;
+    layerId: string | null;
+    purchaseReceiptLineId: string | null;
+  };
+}
+
+export interface InventoryFifoLayersResponse {
+  data: InventoryFifoLayerData[];
+  meta: {
+    apiVersion: '1';
+    method: 'FIFO';
+    cutover: {
+      effectiveAt: string;
+      migrationRule: 'OPENING_BALANCE_AT_MOVING_AVERAGE';
+    };
+    totalQuantity: string;
+    layerQuantity: string;
+    reconciled: boolean;
+    currency: string | null;
+    inventoryValue: string;
+  };
 }
 
 export interface InventoryLocationsResponse {
@@ -157,6 +316,10 @@ export interface InventoryMovementHistoryItem {
     to: InventoryStockState;
     quantity: string;
   } | null;
+  valuation: InventoryMovementValuation | null;
+  lots: InventoryLotAllocation[];
+  fifoValuation: InventoryFifoMovementValuation | null;
+  fifoLayers: InventoryFifoAllocation[];
 }
 
 export interface InventoryMovementListResponse {
@@ -174,10 +337,44 @@ export interface InventoryMovementListResponse {
 }
 
 export interface InventoryStockItem {
-  product: { id: string; name: string; sku: string; active: boolean };
+  product: {
+    id: string;
+    name: string;
+    sku: string;
+    active: boolean;
+    trackLots: boolean;
+  };
   availableQuantity: string;
   totalQuantity: string;
   states: InventoryStateQuantity[];
+  averageUnitCost: string;
+  inventoryValue: string;
+  costing: {
+    method: InventoryValuationMethod;
+    currency: string;
+    quantity: string;
+    inventoryValue: string;
+    reconciled: boolean;
+  };
+  valuation: {
+    quantity: string;
+    inventoryValue: string;
+    quantityReconciled: boolean;
+    valueReconciled: boolean;
+    reconciled: boolean;
+  };
+  lotTracking: {
+    lotQuantity: string;
+    reconciled: boolean;
+    currency: string | null;
+    inventoryValue: string;
+  } | null;
+  fifoValuation: {
+    quantity: string;
+    inventoryValue: string;
+    currency: string | null;
+    reconciled: boolean;
+  };
 }
 
 export interface InventoryStateTransitionResponse {
@@ -193,6 +390,13 @@ export interface InventoryStockListResponse {
     scope: {
       branch: { id: string; name: string };
       warehouse: { id: string; name: string };
+    };
+    valuation: {
+      method: InventoryValuationMethod;
+      policyVersion: number;
+      effectiveAt: string;
+      currency: string;
+      asOf: string;
     };
     pagination: {
       page: number;

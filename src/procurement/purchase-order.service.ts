@@ -34,6 +34,22 @@ import {
   PurchaseOrderListResponse,
   PurchaseOrderResponse,
 } from './purchase-order.types';
+import {
+  InsufficientInventoryLotStockError,
+  InvalidInventoryLotCodeError,
+  InventoryLotCurrencyMismatchError,
+  InventoryLotNotFoundError,
+  InventoryLotRequiredError,
+  InventoryFifoCurrencyMismatchError,
+  InventoryFifoLayerShortageError,
+} from '../inventory/inventory.errors';
+import {
+  InventorySerialDuplicateError,
+  InventorySerialNotFoundError,
+  InventorySerialQuantityError,
+  InventorySerialRequiredError,
+  InventorySerialStateConflictError,
+} from '../inventory/inventory-serial-tracking';
 
 @Injectable()
 export class PurchaseOrderService {
@@ -357,6 +373,51 @@ export class PurchaseOrderService {
         currentStatus: error.status,
         message: 'El estado actual de la orden no permite esta operación.',
       });
+    }
+    if (error instanceof InventoryFifoLayerShortageError) {
+      throw new ConflictException({ code: 'INVENTORY_FIFO_LAYER_SHORTAGE' });
+    }
+    if (error instanceof InventoryFifoCurrencyMismatchError) {
+      throw new ConflictException({
+        code: 'INVENTORY_FIFO_CURRENCY_MISMATCH',
+      });
+    }
+    if (error instanceof InventoryLotRequiredError) {
+      throw new BadRequestException({
+        code: 'INVENTORY_LOT_REQUIRED',
+        message: 'Indica el lote de cada producto que controla lotes.',
+      });
+    }
+    if (error instanceof InvalidInventoryLotCodeError) {
+      throw new BadRequestException({ code: 'INVALID_INVENTORY_LOT_CODE' });
+    }
+    if (error instanceof InventoryLotNotFoundError) {
+      throw new NotFoundException({ code: 'INVENTORY_LOT_NOT_FOUND' });
+    }
+    if (error instanceof InsufficientInventoryLotStockError) {
+      throw new ConflictException({
+        code: 'INSUFFICIENT_INVENTORY_LOT_STOCK',
+      });
+    }
+    if (error instanceof InventoryLotCurrencyMismatchError) {
+      throw new ConflictException({
+        code: 'INVENTORY_LOT_CURRENCY_MISMATCH',
+        message: 'Los lotes de un producto deben usar una sola moneda.',
+      });
+    }
+    if (
+      error instanceof InventorySerialRequiredError ||
+      error instanceof InventorySerialQuantityError
+    ) {
+      throw new BadRequestException({ code: 'INVENTORY_SERIALS_REQUIRED' });
+    }
+    if (error instanceof InventorySerialNotFoundError)
+      throw new NotFoundException({ code: 'INVENTORY_SERIAL_NOT_FOUND' });
+    if (
+      error instanceof InventorySerialDuplicateError ||
+      error instanceof InventorySerialStateConflictError
+    ) {
+      throw new ConflictException({ code: 'INVENTORY_SERIAL_STATE_CONFLICT' });
     }
     throw error;
   }

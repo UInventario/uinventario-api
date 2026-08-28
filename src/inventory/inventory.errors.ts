@@ -45,3 +45,45 @@ export class InventoryCountConflictError extends Error {
     super('INVENTORY_COUNT_CONFLICT');
   }
 }
+
+export class InvalidInventoryLotCodeError extends Error {
+  constructor() {
+    super('INVALID_INVENTORY_LOT_CODE');
+  }
+}
+
+export class InventoryLotRequiredError extends Error {
+  constructor() {
+    super('INVENTORY_LOT_REQUIRED');
+  }
+}
+
+export class InventoryLotNotFoundError extends Error {
+  constructor() {
+    super('INVENTORY_LOT_NOT_FOUND');
+  }
+}
+
+export class InsufficientInventoryLotStockError extends Error {
+  constructor() {
+    super('INSUFFICIENT_INVENTORY_LOT_STOCK');
+  }
+}
+
+export class InventoryLotCurrencyMismatchError extends Error {
+  constructor() {
+    super('INVENTORY_LOT_CURRENCY_MISMATCH');
+  }
+}
+
+export class InventoryFifoLayerShortageError extends Error {
+  constructor() {
+    super('INVENTORY_FIFO_LAYER_SHORTAGE');
+  }
+}
+
+export class InventoryFifoCurrencyMismatchError extends Error {
+  constructor() {
+    super('INVENTORY_FIFO_CURRENCY_MISMATCH');
+  }
+}
