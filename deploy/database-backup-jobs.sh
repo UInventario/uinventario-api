@@ -34,13 +34,8 @@ case "$image" in
 esac
 
 bucket="${project_id}-uinventario-backups"
-bucket_uri="gs://${bucket}"
 runtime_account="uinventario-backup-runtime@${project_id}.iam.gserviceaccount.com"
 
-if ! gcloud storage buckets describe "$bucket_uri" >/dev/null 2>&1; then
-  echo "Backup bucket is missing. Run deploy/provision-database-backups.sh $environment first." >&2
-  exit 3
-fi
 if ! gcloud iam service-accounts describe "$runtime_account" --project="$project_id" >/dev/null 2>&1; then
   echo "Backup runtime account is missing. Provision UIN-138 first." >&2
   exit 3
