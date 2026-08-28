@@ -37,6 +37,7 @@ import {
 import {
   InsufficientInventoryLotStockError,
   InvalidInventoryLotCodeError,
+  InventoryLotCurrencyMismatchError,
   InventoryLotNotFoundError,
   InventoryLotRequiredError,
 } from '../inventory/inventory.errors';
@@ -379,6 +380,12 @@ export class PurchaseOrderService {
     if (error instanceof InsufficientInventoryLotStockError) {
       throw new ConflictException({
         code: 'INSUFFICIENT_INVENTORY_LOT_STOCK',
+      });
+    }
+    if (error instanceof InventoryLotCurrencyMismatchError) {
+      throw new ConflictException({
+        code: 'INVENTORY_LOT_CURRENCY_MISMATCH',
+        message: 'Los lotes de un producto deben usar una sola moneda.',
       });
     }
     throw error;

@@ -19,6 +19,7 @@ import {
   InvalidStockStateTransitionError,
   InsufficientInventoryLotStockError,
   InvalidInventoryLotCodeError,
+  InventoryLotCurrencyMismatchError,
   InventoryLotNotFoundError,
   InventoryLotRequiredError,
 } from './inventory.errors';
@@ -69,6 +70,8 @@ export class InventoryService {
           totalQuantity: result.totalQuantity,
           lotQuantity: result.lotQuantity,
           reconciled: result.totalQuantity === result.lotQuantity,
+          currency: result.currency,
+          inventoryValue: result.inventoryValue,
         },
       };
     } catch (error) {
@@ -252,6 +255,12 @@ export class InventoryService {
       throw new ConflictException({
         code: 'INSUFFICIENT_INVENTORY_LOT_STOCK',
         message: 'El lote no tiene existencias suficientes.',
+      });
+    }
+    if (error instanceof InventoryLotCurrencyMismatchError) {
+      throw new ConflictException({
+        code: 'INVENTORY_LOT_CURRENCY_MISMATCH',
+        message: 'Los lotes de un producto deben usar una sola moneda.',
       });
     }
   }
