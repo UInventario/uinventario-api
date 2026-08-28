@@ -99,7 +99,7 @@ gcloud run deploy "$service_name" \
   --labels="app=uinventario,environment=${environment},component=api" \
   --startup-probe=httpGet.path=/health/live,initialDelaySeconds=0,timeoutSeconds=3,periodSeconds=3,failureThreshold=10 \
   --liveness-probe=httpGet.path=/health/live,initialDelaySeconds=10,timeoutSeconds=3,periodSeconds=30,failureThreshold=3 \
-  --readiness-probe=httpGet.path=/health/ready,initialDelaySeconds=0,timeoutSeconds=3,periodSeconds=5,failureThreshold=3 \
+  --readiness-probe=httpGet.path=/health/ready,timeoutSeconds=3,periodSeconds=5,failureThreshold=3 \
   --quiet
 
 service_url="$(gcloud run services describe "$service_name" --project="$project_id" --region="$region" --format='value(status.url)')"
