@@ -161,6 +161,19 @@ export class InventoryController {
     );
   }
 
+  @Get('products/:productId/fifo-layers')
+  @RequirePermissions('INVENTORY_VIEW')
+  listFifoLayers(
+    @Req() request: AuthenticatedRequest,
+    @Param('productId', new ParseUUIDPipe()) productId: string,
+  ) {
+    return this.inventory.listFifoLayers(
+      request.principal.tenant.id,
+      request.principal.context.warehouse!.id,
+      productId,
+    );
+  }
+
   @Post('movements')
   @RequirePermissions('INVENTORY_ADJUST')
   async createMovement(

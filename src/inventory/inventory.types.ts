@@ -74,6 +74,8 @@ export interface InventoryMovementData extends InventoryBalanceData {
     quantity: string;
   } | null;
   valuation: InventoryMovementValuation | null;
+  fifoValuation: InventoryFifoMovementValuation | null;
+  fifoLayers?: InventoryFifoAllocation[];
 }
 
 export interface InventoryMovementValuation {
@@ -81,6 +83,23 @@ export interface InventoryMovementValuation {
   valueChange: string;
   resultingInventoryValue: string | null;
   averageUnitCost: string | null;
+}
+
+export interface InventoryFifoMovementValuation {
+  unitCost: string;
+  valueChange: string;
+  resultingInventoryValue: string;
+}
+
+export interface InventoryFifoAllocation {
+  allocationId: string;
+  layerId: string;
+  sourceAllocationId: string | null;
+  quantityChange: string;
+  unitCost: string;
+  currency: string;
+  valueChange: string;
+  selectionMode: 'ENTRY' | 'FIFO' | 'RESTORE' | 'TRANSFER' | 'ORIGIN_RETURN';
 }
 
 export interface InventoryLotAllocation {
@@ -123,6 +142,44 @@ export interface InventoryLotsResponse {
     tracked: boolean;
     totalQuantity: string;
     lotQuantity: string;
+    reconciled: boolean;
+    currency: string | null;
+    inventoryValue: string;
+  };
+}
+
+export interface InventoryFifoLayerData {
+  id: string;
+  product: { id: string; name: string; sku: string };
+  location: InventoryLocationData;
+  originType:
+    'MIGRATION_CUT' | 'ENTRY' | 'PURCHASE_RECEIPT' | 'RETURN' | 'TRANSFER';
+  originalQuantity: string;
+  remainingQuantity: string;
+  unitCost: string;
+  currency: string;
+  inventoryValue: string;
+  acquiredAt: string;
+  source: {
+    movementId: string | null;
+    movementType: InventoryMovementType | null;
+    reference: string | null;
+    layerId: string | null;
+    purchaseReceiptLineId: string | null;
+  };
+}
+
+export interface InventoryFifoLayersResponse {
+  data: InventoryFifoLayerData[];
+  meta: {
+    apiVersion: '1';
+    method: 'FIFO';
+    cutover: {
+      effectiveAt: string;
+      migrationRule: 'OPENING_BALANCE_AT_MOVING_AVERAGE';
+    };
+    totalQuantity: string;
+    layerQuantity: string;
     reconciled: boolean;
     currency: string | null;
     inventoryValue: string;
@@ -213,6 +270,8 @@ export interface InventoryMovementHistoryItem {
   } | null;
   valuation: InventoryMovementValuation | null;
   lots: InventoryLotAllocation[];
+  fifoValuation: InventoryFifoMovementValuation | null;
+  fifoLayers: InventoryFifoAllocation[];
 }
 
 export interface InventoryMovementListResponse {
@@ -255,6 +314,12 @@ export interface InventoryStockItem {
     currency: string | null;
     inventoryValue: string;
   } | null;
+  fifoValuation: {
+    quantity: string;
+    inventoryValue: string;
+    currency: string | null;
+    reconciled: boolean;
+  };
 }
 
 export interface InventoryStateTransitionResponse {

@@ -40,6 +40,8 @@ import {
 } from './payment-authorization.service';
 import {
   InsufficientInventoryLotStockError,
+  InventoryFifoCurrencyMismatchError,
+  InventoryFifoLayerShortageError,
   InventoryLotNotFoundError,
 } from '../inventory/inventory.errors';
 
@@ -287,6 +289,14 @@ export class PosService {
       if (error instanceof InsufficientInventoryLotStockError) {
         throw new ConflictException({
           code: 'INSUFFICIENT_INVENTORY_LOT_STOCK',
+        });
+      }
+      if (error instanceof InventoryFifoLayerShortageError) {
+        throw new ConflictException({ code: 'INVENTORY_FIFO_LAYER_SHORTAGE' });
+      }
+      if (error instanceof InventoryFifoCurrencyMismatchError) {
+        throw new ConflictException({
+          code: 'INVENTORY_FIFO_CURRENCY_MISMATCH',
         });
       }
       throw error;

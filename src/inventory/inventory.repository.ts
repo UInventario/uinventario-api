@@ -27,6 +27,8 @@ import {
   InventoryStockItem,
   InventoryLotData,
   InventoryLotAllocation,
+  InventoryFifoLayerData,
+  InventoryFifoAllocation,
 } from './inventory.types';
 import { applyInventoryValuation } from './inventory-valuation';
 import { applyInventoryLotTracking } from './inventory-lot-tracking';
@@ -53,6 +55,9 @@ interface MovementRow {
   value_change: string | null;
   resulting_inventory_value: string | null;
   average_unit_cost: string | null;
+  fifo_unit_cost: string | null;
+  fifo_value_change: string | null;
+  fifo_resulting_inventory_value: string | null;
 }
 
 interface CountRow {
@@ -249,6 +254,149 @@ export class InventoryRepository {
     };
   }
 
+  async listFifoLayers(
+    tenantId: string,
+    warehouseId: string,
+    productId: string,
+  ): Promise<{
+    items: InventoryFifoLayerData[];
+    totalQuantity: string;
+    layerQuantity: string;
+    currency: string | null;
+    inventoryValue: string;
+    cutover: {
+      effectiveAt: string;
+      migrationRule: 'OPENING_BALANCE_AT_MOVING_AVERAGE';
+    };
+  }> {
+    const [product] = await this.dataSource.query<
+      Array<{
+        id: string;
+        name: string;
+        sku: string;
+        total_quantity: string;
+      }>
+    >(
+      `SELECT p.id, p.name, p.sku,
+              COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.quantity ELSE 0 END), 0) AS total_quantity
+       FROM products p
+       LEFT JOIN inventory_balances ib
+         ON ib.product_id = p.id AND ib.tenant_id = p.tenant_id
+       LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
+       WHERE p.id = ? AND p.tenant_id = ?
+       GROUP BY p.id, p.name, p.sku`,
+      [warehouseId, productId, tenantId],
+    );
+    if (!product) throw new InventoryTargetNotFoundError();
+    await this.dataSource.query(
+      `INSERT INTO inventory_fifo_cutovers
+         (tenant_id, effective_at, migration_rule)
+       SELECT id, CURRENT_TIMESTAMP(6), 'OPENING_BALANCE_AT_MOVING_AVERAGE'
+       FROM tenants WHERE id = ?
+       ON DUPLICATE KEY UPDATE tenant_id = VALUES(tenant_id)`,
+      [tenantId],
+    );
+    const [cutover] = await this.dataSource.query<
+      Array<{ effective_at: Date | string; migration_rule: string }>
+    >(
+      `SELECT effective_at, migration_rule FROM inventory_fifo_cutovers
+       WHERE tenant_id = ?`,
+      [tenantId],
+    );
+    if (!cutover) throw new InventoryTargetNotFoundError();
+    const rows = await this.dataSource.query<
+      Array<{
+        id: string;
+        origin_type: InventoryFifoLayerData['originType'];
+        original_quantity: string;
+        remaining_quantity: string;
+        unit_cost: string;
+        currency: string;
+        acquired_at: Date | string;
+        location_id: string;
+        location_name: string;
+        location_code: string;
+        source_movement_id: string | null;
+        source_movement_type: InventoryMovementType | null;
+        source_reference: string | null;
+        source_layer_id: string | null;
+        purchase_receipt_line_id: string | null;
+      }>
+    >(
+      `SELECT layer.id, layer.origin_type, layer.original_quantity,
+              layer.remaining_quantity, layer.unit_cost, layer.currency,
+              layer.acquired_at, l.id AS location_id, l.name AS location_name,
+              l.code AS location_code, layer.source_movement_id,
+              im.type AS source_movement_type, im.reference AS source_reference,
+              layer.source_layer_id, layer.purchase_receipt_line_id
+       FROM inventory_fifo_layers layer
+       INNER JOIN locations l
+         ON l.id = layer.location_id AND l.tenant_id = layer.tenant_id
+       LEFT JOIN inventory_movements im
+         ON im.id = layer.source_movement_id AND im.tenant_id = layer.tenant_id
+       WHERE layer.tenant_id = ? AND layer.product_id = ?
+         AND l.warehouse_id = ?
+       ORDER BY layer.acquired_at, layer.created_at, layer.id`,
+      [tenantId, productId, warehouseId],
+    );
+    const items = rows.map((row) => ({
+      id: row.id,
+      product: { id: product.id, name: product.name, sku: product.sku },
+      location: {
+        id: row.location_id,
+        name: row.location_name,
+        code: row.location_code,
+      },
+      originType: row.origin_type,
+      originalQuantity: this.normalizeDecimal(row.original_quantity),
+      remainingQuantity: this.normalizeDecimal(row.remaining_quantity),
+      unitCost: this.normalizeCost(row.unit_cost),
+      currency: row.currency,
+      inventoryValue: this.valuationValue(
+        row.remaining_quantity,
+        row.unit_cost,
+      ),
+      acquiredAt: new Date(row.acquired_at).toISOString(),
+      source: {
+        movementId: row.source_movement_id,
+        movementType: row.source_movement_type,
+        reference: row.source_reference,
+        layerId: row.source_layer_id,
+        purchaseReceiptLineId: row.purchase_receipt_line_id,
+      },
+    }));
+    const layerQuantity = this.fromUnits(
+      items.reduce(
+        (total, item) => total + this.toUnits(item.remainingQuantity),
+        0n,
+      ),
+    );
+    const inventoryValue = this.fromCostUnits(
+      items.reduce(
+        (total, item) => total + this.toCostUnits(item.inventoryValue),
+        0n,
+      ),
+    );
+    const activeCurrencies = new Set(
+      items
+        .filter((item) => this.toUnits(item.remainingQuantity) > 0n)
+        .map((item) => item.currency),
+    );
+    return {
+      items,
+      totalQuantity: this.normalizeDecimal(product.total_quantity),
+      layerQuantity,
+      currency:
+        activeCurrencies.size === 1 ? [...activeCurrencies.values()][0] : null,
+      inventoryValue,
+      cutover: {
+        effectiveAt: new Date(cutover.effective_at).toISOString(),
+        migrationRule:
+          cutover.migration_rule as 'OPENING_BALANCE_AT_MOVING_AVERAGE',
+      },
+    };
+  }
+
   async listMovements(
     tenantId: string,
     branchId: string,
@@ -371,6 +519,9 @@ export class InventoryRepository {
           value_change: string | null;
           resulting_inventory_value: string | null;
           average_unit_cost: string | null;
+          fifo_unit_cost: string | null;
+          fifo_value_change: string | null;
+          fifo_resulting_inventory_value: string | null;
         }>
       >(
         `SELECT im.id, im.type, im.quantity_change, im.resulting_quantity,
@@ -379,7 +530,8 @@ export class InventoryRepository {
                 im.reservation_id,
                 im.from_state, im.to_state, im.state_quantity,
                 im.unit_cost, im.value_change, im.resulting_inventory_value,
-                im.average_unit_cost,
+                im.average_unit_cost, im.fifo_unit_cost, im.fifo_value_change,
+                im.fifo_resulting_inventory_value,
                 im.reason, im.reference, im.created_at,
                 p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
                 l.id AS location_id, l.name AS location_name, l.code AS location_code,
@@ -431,6 +583,48 @@ export class InventoryRepository {
         selectionMode: allocation.selection_mode,
       });
       allocationsByMovement.set(allocation.movement_id, values);
+    }
+    const fifoAllocations = rows.length
+      ? await this.dataSource.query<
+          Array<{
+            id: string;
+            movement_id: string;
+            layer_id: string;
+            source_allocation_id: string | null;
+            quantity_change: string;
+            unit_cost: string;
+            currency: string;
+            value_change: string;
+            selection_mode: InventoryFifoAllocation['selectionMode'];
+          }>
+        >(
+          `SELECT id, movement_id, layer_id, source_allocation_id,
+                  quantity_change, unit_cost, currency, value_change,
+                  selection_mode
+           FROM inventory_movement_fifo_layers
+           WHERE tenant_id = ? AND movement_id IN (${rows.map(() => '?').join(', ')})
+           ORDER BY created_at, id`,
+          [tenantId, ...rows.map((row) => row.id)],
+        )
+      : [];
+    const fifoAllocationsByMovement = new Map<
+      string,
+      InventoryFifoAllocation[]
+    >();
+    for (const allocation of fifoAllocations) {
+      const values =
+        fifoAllocationsByMovement.get(allocation.movement_id) ?? [];
+      values.push({
+        allocationId: allocation.id,
+        layerId: allocation.layer_id,
+        sourceAllocationId: allocation.source_allocation_id,
+        quantityChange: this.normalizeDecimal(allocation.quantity_change),
+        unitCost: this.normalizeCost(allocation.unit_cost),
+        currency: allocation.currency,
+        valueChange: this.normalizeCost(allocation.value_change),
+        selectionMode: allocation.selection_mode,
+      });
+      fifoAllocationsByMovement.set(allocation.movement_id, values);
     }
     return {
       items: rows.map((row) => ({
@@ -543,6 +737,19 @@ export class InventoryRepository {
               }
             : null,
         lots: allocationsByMovement.get(row.id) ?? [],
+        fifoValuation:
+          row.fifo_unit_cost !== null &&
+          row.fifo_value_change !== null &&
+          row.fifo_resulting_inventory_value !== null
+            ? {
+                unitCost: this.normalizeCost(row.fifo_unit_cost),
+                valueChange: this.normalizeCost(row.fifo_value_change),
+                resultingInventoryValue: this.normalizeCost(
+                  row.fifo_resulting_inventory_value,
+                ),
+              }
+            : null,
+        fifoLayers: fifoAllocationsByMovement.get(row.id) ?? [],
       })),
       total: Number(countRows[0]?.total ?? 0),
       scope: { branch },
@@ -616,6 +823,9 @@ export class InventoryRepository {
           lot_quantity: string;
           lot_inventory_value: string;
           lot_currency: string | null;
+          fifo_quantity: string;
+          fifo_inventory_value: string;
+          fifo_currency: string | null;
         }>
       >(
         `SELECT p.id AS product_id, p.name AS product_name, p.sku AS product_sku, p.active, p.track_lots,
@@ -652,7 +862,28 @@ export class InventoryRepository {
                   INNER JOIN locations ll
                     ON ll.id = ilb.location_id AND ll.tenant_id = ilb.tenant_id
                   WHERE il.tenant_id = p.tenant_id AND il.product_id = p.id
-                    AND ll.warehouse_id = ? AND ilb.quantity > 0) AS lot_currency
+                    AND ll.warehouse_id = ? AND ilb.quantity > 0) AS lot_currency,
+                (SELECT COALESCE(SUM(layer.remaining_quantity), 0)
+                  FROM inventory_fifo_layers layer
+                  INNER JOIN locations fl
+                    ON fl.id = layer.location_id AND fl.tenant_id = layer.tenant_id
+                  WHERE layer.tenant_id = p.tenant_id AND layer.product_id = p.id
+                    AND fl.warehouse_id = ?) AS fifo_quantity,
+                (SELECT CAST(COALESCE(SUM(layer.remaining_quantity * layer.unit_cost), 0)
+                  AS DECIMAL(21,4))
+                  FROM inventory_fifo_layers layer
+                  INNER JOIN locations fl
+                    ON fl.id = layer.location_id AND fl.tenant_id = layer.tenant_id
+                  WHERE layer.tenant_id = p.tenant_id AND layer.product_id = p.id
+                    AND fl.warehouse_id = ?) AS fifo_inventory_value,
+                (SELECT CASE WHEN COUNT(DISTINCT layer.currency) = 1
+                             THEN MIN(layer.currency) ELSE NULL END
+                  FROM inventory_fifo_layers layer
+                  INNER JOIN locations fl
+                    ON fl.id = layer.location_id AND fl.tenant_id = layer.tenant_id
+                  WHERE layer.tenant_id = p.tenant_id AND layer.product_id = p.id
+                    AND fl.warehouse_id = ?
+                    AND layer.remaining_quantity > 0) AS fifo_currency
          FROM products p
          LEFT JOIN inventory_balances ib ON ib.product_id = p.id AND ib.tenant_id = p.tenant_id
          LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
@@ -662,6 +893,9 @@ export class InventoryRepository {
                   iv.quantity, iv.average_unit_cost, iv.inventory_value
          ORDER BY p.created_at DESC, p.id DESC LIMIT ? OFFSET ?`,
         [
+          warehouseId,
+          warehouseId,
+          warehouseId,
           warehouseId,
           warehouseId,
           warehouseId,
@@ -733,6 +967,14 @@ export class InventoryRepository {
                 inventoryValue: this.normalizeCost(row.lot_inventory_value),
               }
             : null,
+          fifoValuation: {
+            quantity: this.normalizeDecimal(row.fifo_quantity),
+            inventoryValue: this.normalizeCost(row.fifo_inventory_value),
+            currency: row.fifo_currency,
+            reconciled:
+              this.toUnits(row.fifo_quantity) ===
+              this.toUnits(row.total_quantity),
+          },
         };
       }),
       total: Number(countRows[0]?.total ?? 0),
@@ -1299,7 +1541,8 @@ export class InventoryRepository {
       `SELECT im.id, im.type, im.quantity_change, im.resulting_quantity,
               im.from_state, im.to_state, im.state_quantity,
               im.unit_cost, im.value_change, im.resulting_inventory_value,
-              im.average_unit_cost,
+              im.average_unit_cost, im.fifo_unit_cost, im.fifo_value_change,
+              im.fifo_resulting_inventory_value,
               im.reason, im.reference, im.request_fingerprint, im.created_at,
               p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
               l.id AS location_id, l.name AS location_name, l.code AS location_code
@@ -1412,7 +1655,8 @@ export class InventoryRepository {
     const negative = value.startsWith('-');
     const unsigned = negative ? value.slice(1) : value;
     const [whole, fraction = ''] = unsigned.split('.');
-    const units = BigInt(whole) * 10000n + BigInt(fraction.padEnd(4, '0'));
+    const units =
+      BigInt(whole) * 10000n + BigInt(fraction.padEnd(4, '0').slice(0, 4));
     return negative ? -units : units;
   }
 
@@ -1452,6 +1696,18 @@ export class InventoryRepository {
                 row.average_unit_cost === null
                   ? null
                   : this.normalizeCost(row.average_unit_cost),
+            }
+          : null,
+      fifoValuation:
+        row.fifo_unit_cost !== null &&
+        row.fifo_value_change !== null &&
+        row.fifo_resulting_inventory_value !== null
+          ? {
+              unitCost: this.normalizeCost(row.fifo_unit_cost),
+              valueChange: this.normalizeCost(row.fifo_value_change),
+              resultingInventoryValue: this.normalizeCost(
+                row.fifo_resulting_inventory_value,
+              ),
             }
           : null,
       product: {
