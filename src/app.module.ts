@@ -2,7 +2,7 @@ import { Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
 import { ConfigService } from '@nestjs/config';
-import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+import { ThrottlerModule } from '@nestjs/throttler';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { join } from 'node:path';
 import { RegistrationModule } from './auth/registration/registration.module';
@@ -28,6 +28,7 @@ import { CustomerModule } from './customers/customer.module';
 import { ProductReservationModule } from './reservations/product-reservation.module';
 import { OfflineSyncModule } from './offline-sync/offline-sync.module';
 import { DataExportModule } from './data-exports/data-export.module';
+import { SecurityThrottlerGuard } from './security/security-throttler.guard';
 
 @Module({
   imports: [
@@ -76,6 +77,6 @@ import { DataExportModule } from './data-exports/data-export.module';
     PosModule,
     DataExportModule,
   ],
-  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
+  providers: [{ provide: APP_GUARD, useClass: SecurityThrottlerGuard }],
 })
 export class AppModule {}

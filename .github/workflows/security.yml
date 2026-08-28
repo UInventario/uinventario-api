@@ -10,6 +10,17 @@ permissions:
   contents: read
 
 jobs:
+  sast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Semgrep OSS
+        run: >-
+          docker run --rm
+          -v "$PWD:/src"
+          semgrep/semgrep@sha256:155f999d01d02b33aa5a8db9186eb20dcd0154ce1a0ac6fce8d80674d0ace235
+          semgrep scan --config /src/.semgrep.yml --error --metrics=off /src/src
+
   dependency-audit:
     runs-on: ubuntu-latest
     steps:

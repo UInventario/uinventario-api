@@ -89,10 +89,11 @@ steps:
         fi
 
         sh deploy/cloud-run.sh "${_DEPLOY_ENV}" "$$image" "$$web_origin"
+        api_url="$$(gcloud run services describe uinventario-api --project="$PROJECT_ID" --region="${_REGION}" --format='value(status.url)')"
+        sh deploy/security-smoke.sh "$$api_url" "$$web_origin"
         backup_image="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPOSITORY}/database-backup:$COMMIT_SHA"
         sh deploy/database-backup-jobs.sh "${_DEPLOY_ENV}" "$$backup_image"
 
-        api_url="$$(gcloud run services describe uinventario-api --project="$PROJECT_ID" --region="${_REGION}" --format='value(status.url)')"
         if gcloud run services describe uinventario-web --project="$PROJECT_ID" --region="${_REGION}" >/dev/null 2>&1; then
           gcloud run services update uinventario-web \
             --project="$PROJECT_ID" \

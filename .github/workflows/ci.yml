@@ -79,5 +79,24 @@ jobs:
         run: |
           npm run migration:run
           npm run migration:run
+      - name: Focused DAST
+        run: |
+          npm run start:prod > /tmp/uinventario-api.log 2>&1 &
+          api_pid=$!
+          trap 'kill "$api_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:3000/health/ready >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              cat /tmp/uinventario-api.log
+              exit 1
+            fi
+            sleep 1
+          done
+          sh deploy/security-smoke.sh http://127.0.0.1:3000 http://localhost:4200
+          kill "$api_pid"
+          wait "$api_pid" 2>/dev/null || true
+          trap - EXIT
       - name: Integration tests
         run: npm run test:e2e:ci
