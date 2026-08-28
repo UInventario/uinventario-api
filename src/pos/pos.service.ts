@@ -51,6 +51,7 @@ import {
   InventorySerialRequiredError,
   InventorySerialStateConflictError,
 } from '../inventory/inventory-serial-tracking';
+import { SuspendedSaleStateError } from './suspended-sale.errors';
 
 @Injectable()
 export class PosService {
@@ -233,6 +234,7 @@ export class PosService {
         quote: quote.data,
         customerId: input.dto.customerId ?? null,
         reservationId: input.dto.reservationId ?? null,
+        suspendedSaleId: input.dto.suspendedSaleId ?? null,
         payments,
       });
       return {
@@ -244,6 +246,15 @@ export class PosService {
         throw new ConflictException({
           code: 'IDEMPOTENCY_KEY_REUSED',
           message: 'La clave de idempotencia ya fue usada con otros datos.',
+        });
+      }
+      if (error instanceof SuspendedSaleStateError) {
+        throw new ConflictException({
+          code:
+            error.status === 'EXPIRED'
+              ? 'SUSPENDED_SALE_EXPIRED'
+              : 'SUSPENDED_SALE_NOT_ACTIVE',
+          status: error.status,
         });
       }
       if (error instanceof PaymentMethodUnavailableError) {
@@ -674,6 +685,7 @@ export class PosService {
       ),
       customerId: dto.customerId ?? null,
       reservationId: dto.reservationId ?? null,
+      suspendedSaleId: dto.suspendedSaleId ?? null,
     };
     return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
   }

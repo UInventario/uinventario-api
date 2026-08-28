@@ -61,6 +61,8 @@ describe('UInventario API (e2e)', () => {
       'sale_receipt_snapshots',
       'sale_return_lines',
       'sale_returns',
+      'suspended_sale_lines',
+      'suspended_sales',
       'sale_payments',
       'sale_lines',
       'sales',
@@ -6918,6 +6920,250 @@ describe('UInventario API (e2e)', () => {
             },
           });
         });
+    });
+
+    it('suspends, isolates, recalculates and transactionally consumes a pending sale', async () => {
+      const { cookie, productId, locationId } = await preparePos();
+      const suspendedResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/suspended-sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'suspended-sale-create-001')
+        .send({
+          notes: 'Cliente vuelve en unos minutos',
+          lines: [{ productId, quantity: '2' }],
+        })
+        .expect(201);
+      const suspended = suspendedResponse.body as {
+        data: { id: string; status: string; notes: string; lines: unknown[] };
+        meta: { idempotentReplay: boolean };
+      };
+      expect(suspended).toMatchObject({
+        data: {
+          status: 'ACTIVE',
+          notes: 'Cliente vuelve en unos minutos',
+          lines: [
+            expect.objectContaining({
+              quantity: '2.000',
+              unitPriceSnapshot: '119.90',
+            }),
+          ],
+        },
+        meta: { idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/suspended-sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'suspended-sale-create-001')
+        .send({
+          notes: 'Cliente vuelve en unos minutos',
+          lines: [{ productId, quantity: '2' }],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { id: suspended.data.id },
+            meta: { idempotentReplay: true },
+          });
+        });
+
+      const [before] = await dataSource.query<Array<{ quantity: string }>>(
+        `SELECT available_quantity AS quantity FROM inventory_balances
+         WHERE product_id = ? AND location_id = ?`,
+        [productId, locationId],
+      );
+      const [{ salesBefore }] = await dataSource.query<
+        Array<{ salesBefore: string }>
+      >('SELECT COUNT(*) AS salesBefore FROM sales');
+      expect(before.quantity).toBe('5.000');
+      expect(Number(salesBefore)).toBe(0);
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { expectedCash: '250.00' } });
+        });
+
+      const [scope] = await dataSource.query<
+        Array<{
+          tenant_id: string;
+          branch_id: string;
+          cash_register_id: string;
+          role_id: string;
+        }>
+      >(
+        `SELECT u.tenant_id, b.id AS branch_id, cr.id AS cash_register_id, r.id AS role_id
+         FROM users u
+         INNER JOIN roles r ON r.tenant_id = u.tenant_id AND r.code = 'ADMIN'
+         INNER JOIN branches b ON b.tenant_id = u.tenant_id
+         INNER JOIN cash_registers cr ON cr.tenant_id = u.tenant_id AND cr.branch_id = b.id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      const otherUserId = randomUUID();
+      await dataSource.query(
+        `INSERT INTO users (id, tenant_id, email, normalized_email, password_hash)
+         VALUES (?, ?, 'other-cashier@example.com', 'other-cashier@example.com', 'not-used')`,
+        [otherUserId, scope.tenant_id],
+      );
+      await dataSource.query(
+        'INSERT INTO user_roles (user_id, role_id, tenant_id) VALUES (?, ?, ?)',
+        [otherUserId, scope.role_id, scope.tenant_id],
+      );
+      await dataSource.query(
+        'INSERT INTO user_branch_access (user_id, tenant_id, branch_id) VALUES (?, ?, ?)',
+        [otherUserId, scope.tenant_id, scope.branch_id],
+      );
+      await dataSource.query(
+        `INSERT INTO user_cash_register_access (user_id, tenant_id, branch_id, cash_register_id)
+         VALUES (?, ?, ?, ?)`,
+        [otherUserId, scope.tenant_id, scope.branch_id, scope.cash_register_id],
+      );
+      const otherCookie = await createPersistedSession(
+        'other-cashier@example.com',
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/suspended-sales/${suspended.data.id}/resume`)
+        .set('Cookie', otherCookie)
+        .expect(404);
+
+      await dataSource.query('UPDATE products SET price = ? WHERE id = ?', [
+        '129.90',
+        productId,
+      ]);
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/suspended-sales/${suspended.data.id}/resume`)
+        .set('Cookie', cookie)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              suspendedSale: { id: suspended.data.id, status: 'ACTIVE' },
+              quote: { totals: { total: '259.80' } },
+              conflicts: [
+                expect.objectContaining({
+                  code: 'PRICE_CHANGED',
+                  productId,
+                  previous: '119.90',
+                  current: '129.90',
+                }),
+              ],
+            },
+          });
+        });
+
+      const completed = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'suspended-sale-complete-001')
+        .send({
+          suspendedSaleId: suspended.data.id,
+          lines: [{ productId, quantity: '2' }],
+          payment: { method: 'CASH', amountReceived: '260.00' },
+        })
+        .expect(201);
+      const completedId = (completed.body as { data: { id: string } }).data.id;
+      const [state] = await dataSource.query<
+        Array<{ status: string; completed_sale_id: string }>
+      >('SELECT status, completed_sale_id FROM suspended_sales WHERE id = ?', [
+        suspended.data.id,
+      ]);
+      expect(state).toEqual({
+        status: 'RESUMED',
+        completed_sale_id: completedId,
+      });
+      const [after] = await dataSource.query<Array<{ quantity: string }>>(
+        `SELECT available_quantity AS quantity FROM inventory_balances
+         WHERE product_id = ? AND location_id = ?`,
+        [productId, locationId],
+      );
+      expect(after.quantity).toBe('3.000');
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'suspended-sale-complete-duplicate')
+        .send({
+          suspendedSaleId: suspended.data.id,
+          lines: [{ productId, quantity: '1' }],
+          payment: { method: 'CASH', amountReceived: '130.00' },
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string; status?: string } }) => {
+          expect(body).toMatchObject({
+            code: 'SUSPENDED_SALE_NOT_ACTIVE',
+            status: 'RESUMED',
+          });
+        });
+
+      const cancellable = await request(app.getHttpServer())
+        .post('/api/v1/pos/suspended-sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'suspended-sale-cancel-001')
+        .send({ notes: 'Cancelar', lines: [{ productId, quantity: '1' }] })
+        .expect(201);
+      const cancellableId = (cancellable.body as { data: { id: string } }).data
+        .id;
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/suspended-sales/${cancellableId}/cancel`)
+        .set('Cookie', cookie)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { status: 'CANCELLED' },
+            meta: { idempotentReplay: false },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/suspended-sales/${cancellableId}/cancel`)
+        .set('Cookie', cookie)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { idempotentReplay: true } });
+        });
+
+      const expirable = await request(app.getHttpServer())
+        .post('/api/v1/pos/suspended-sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'suspended-sale-expire-001')
+        .send({ notes: 'Expirar', lines: [{ productId, quantity: '1' }] })
+        .expect(201);
+      const expirableId = (expirable.body as { data: { id: string } }).data.id;
+      await dataSource.query(
+        `UPDATE suspended_sales SET expires_at = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 1 SECOND)
+         WHERE id = ?`,
+        [expirableId],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/suspended-sales/${expirableId}/resume`)
+        .set('Cookie', cookie)
+        .expect(409)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            code: 'SUSPENDED_SALE_EXPIRED',
+            status: 'EXPIRED',
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/suspended-sales')
+        .set('Cookie', cookie)
+        .expect(200);
+      const [expirationAudit] = await dataSource.query<
+        Array<{ total: string }>
+      >(
+        `SELECT COUNT(*) AS total FROM audit_events
+         WHERE entity_id = ? AND action = 'SALE_SUSPENSION_EXPIRED'`,
+        [expirableId],
+      );
+      expect(Number(expirationAudit.total)).toBe(1);
+
+      const audit = await dataSource.query<Array<{ action: string }>>(
+        `SELECT action FROM audit_events WHERE entity_id = ? ORDER BY created_at, id`,
+        [suspended.data.id],
+      );
+      expect(audit.map(({ action }) => action)).toEqual([
+        'SALE_SUSPENDED',
+        'SALE_SUSPENSION_RESUMED',
+      ]);
     });
 
     it('authorizes card, transfer and voucher payments without affecting expected cash', async () => {
