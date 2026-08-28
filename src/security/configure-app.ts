@@ -39,6 +39,11 @@ export function configureApp(app: INestApplication): void {
     }),
   );
   app.use((request: RequestContext, response: Response, next: NextFunction) => {
+    response.setHeader('Cache-Control', 'no-store');
+    response.setHeader(
+      'Permissions-Policy',
+      'camera=(), geolocation=(), microphone=(), payment=(), usb=()',
+    );
     const suppliedRequestId = request.header('x-request-id');
     request.requestId =
       suppliedRequestId && REQUEST_ID_PATTERN.test(suppliedRequestId)
