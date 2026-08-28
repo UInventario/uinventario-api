@@ -32,6 +32,7 @@ import {
 } from './inventory.types';
 import { applyInventoryValuation } from './inventory-valuation';
 import { applyInventoryLotTracking } from './inventory-lot-tracking';
+import type { InventoryValuationMethod } from './inventory-valuation-policy.types';
 
 interface MovementRow {
   id: string;
@@ -779,6 +780,13 @@ export class InventoryRepository {
       branch: { id: string; name: string };
       warehouse: { id: string; name: string };
     };
+    valuation: {
+      method: InventoryValuationMethod;
+      policyVersion: number;
+      effectiveAt: string;
+      currency: string;
+      asOf: string;
+    };
   }> {
     const scopeRows = await this.dataSource.query<
       Array<{
@@ -786,12 +794,21 @@ export class InventoryRepository {
         branch_name: string;
         warehouse_id: string;
         warehouse_name: string;
+        country_code: string;
+        valuation_method: InventoryValuationMethod;
+        valuation_version: number | string;
+        valuation_effective_at: Date | string;
       }>
     >(
       `SELECT b.id AS branch_id, b.name AS branch_name,
-              w.id AS warehouse_id, w.name AS warehouse_name
+              w.id AS warehouse_id, w.name AS warehouse_name,
+              t.country_code, ivp.method AS valuation_method,
+              ivp.version AS valuation_version,
+              ivp.effective_at AS valuation_effective_at
        FROM branches b
        INNER JOIN warehouses w ON w.branch_id = b.id AND w.tenant_id = b.tenant_id
+       INNER JOIN tenants t ON t.id = b.tenant_id
+       INNER JOIN inventory_valuation_policies ivp ON ivp.tenant_id = b.tenant_id
        WHERE b.id = ? AND w.id = ? AND b.tenant_id = ?
          AND b.active = TRUE AND w.active = TRUE LIMIT 1`,
       [branchId, warehouseId, tenantId],
@@ -925,6 +942,7 @@ export class InventoryRepository {
         parameters,
       ),
     ]);
+    const tenantCurrency = this.currencyForCountry(scope.country_code);
     return {
       items: rows.map((row) => {
         const available = this.normalizeDecimal(row.available_quantity);
@@ -940,6 +958,39 @@ export class InventoryRepository {
           row.average_unit_cost,
           row.total_inventory_value,
         );
+        const movingAverageValue = this.valuationValue(
+          row.total_quantity,
+          row.average_unit_cost,
+        );
+        const movingAverageReconciled = quantityReconciled && valueReconciled;
+        const lotReconciled =
+          this.toUnits(row.lot_quantity) === this.toUnits(row.total_quantity);
+        const fifoReconciled =
+          this.toUnits(row.fifo_quantity) === this.toUnits(row.total_quantity);
+        const costing =
+          scope.valuation_method === 'FIFO'
+            ? {
+                method: scope.valuation_method,
+                currency: row.fifo_currency ?? tenantCurrency,
+                quantity: this.normalizeDecimal(row.fifo_quantity),
+                inventoryValue: this.normalizeCost(row.fifo_inventory_value),
+                reconciled: fifoReconciled,
+              }
+            : scope.valuation_method === 'SPECIFIC_LOT'
+              ? {
+                  method: scope.valuation_method,
+                  currency: row.lot_currency ?? tenantCurrency,
+                  quantity: this.normalizeDecimal(row.lot_quantity),
+                  inventoryValue: this.normalizeCost(row.lot_inventory_value),
+                  reconciled: lotReconciled,
+                }
+              : {
+                  method: scope.valuation_method,
+                  currency: tenantCurrency,
+                  quantity: total,
+                  inventoryValue: movingAverageValue,
+                  reconciled: movingAverageReconciled,
+                };
         return {
           product: {
             id: row.product_id,
@@ -957,23 +1008,19 @@ export class InventoryRepository {
             { code: 'IN_TRANSIT', quantity: inTransit },
           ],
           averageUnitCost: this.normalizeCost(row.average_unit_cost),
-          inventoryValue: this.valuationValue(
-            row.total_quantity,
-            row.average_unit_cost,
-          ),
+          inventoryValue: costing.inventoryValue,
+          costing,
           valuation: {
             quantity: this.normalizeDecimal(row.valuation_quantity),
             inventoryValue: this.normalizeCost(row.total_inventory_value),
             quantityReconciled,
             valueReconciled,
-            reconciled: quantityReconciled && valueReconciled,
+            reconciled: movingAverageReconciled,
           },
           lotTracking: row.track_lots
             ? {
                 lotQuantity: this.normalizeDecimal(row.lot_quantity),
-                reconciled:
-                  this.toUnits(row.lot_quantity) ===
-                  this.toUnits(row.total_quantity),
+                reconciled: lotReconciled,
                 currency: row.lot_currency,
                 inventoryValue: this.normalizeCost(row.lot_inventory_value),
               }
@@ -982,9 +1029,7 @@ export class InventoryRepository {
             quantity: this.normalizeDecimal(row.fifo_quantity),
             inventoryValue: this.normalizeCost(row.fifo_inventory_value),
             currency: row.fifo_currency,
-            reconciled:
-              this.toUnits(row.fifo_quantity) ===
-              this.toUnits(row.total_quantity),
+            reconciled: fifoReconciled,
           },
         };
       }),
@@ -992,6 +1037,13 @@ export class InventoryRepository {
       scope: {
         branch: { id: scope.branch_id, name: scope.branch_name },
         warehouse: { id: scope.warehouse_id, name: scope.warehouse_name },
+      },
+      valuation: {
+        method: scope.valuation_method,
+        policyVersion: Number(scope.valuation_version),
+        effectiveAt: new Date(scope.valuation_effective_at).toISOString(),
+        currency: tenantCurrency,
+        asOf: new Date().toISOString(),
       },
     };
   }
@@ -1642,6 +1694,10 @@ export class InventoryRepository {
     const rounded =
       numerator >= 0n ? (numerator + 500n) / 1000n : (numerator - 500n) / 1000n;
     return this.fromCostUnits(rounded);
+  }
+
+  private currencyForCountry(countryCode: string): string {
+    return { MX: 'MXN', CL: 'CLP' }[countryCode] ?? 'USD';
   }
 
   private isValuationValueReconciled(

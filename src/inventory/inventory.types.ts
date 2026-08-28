@@ -1,3 +1,5 @@
+import type { InventoryValuationMethod } from './inventory-valuation-policy.types';
+
 export const INVENTORY_MOVEMENT_TYPES = [
   'INITIAL',
   'ENTRY',
@@ -304,6 +306,13 @@ export interface InventoryStockItem {
   states: InventoryStateQuantity[];
   averageUnitCost: string;
   inventoryValue: string;
+  costing: {
+    method: InventoryValuationMethod;
+    currency: string;
+    quantity: string;
+    inventoryValue: string;
+    reconciled: boolean;
+  };
   valuation: {
     quantity: string;
     inventoryValue: string;
@@ -338,6 +347,13 @@ export interface InventoryStockListResponse {
     scope: {
       branch: { id: string; name: string };
       warehouse: { id: string; name: string };
+    };
+    valuation: {
+      method: InventoryValuationMethod;
+      policyVersion: number;
+      effectiveAt: string;
+      currency: string;
+      asOf: string;
     };
     pagination: {
       page: number;

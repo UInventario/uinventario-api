@@ -2411,31 +2411,56 @@ describe('UInventario API (e2e)', () => {
         .get('/api/v1/inventory/stock')
         .set('Cookie', cookie)
         .expect(200)
-        .expect(({ body }: { body: { data: unknown[] } }) => {
-          expect(body.data).toEqual(
-            expect.arrayContaining([
-              expect.objectContaining({
-                product: {
-                  id: order.lines[0].productId,
-                  name: 'Receipts Producto',
-                  sku: 'RECEIPTS-1',
-                  active: true,
-                  trackLots: false,
-                },
-                totalQuantity: '7.000',
-                averageUnitCost: '80.7714',
-                inventoryValue: '565.3998',
-                valuation: {
-                  quantity: '7.000',
-                  inventoryValue: '565.4000',
-                  quantityReconciled: true,
-                  valueReconciled: true,
-                  reconciled: true,
-                },
-              }),
-            ]),
-          );
-        });
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: unknown[]; meta: Record<string, unknown> };
+          }) => {
+            expect(body.data).toEqual(
+              expect.arrayContaining([
+                expect.objectContaining({
+                  product: {
+                    id: order.lines[0].productId,
+                    name: 'Receipts Producto',
+                    sku: 'RECEIPTS-1',
+                    active: true,
+                    trackLots: false,
+                  },
+                  totalQuantity: '7.000',
+                  averageUnitCost: '80.7714',
+                  inventoryValue: '565.3998',
+                  costing: {
+                    method: 'MOVING_AVERAGE',
+                    currency: 'MXN',
+                    quantity: '7.000',
+                    inventoryValue: '565.3998',
+                    reconciled: true,
+                  },
+                  valuation: {
+                    quantity: '7.000',
+                    inventoryValue: '565.4000',
+                    quantityReconciled: true,
+                    valueReconciled: true,
+                    reconciled: true,
+                  },
+                }),
+              ]),
+            );
+            expect(body.meta).toMatchObject({
+              valuation: {
+                method: 'MOVING_AVERAGE',
+                policyVersion: 1,
+                currency: 'MXN',
+              },
+            });
+            expect(
+              Number.isNaN(
+                Date.parse((body.meta.valuation as { asOf: string }).asOf),
+              ),
+            ).toBe(false);
+          },
+        );
     });
 
     it('rolls back receipt, stock, cost and order state when movement persistence fails', async () => {
@@ -3533,6 +3558,26 @@ describe('UInventario API (e2e)', () => {
             data: { valuation: { method: 'FIFO', policyVersion: 2 } },
           });
         });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              {
+                costing: {
+                  method: 'FIFO',
+                  currency: 'MXN',
+                  quantity: '4.000',
+                  inventoryValue: '40.0000',
+                  reconciled: true,
+                },
+              },
+            ],
+            meta: { valuation: { method: 'FIFO', policyVersion: 2 } },
+          });
+        });
 
       const lotPreview = await request(app.getHttpServer())
         .post('/api/v1/inventory/valuation-policy/preview')
@@ -3560,6 +3605,28 @@ describe('UInventario API (e2e)', () => {
           planFingerprint: lotPlan.data.planFingerprint,
         })
         .expect(201);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              {
+                costing: {
+                  method: 'SPECIFIC_LOT',
+                  currency: 'MXN',
+                  quantity: '4.000',
+                  inventoryValue: '40.0000',
+                  reconciled: true,
+                },
+              },
+            ],
+            meta: {
+              valuation: { method: 'SPECIFIC_LOT', policyVersion: 3 },
+            },
+          });
+        });
       await request(app.getHttpServer())
         .post('/api/v1/inventory/valuation-policy/changes')
         .set('Cookie', cookie)
@@ -7074,6 +7141,10 @@ describe('UInventario API (e2e)', () => {
         workbookBuffer as unknown as Parameters<typeof workbook.xlsx.load>[0],
       );
       expect(workbook.worksheets[0].getCell('D2').value).toBe(4);
+      expect(workbook.worksheets[0].getCell('I2').value).toBe('MOVING_AVERAGE');
+      expect(workbook.worksheets[0].getCell('J2').value).toBe('MXN');
+      expect(workbook.worksheets[0].getCell('K2').value).toBe(true);
+      expect(workbook.worksheets[0].getCell('L2').value).toBe(320);
 
       const salesExport = await createExport({
         dataset: 'SALES',
