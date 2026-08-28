@@ -56,6 +56,7 @@ export const validationSchema = Joi.object({
     then: secureOriginList.required(),
     otherwise: originList.default('http://localhost:4200'),
   }),
+  OBSERVABILITY_SUCCESS_SAMPLE_RATE: Joi.number().min(0).max(1).default(0.1),
   DATABASE_URL: Joi.string()
     .uri({ scheme: ['mysql'] })
     .required(),
