@@ -6714,6 +6714,46 @@ describe('UInventario API (e2e)', () => {
       return { cookie, productId, locationId: location.id };
     }
 
+    it('accepts the unified sale contract with one cash payment', async () => {
+      const { cookie, productId } = await preparePos();
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'single-cash-payment')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          payments: [
+            {
+              method: 'CASH',
+              amount: '119.90',
+              amountReceived: '120.00',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              payment: {
+                method: 'CASH',
+                amountReceived: '120.00',
+                amountApplied: '119.90',
+                change: '0.10',
+              },
+              payments: [
+                {
+                  method: 'CASH',
+                  amountReceived: '120.00',
+                  amountApplied: '119.90',
+                  change: '0.10',
+                },
+              ],
+            },
+          });
+        });
+    });
+
     it('authorizes card, transfer and voucher payments without affecting expected cash', async () => {
       const { cookie, productId, locationId } = await preparePos();
       await request(app.getHttpServer())
