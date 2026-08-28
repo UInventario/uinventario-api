@@ -71,6 +71,9 @@ Los objetivos RPO/RTO, la retención y el procedimiento de restore aislado está
 [`docs/operations/database-recovery.md`](docs/operations/database-recovery.md).
 El checklist de release, smoke, rollback coordinado y contactos operativos está en
 [`docs/operations/production-runbook.md`](docs/operations/production-runbook.md).
+La política versionada de API/offline, ventana de clientes y migraciones
+expand/contract está en
+[`docs/compatibility-policy.md`](docs/compatibility-policy.md).
 
 ## Aislamiento multiempresa
 

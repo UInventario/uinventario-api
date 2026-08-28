@@ -4,6 +4,15 @@ import type { InventoryValuationPolicyData } from '../inventory/inventory-valuat
 export const OFFLINE_SYNC_PROTOCOL_VERSION = '1.0' as const;
 export const OFFLINE_SYNC_MAX_PAGE_SIZE = 500 as const;
 
+export const OFFLINE_SYNC_COMPATIBILITY_POLICY_V1 = {
+  apiVersion: 'v1',
+  currentProtocolVersion: OFFLINE_SYNC_PROTOCOL_VERSION,
+  minimumProtocolVersion: '1.0',
+  supportedMajorVersion: 1,
+  deprecationNoticeDays: 180,
+  breakingChangesRequireNewMajor: true,
+} as const;
+
 export const OFFLINE_FRESHNESS_POLICY_V1 = {
   version: 1,
   maxClockSkewSeconds: 300,

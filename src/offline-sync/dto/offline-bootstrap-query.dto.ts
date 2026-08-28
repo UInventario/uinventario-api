@@ -4,6 +4,7 @@ import {
   IsOptional,
   IsString,
   IsUUID,
+  Matches,
   Max,
   MaxLength,
   Min,
@@ -11,6 +12,10 @@ import {
 import { OFFLINE_SYNC_MAX_PAGE_SIZE } from '../offline-sync-v1.contract';
 
 export class OfflineBootstrapQueryDto {
+  @IsOptional()
+  @Matches(/^1\.\d+$/)
+  protocolVersion?: string = '1.0';
+
   @IsUUID()
   deviceId!: string;
 

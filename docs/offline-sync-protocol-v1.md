@@ -1,6 +1,6 @@
 # Protocolo offline v1
 
-El contrato canónico está en `src/offline-sync/offline-sync-v1.contract.ts`. La versión `1.x` admite cambios aditivos; quitar, renombrar o cambiar la semántica de un campo requiere una versión mayor.
+El contrato canónico está en `src/offline-sync/offline-sync-v1.contract.ts`. La versión `1.x` admite cambios aditivos; quitar, renombrar o cambiar la semántica de un campo requiere una versión mayor. La ventana de soporte y el procedimiento de retiro están en [`compatibility-policy.md`](compatibility-policy.md).
 
 ## Alcance inmediato
 
