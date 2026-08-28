@@ -73,6 +73,14 @@ gcloud artifacts repositories add-iam-policy-binding "$artifact_repository" \
   --condition=None \
   --quiet >/dev/null
 
+source_bucket="gs://${project_id}_cloudbuild"
+if gcloud storage buckets describe "$source_bucket" >/dev/null 2>&1; then
+  gcloud storage buckets add-iam-policy-binding "$source_bucket" \
+    --member="$build_member" \
+    --role=roles/storage.objectViewer \
+    --quiet >/dev/null
+fi
+
 for runtime in uinventario-api-runtime uinventario-web-runtime; do
   gcloud iam service-accounts add-iam-policy-binding "${runtime}@${project_id}.iam.gserviceaccount.com" \
     --project="$project_id" \
