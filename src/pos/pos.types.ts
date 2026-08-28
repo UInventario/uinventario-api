@@ -79,6 +79,7 @@ export interface CashSaleData {
   currency: string;
   taxRate: string;
   lines: Array<{
+    id: string;
     product: { id: string; name: string; sku: string };
     quantity: string;
     unitPrice: string;
@@ -119,7 +120,7 @@ export interface SaleDetailData extends Omit<CashSaleData, 'userId'> {
   user: { id: string; email: string };
   movements: Array<{
     id: string;
-    type: 'SALE' | 'SALE_VOID';
+    type: 'SALE' | 'SALE_VOID' | 'SALE_RETURN';
     saleLineId: string;
     product: { id: string; name: string; sku: string };
     location: { id: string; name: string; code: string };

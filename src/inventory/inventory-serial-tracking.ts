@@ -29,6 +29,8 @@ interface MovementRow {
   created_by_user_id: string;
   sale_id: string | null;
   sale_line_id: string | null;
+  sale_return_line_id: string | null;
+  source_sale_movement_id: string | null;
   transfer_line_id: string | null;
   reservation_id: string | null;
   purchase_return_line_id: string | null;
@@ -227,6 +229,7 @@ export async function applyInventorySerialTracking(
     `SELECT im.id, im.tenant_id, im.product_id, im.location_id, im.type,
             im.quantity_change, im.state_quantity, im.from_state, im.to_state,
             im.created_by_user_id, im.sale_id, im.sale_line_id,
+            im.sale_return_line_id, im.source_sale_movement_id,
             im.transfer_line_id, im.reservation_id,
             im.purchase_return_line_id, p.track_serials
      FROM inventory_movements im
@@ -320,6 +323,20 @@ export async function applyInventorySerialTracking(
         allowed = ['SOLD', 'REMOVED'];
         toStatus = 'AVAILABLE';
         break;
+      case 'SALE_RETURN': {
+        const [returnLine] = await manager.query<
+          Array<{ item_condition: 'SELLABLE' | 'DAMAGED' }>
+        >(
+          `SELECT item_condition FROM sale_return_lines
+           WHERE id = ? AND tenant_id = ?`,
+          [movement.sale_return_line_id, movement.tenant_id],
+        );
+        if (!returnLine) throw new InventorySerialStateConflictError();
+        allowed = ['SOLD'];
+        toStatus =
+          returnLine.item_condition === 'DAMAGED' ? 'DAMAGED' : 'AVAILABLE';
+        break;
+      }
       case 'TRANSFER_OUT':
         toStatus = 'IN_TRANSIT';
         toLocationId = options.destinationLocationId ?? null;
@@ -351,7 +368,7 @@ export async function applyInventorySerialTracking(
     if (
       !allowed.includes(serial.status) ||
       (serial.current_location_id !== movement.location_id &&
-        movement.type !== 'SALE_VOID')
+        !['SALE_VOID', 'SALE_RETURN'].includes(movement.type))
     ) {
       throw new InventorySerialStateConflictError();
     }

@@ -16,6 +16,7 @@ export const INVENTORY_MOVEMENT_TYPES = [
   'TRANSFER_DISCREPANCY',
   'SALE',
   'SALE_VOID',
+  'SALE_RETURN',
   'PURCHASE_RECEIPT',
   'SUPPLIER_RETURN',
 ] as const;
@@ -31,6 +32,7 @@ export type UserInventoryMovementType = Exclude<
   | 'TRANSFER_DISCREPANCY'
   | 'SALE'
   | 'SALE_VOID'
+  | 'SALE_RETURN'
   | 'PURCHASE_RECEIPT'
   | 'SUPPLIER_RETURN'
 >;
@@ -303,6 +305,7 @@ export interface InventoryMovementHistoryItem {
       | 'MOVEMENT'
       | 'IMPORT'
       | 'SALE'
+      | 'SALE_RETURN'
       | 'TRANSFER'
       | 'RECEIPT'
       | 'PURCHASE_RECEIPT'

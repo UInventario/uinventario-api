@@ -21,6 +21,7 @@ interface FifoMovementRow {
   purchase_return_line_id: string | null;
   sale_id: string | null;
   sale_line_id: string | null;
+  source_sale_movement_id: string | null;
   transfer_line_id: string | null;
   unit_cost: string | null;
   country_code: string;
@@ -306,6 +307,7 @@ async function restoreSale(
   movement: FifoMovementRow,
   expectedQuantity: bigint,
 ): Promise<bigint> {
+  const sourceFilter = movement.source_sale_movement_id ? 'AND im.id = ?' : '';
   const allocations = await manager.query<SourceAllocationRow[]>(
     `SELECT imfl.id, imfl.layer_id, imfl.quantity_change,
             imfl.unit_cost, imfl.currency, layer.acquired_at
@@ -315,7 +317,7 @@ async function restoreSale(
      INNER JOIN inventory_fifo_layers layer
        ON layer.id = imfl.layer_id AND layer.tenant_id = imfl.tenant_id
      WHERE im.tenant_id = ? AND im.sale_id = ? AND im.sale_line_id = ?
-       AND im.location_id = ? AND im.type = 'SALE'
+       AND im.location_id = ? AND im.type = 'SALE' ${sourceFilter}
      ORDER BY im.created_at, im.id, imfl.created_at, imfl.id
      FOR UPDATE`,
     [
@@ -323,12 +325,24 @@ async function restoreSale(
       movement.sale_id,
       movement.sale_line_id,
       movement.location_id,
+      ...(movement.source_sale_movement_id
+        ? [movement.source_sale_movement_id]
+        : []),
     ],
   );
   let restored = 0n;
   let totalValue = 0n;
   for (const allocation of allocations) {
-    const quantity = -quantityUnits(allocation.quantity_change);
+    const original = -quantityUnits(allocation.quantity_change);
+    const [prior] = await manager.query<Array<{ quantity: string }>>(
+      `SELECT COALESCE(SUM(quantity_change), 0) AS quantity
+       FROM inventory_movement_fifo_layers
+       WHERE tenant_id = ? AND source_allocation_id = ?`,
+      [movement.tenant_id, allocation.id],
+    );
+    const available = original - quantityUnits(prior.quantity);
+    const needed = expectedQuantity - restored;
+    const quantity = available < needed ? available : needed;
     if (quantity <= 0n) continue;
     const [layer] = await manager.query<
       Array<{ original_quantity: string; remaining_quantity: string }>
@@ -484,6 +498,7 @@ export async function applyInventoryFifoValuation(
     `SELECT im.id, im.tenant_id, im.product_id, im.location_id, im.type,
             im.quantity_change, im.purchase_receipt_line_id,
             im.purchase_return_line_id, im.sale_id, im.sale_line_id,
+            im.source_sale_movement_id,
             im.transfer_line_id, im.unit_cost, im.created_at, t.country_code
      FROM inventory_movements im
      INNER JOIN tenants t ON t.id = im.tenant_id
@@ -507,7 +522,7 @@ export async function applyInventoryFifoValuation(
   const quantityChange = quantityUnits(movement.quantity_change);
   let valueChange = 0n;
   if (quantityChange > 0n) {
-    if (movement.type === 'SALE_VOID') {
+    if (movement.type === 'SALE_VOID' || movement.type === 'SALE_RETURN') {
       valueChange = await restoreSale(manager, movement, quantityChange);
     } else if (movement.type === 'TRANSFER_IN') {
       valueChange = await transferLayers(manager, movement, quantityChange);

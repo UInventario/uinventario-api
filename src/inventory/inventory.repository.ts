@@ -678,6 +678,7 @@ export class InventoryRepository {
           resulting_quantity: string;
           idempotency_key: string;
           sale_id: string | null;
+          sale_return_id: string | null;
           transfer_id: string | null;
           receipt_id: string | null;
           inventory_import_id: string | null;
@@ -713,7 +714,8 @@ export class InventoryRepository {
         }>
       >(
         `SELECT im.id, im.type, im.quantity_change, im.resulting_quantity,
-                im.idempotency_key, im.sale_id, im.transfer_id, im.receipt_id,
+                im.idempotency_key, im.sale_id, im.sale_return_id,
+                im.transfer_id, im.receipt_id,
                 im.inventory_import_id, im.purchase_receipt_id, im.purchase_return_id,
                 im.reservation_id,
                 im.from_state, im.to_state, im.state_quantity,
@@ -848,6 +850,7 @@ export class InventoryRepository {
         },
         responsible: { id: row.user_id, email: row.user_email },
         correlationId:
+          row.sale_return_id ??
           row.sale_id ??
           row.transfer_id ??
           row.inventory_import_id ??
@@ -856,53 +859,59 @@ export class InventoryRepository {
           row.reservation_id ??
           row.id,
         idempotencyKey: row.idempotency_key,
-        document: row.reservation_id
+        document: row.sale_return_id
           ? {
-              type: 'RESERVATION',
-              id: row.reservation_id,
+              type: 'SALE_RETURN',
+              id: row.sale_return_id,
               reference: row.reference,
             }
-          : row.purchase_return_id
+          : row.reservation_id
             ? {
-                type: 'SUPPLIER_RETURN',
-                id: row.purchase_return_id,
+                type: 'RESERVATION',
+                id: row.reservation_id,
                 reference: row.reference,
               }
-            : row.purchase_receipt_id
+            : row.purchase_return_id
               ? {
-                  type: 'PURCHASE_RECEIPT',
-                  id: row.purchase_receipt_id,
+                  type: 'SUPPLIER_RETURN',
+                  id: row.purchase_return_id,
                   reference: row.reference,
                 }
-              : row.inventory_import_id
+              : row.purchase_receipt_id
                 ? {
-                    type: 'IMPORT',
-                    id: row.inventory_import_id,
+                    type: 'PURCHASE_RECEIPT',
+                    id: row.purchase_receipt_id,
                     reference: row.reference,
                   }
-                : row.receipt_id
+                : row.inventory_import_id
                   ? {
-                      type: 'RECEIPT',
-                      id: row.receipt_id,
+                      type: 'IMPORT',
+                      id: row.inventory_import_id,
                       reference: row.reference,
                     }
-                  : row.transfer_id
+                  : row.receipt_id
                     ? {
-                        type: 'TRANSFER',
-                        id: row.transfer_id,
+                        type: 'RECEIPT',
+                        id: row.receipt_id,
                         reference: row.reference,
                       }
-                    : row.sale_id
+                    : row.transfer_id
                       ? {
-                          type: 'SALE',
-                          id: row.sale_id,
+                          type: 'TRANSFER',
+                          id: row.transfer_id,
                           reference: row.reference,
                         }
-                      : {
-                          type: 'MOVEMENT',
-                          id: row.id,
-                          reference: row.reference,
-                        },
+                      : row.sale_id
+                        ? {
+                            type: 'SALE',
+                            id: row.sale_id,
+                            reference: row.reference,
+                          }
+                        : {
+                            type: 'MOVEMENT',
+                            id: row.id,
+                            reference: row.reference,
+                          },
         stateTransition:
           row.from_state && row.to_state && row.state_quantity
             ? {

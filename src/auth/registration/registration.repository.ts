@@ -83,6 +83,7 @@ export class RegistrationRepository {
       `INSERT INTO role_permissions (role_id, tenant_id, permission) VALUES
         (?, ?, 'TENANT_MANAGE'), (?, ?, 'PRODUCTS_MANAGE'),
         (?, ?, 'SALES_MANAGE'), (?, ?, 'SALES_VOID'),
+        (?, ?, 'SALES_RETURN'),
         (?, ?, 'SALES_DISCOUNT'), (?, ?, 'SALE_REPRINT'),
         (?, ?, 'CASH_REGISTER_OPEN'), (?, ?, 'CASH_REGISTER_CLOSE'),
         (?, ?, 'CASH_REGISTER_MOVE'),
@@ -97,7 +98,7 @@ export class RegistrationRepository {
         (?, ?, 'INVENTORY_TRANSFER'), (?, ?, 'INVENTORY_COUNT'),
         (?, ?, 'INVENTORY_APPROVE'),
         (?, ?, 'INVENTORY_VALUATION_MANAGE')`,
-      Array.from({ length: 23 }, () => [role.id, tenant.id]).flat(),
+      Array.from({ length: 24 }, () => [role.id, tenant.id]).flat(),
     );
     await manager.query(
       `INSERT INTO privacy_policies
