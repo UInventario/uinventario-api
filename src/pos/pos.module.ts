@@ -15,10 +15,17 @@ import { PermissionGuard } from '../auth/authorization/permission.guard';
 import { PaymentAuthorizationService } from './payment-authorization.service';
 import { SalesCashReportRepository } from './sales-cash-report.repository';
 import { SalesCashReportService } from './sales-cash-report.service';
+import { SaleReceiptController } from './sale-receipt.controller';
+import { SaleReceiptRepository } from './sale-receipt.repository';
+import { SaleReceiptService } from './sale-receipt.service';
+import {
+  SALE_RECEIPT_EMAIL_ADAPTER,
+  SimulatorSaleReceiptEmailAdapter,
+} from './sale-receipt-email.adapter';
 
 @Module({
   imports: [SessionModule],
-  controllers: [PosController],
+  controllers: [PosController, SaleReceiptController],
   providers: [
     PosRepository,
     SalesRepository,
@@ -32,6 +39,13 @@ import { SalesCashReportService } from './sales-cash-report.service';
     PaymentAuthorizationService,
     SalesCashReportRepository,
     SalesCashReportService,
+    SaleReceiptRepository,
+    SaleReceiptService,
+    SimulatorSaleReceiptEmailAdapter,
+    {
+      provide: SALE_RECEIPT_EMAIL_ADAPTER,
+      useExisting: SimulatorSaleReceiptEmailAdapter,
+    },
     PosService,
     PosAccessGuard,
   ],

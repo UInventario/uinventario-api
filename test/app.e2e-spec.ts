@@ -58,6 +58,7 @@ describe('UInventario API (e2e)', () => {
       'offline_devices',
       'offline_sync_tombstones',
       'password_reset_tokens',
+      'sale_receipt_snapshots',
       'sale_payments',
       'sale_lines',
       'sales',
@@ -9376,6 +9377,204 @@ describe('UInventario API (e2e)', () => {
             },
           });
         });
+    });
+
+    it('reprints an immutable non-fiscal receipt and sends it through the email simulator', async () => {
+      const { cookie, productId } = await preparePos();
+      const sale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'receipt-sale')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: '120.00',
+        })
+        .expect(201);
+      const saleId = (sale.body as { data: { id: string } }).data.id;
+      const [principal] = await dataSource.query<
+        Array<{ tenant_id: string; role_id: string }>
+      >(
+        `SELECT user.tenant_id, user_role.role_id FROM users user
+         INNER JOIN user_roles user_role
+           ON user_role.user_id = user.id AND user_role.tenant_id = user.tenant_id
+         WHERE user.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'SALE_REPRINT'`,
+        [principal.role_id, principal.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/receipt/reprints`)
+        .set('Cookie', cookie)
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PERMISSION_DENIED');
+        });
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'SALE_REPRINT')`,
+        [principal.role_id, principal.tenant_id],
+      );
+
+      await dataSource.query(
+        `UPDATE tenants SET name = 'Nombre nuevo', legal_name = 'Razón social nueva'
+         WHERE id = ?`,
+        [principal.tenant_id],
+      );
+      await dataSource.query(
+        `UPDATE cash_registers SET name = 'Caja renombrada' WHERE tenant_id = ?`,
+        [principal.tenant_id],
+      );
+      await dataSource.query(
+        `UPDATE sale_lines SET product_name = 'Producto alterado' WHERE sale_id = ?`,
+        [saleId],
+      );
+
+      for (const requestId of ['receipt-print-1', 'receipt-print-2']) {
+        await request(app.getHttpServer())
+          .post(`/api/v1/pos/sales/${saleId}/receipt/reprints`)
+          .set('Cookie', cookie)
+          .set('X-Request-Id', requestId)
+          .expect(200)
+          .expect(({ body }: { body: unknown }) => {
+            expect(body).toMatchObject({
+              data: {
+                saleId,
+                documentType: 'NON_FISCAL_SALE_RECEIPT',
+                fiscalNotice: 'COMPROBANTE NO FISCAL',
+                merchant: {
+                  name: 'Tienda POS',
+                  legalName: 'Tienda POS Legal',
+                  countryCode: 'MX',
+                },
+                branchName: 'Sucursal POS',
+                cashRegister: { name: 'Caja POS', code: 'MAIN' },
+                sellerEmail: registrationPayload.email,
+                currency: 'MXN',
+                lines: [
+                  {
+                    productName: 'Café POS',
+                    productSku: 'CAFE-POS',
+                    quantity: '1.000',
+                    unitPrice: '119.90',
+                    total: '119.90',
+                  },
+                ],
+                payments: [
+                  {
+                    method: 'CASH',
+                    amountReceived: '120.00',
+                    amountApplied: '119.90',
+                    change: '0.10',
+                  },
+                ],
+                totals: { subtotal: '103.36', tax: '16.54', total: '119.90' },
+                saleStatus: 'COMPLETED',
+              },
+              meta: { apiVersion: '1' },
+            });
+          });
+      }
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/receipt/deliveries`)
+        .set('Cookie', cookie)
+        .send({ email: 'no-es-correo' })
+        .expect(400);
+      const recipient = 'cliente.recibo@example.com';
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/receipt/deliveries`)
+        .set('Cookie', cookie)
+        .set('X-Request-Id', 'receipt-email-1')
+        .send({ email: recipient })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              receipt: { saleId, fiscalNotice: 'COMPROBANTE NO FISCAL' },
+              delivery: {
+                mode: 'SIMULATED',
+                channel: 'EMAIL',
+                recipient,
+              },
+            },
+          });
+        });
+
+      const foreignEmail = 'foreign.receipt@example.com';
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'receipt-foreign-registration')
+        .send({
+          organizationName: 'Comercio ajeno',
+          email: foreignEmail,
+          password: registrationPayload.password,
+        })
+        .expect(201);
+      const foreignCookie = await createPersistedSession(foreignEmail);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', foreignCookie)
+        .send({
+          legalName: 'Ajeno Legal',
+          tradeName: 'Ajeno',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', foreignCookie)
+        .send({
+          branchName: 'Sucursal ajena',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega ajena',
+          locationName: 'General ajena',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', foreignCookie)
+        .send({ name: 'Caja ajena' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/receipt/reprints`)
+        .set('Cookie', foreignCookie)
+        .expect(404);
+
+      const [state] = await dataSource.query<
+        Array<{
+          snapshots: number | string;
+          reprints: number | string;
+          sends: number | string;
+          send_data: string | { recipientHash: string };
+        }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM sale_receipt_snapshots WHERE sale_id = ?) AS snapshots,
+           (SELECT COUNT(*) FROM audit_events
+             WHERE action = 'SALE_RECEIPT_REPRINTED' AND entity_id = ?) AS reprints,
+           (SELECT COUNT(*) FROM audit_events
+             WHERE action = 'SALE_RECEIPT_SENT' AND entity_id = ?) AS sends,
+           (SELECT after_data FROM audit_events
+             WHERE action = 'SALE_RECEIPT_SENT' AND entity_id = ? LIMIT 1) AS send_data`,
+        [saleId, saleId, saleId, saleId],
+      );
+      const sendData =
+        typeof state.send_data === 'string'
+          ? (JSON.parse(state.send_data) as { recipientHash: string })
+          : state.send_data;
+      expect({
+        snapshots: Number(state.snapshots),
+        reprints: Number(state.reprints),
+        sends: Number(state.sends),
+      }).toEqual({ snapshots: 1, reprints: 2, sends: 1 });
+      expect(sendData.recipientHash).toBe(
+        createHash('sha256').update(recipient).digest('hex'),
+      );
+      expect(JSON.stringify(sendData)).not.toContain(recipient);
     });
 
     it('voids a sale once with payment, stock, cash and audit compensation', async () => {
