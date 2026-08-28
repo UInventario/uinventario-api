@@ -48,6 +48,10 @@ a esos nombres, nunca contener los valores. UIN-162 cubre el futuro proveedor de
 hasta entonces `PASSWORD_RESET_DELIVERY=disabled` mantiene el flujo preparado sin
 simular entrega productiva.
 
+Los contenedores pueden existir sin versiones para que el propietario cargue las URI
+reales directamente en Secret Manager. El despliegue exige que `latest` exista y esté
+habilitada; nunca se crea una versión vacía o aleatoria para superar el guard.
+
 Para rotar la base, agregar una nueva versión del secret y desplegar una nueva revisión
 que la referencie. El nombre de variable y el código no cambian. Dev y Prod nunca deben
 compartir secret, conexión ni versión.

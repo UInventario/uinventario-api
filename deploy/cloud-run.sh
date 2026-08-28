@@ -43,8 +43,12 @@ service_name="uinventario-api"
 migration_job="uinventario-api-migrate"
 runtime_service_account="${API_RUNTIME_SERVICE_ACCOUNT:-uinventario-api-runtime@${project_id}.iam.gserviceaccount.com}"
 
-if ! gcloud secrets describe "$database_secret" --project="$project_id" >/dev/null 2>&1; then
-  echo "Database secret $database_secret is unavailable in $project_id. Resolve Jira UIN-27 first." >&2
+database_secret_state="$(gcloud secrets versions describe latest \
+  --secret="$database_secret" \
+  --project="$project_id" \
+  --format='value(state)' 2>/dev/null || true)"
+if [ "$database_secret_state" != "ENABLED" ]; then
+  echo "Database secret $database_secret has no enabled latest version in $project_id. Resolve Jira UIN-27 first." >&2
   exit 3
 fi
 
