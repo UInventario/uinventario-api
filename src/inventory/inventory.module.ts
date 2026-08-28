@@ -14,6 +14,9 @@ import { InventoryCountRepository } from './inventory-count.repository';
 import { InventoryCountService } from './inventory-count.service';
 import { InventoryValuationPolicyService } from './inventory-valuation-policy.service';
 import { InventoryReconciliationService } from './inventory-reconciliation.service';
+import { InventoryStockAlertController } from './inventory-stock-alert.controller';
+import { InventoryStockAlertRepository } from './inventory-stock-alert.repository';
+import { InventoryStockAlertService } from './inventory-stock-alert.service';
 
 @Module({
   imports: [SessionModule],
@@ -21,6 +24,7 @@ import { InventoryReconciliationService } from './inventory-reconciliation.servi
     InventoryController,
     InventoryTransferController,
     InventoryCountController,
+    InventoryStockAlertController,
   ],
   providers: [
     InventoryRepository,
@@ -33,6 +37,8 @@ import { InventoryReconciliationService } from './inventory-reconciliation.servi
     InventoryCountService,
     InventoryValuationPolicyService,
     InventoryReconciliationService,
+    InventoryStockAlertRepository,
+    InventoryStockAlertService,
     PermissionGuard,
   ],
   exports: [

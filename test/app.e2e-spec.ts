@@ -49,6 +49,8 @@ describe('UInventario API (e2e)', () => {
       'inventory_reconciliation_guards',
       'inventory_reconciliation_findings',
       'inventory_reconciliation_runs',
+      'inventory_stock_alert_states',
+      'inventory_stock_thresholds',
       'inventory_valuation_policy_history',
       'inventory_valuation_policies',
       'offline_commands',
@@ -4778,6 +4780,159 @@ describe('UInventario API (e2e)', () => {
         Array<{ movements: number | string }>
       >('SELECT COUNT(*) AS movements FROM inventory_movements');
       expect(Number(counts.movements)).toBe(5);
+    });
+
+    it('transitions low, depleted and recovered alerts once per tenant location', async () => {
+      await registerAccount('inventory-alert-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeInventoryOnboarding(registrationPayload.email, cookie);
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto con alerta',
+          sku: 'ALERT-1',
+          cost: '5.00',
+          price: '9.00',
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      const [location] = await dataSource.query<
+        Array<{ id: string; tenant_id: string }>
+      >(
+        `SELECT location.id, location.tenant_id FROM locations location
+         INNER JOIN users user ON user.tenant_id = location.tenant_id
+         WHERE user.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      const movement = (
+        key: string,
+        type: 'INITIAL' | 'ENTRY' | 'EXIT',
+        quantity: string,
+      ) =>
+        request(app.getHttpServer())
+          .post('/api/v1/inventory/movements')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', key)
+          .send({
+            productId,
+            locationId: location.id,
+            type,
+            quantity,
+            reason: 'Prueba de transición de alerta',
+            reference: `REF-${key}`,
+          });
+
+      await movement('stock-alert-initial', 'INITIAL', '8').expect(201);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock-alerts')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[]; meta: unknown } }) => {
+          expect(body.data).toEqual([]);
+          expect(body.meta).toMatchObject({ defaultThreshold: '5.000' });
+        });
+
+      const low = await request(app.getHttpServer())
+        .put(
+          `/api/v1/inventory/stock-alerts/products/${productId}/locations/${location.id}/threshold`,
+        )
+        .set('Cookie', cookie)
+        .send({ threshold: '10' })
+        .expect(200);
+      expect(low.body).toMatchObject({
+        data: {
+          product: { id: productId, sku: 'ALERT-1' },
+          location: { id: location.id },
+          status: 'LOW',
+          availableQuantity: '8.000',
+          threshold: '10.000',
+        },
+      });
+      const lowTransitionedAt = (
+        low.body as { data: { transitionedAt: string } }
+      ).data.transitionedAt;
+      const repeated = await request(app.getHttpServer())
+        .put(
+          `/api/v1/inventory/stock-alerts/products/${productId}/locations/${location.id}/threshold`,
+        )
+        .set('Cookie', cookie)
+        .send({ threshold: '10' })
+        .expect(200);
+      expect(
+        (repeated.body as { data: { transitionedAt: string } }).data
+          .transitionedAt,
+      ).toBe(lowTransitionedAt);
+
+      await movement('stock-alert-recovery', 'ENTRY', '5').expect(201);
+      const recovered = await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock-alerts')
+        .query({ status: 'RECOVERED', q: ' alert-1 ' })
+        .set('Cookie', cookie)
+        .expect(200);
+      expect(recovered.body).toMatchObject({
+        data: [
+          {
+            status: 'RECOVERED',
+            availableQuantity: '13.000',
+            threshold: '10.000',
+          },
+        ],
+        meta: { pagination: { total: 1 } },
+      });
+      const recoveredAt = (
+        recovered.body as { data: Array<{ transitionedAt: string }> }
+      ).data[0].transitionedAt;
+      await movement('stock-alert-remains-recovered', 'ENTRY', '1').expect(201);
+      const stillRecovered = await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock-alerts')
+        .query({ status: 'RECOVERED' })
+        .set('Cookie', cookie)
+        .expect(200);
+      expect(
+        (stillRecovered.body as { data: Array<{ transitionedAt: string }> })
+          .data[0].transitionedAt,
+      ).toBe(recoveredAt);
+
+      await movement('stock-alert-low-again', 'EXIT', '10').expect(201);
+      await movement('stock-alert-depleted', 'EXIT', '4').expect(201);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock-alerts')
+        .query({ status: 'OUT_OF_STOCK' })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              {
+                product: { id: productId },
+                status: 'OUT_OF_STOCK',
+                availableQuantity: '0.000',
+              },
+            ],
+          });
+        });
+
+      const secondary = {
+        organizationName: 'Alertas aisladas',
+        email: 'stock-alert-other@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'stock-alert-secondary-registration')
+        .send(secondary)
+        .expect(201);
+      const secondaryCookie = await createPersistedSession(secondary.email);
+      await completeInventoryOnboarding(secondary.email, secondaryCookie);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock-alerts')
+        .set('Cookie', secondaryCookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toEqual([]);
+        });
     });
 
     it('applies operational movement directions and rolls back invalid exits', async () => {
