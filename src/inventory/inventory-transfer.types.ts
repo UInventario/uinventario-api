@@ -11,6 +11,7 @@ export interface InventoryTransferLineData {
   receivedQuantity: string;
   discrepancyQuantity: string;
   pendingQuantity: string;
+  serialNumbers: string[];
 }
 
 export interface InventoryTransferReceiptLineData {

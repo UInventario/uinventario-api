@@ -201,6 +201,32 @@ export class InventoryController {
     );
   }
 
+  @Get('products/:productId/serials')
+  @RequirePermissions('INVENTORY_VIEW')
+  listSerials(
+    @Req() request: AuthenticatedRequest,
+    @Param('productId', new ParseUUIDPipe()) productId: string,
+  ) {
+    return this.inventory.listSerials(
+      request.principal.tenant.id,
+      request.principal.context.warehouse!.id,
+      productId,
+    );
+  }
+
+  @Get('serials/:serialId/history')
+  @RequirePermissions('INVENTORY_VIEW')
+  serialHistory(
+    @Req() request: AuthenticatedRequest,
+    @Param('serialId', new ParseUUIDPipe()) serialId: string,
+  ) {
+    return this.inventory.serialHistory(
+      request.principal.tenant.id,
+      request.principal.context.warehouse!.id,
+      serialId,
+    );
+  }
+
   @Get('products/:productId/fifo-layers')
   @RequirePermissions('INVENTORY_VIEW')
   listFifoLayers(

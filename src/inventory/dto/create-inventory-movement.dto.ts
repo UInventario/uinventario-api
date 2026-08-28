@@ -1,5 +1,8 @@
 import { Transform } from 'class-transformer';
 import {
+  ArrayMaxSize,
+  ArrayUnique,
+  IsArray,
   IsIn,
   IsOptional,
   IsString,
@@ -59,4 +62,12 @@ export class CreateInventoryMovementDto {
   @IsString()
   @Matches(/^[A-Za-z0-9][A-Za-z0-9._/ -]{0,63}$/)
   lotCode?: string;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(1000)
+  @ArrayUnique((value: string) => value.trim().toUpperCase())
+  @IsString({ each: true })
+  @MaxLength(120, { each: true })
+  serialNumbers?: string[];
 }

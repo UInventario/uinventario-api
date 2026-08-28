@@ -28,6 +28,7 @@ interface ProductRow {
   sku: string;
   barcode: string | null;
   track_lots: number | boolean;
+  track_serials: number | boolean;
   cost: string;
   price: string;
   active: number | boolean;
@@ -72,8 +73,8 @@ export class CatalogRepository {
         await manager.query(
           `INSERT INTO products
             (id, tenant_id, name, sku, normalized_sku, barcode, track_lots,
-             category_id, brand_id, cost, price)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             track_serials, category_id, brand_id, cost, price)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             id,
             tenantId,
@@ -82,6 +83,7 @@ export class CatalogRepository {
             this.normalize(dto.sku),
             dto.barcode ?? null,
             specificLotPolicy || (dto.trackLots ?? false),
+            dto.trackSerials ?? false,
             categoryId,
             brandId,
             dto.cost,
@@ -128,11 +130,12 @@ export class CatalogRepository {
         const [currentTracking] = await manager.query<
           Array<{
             track_lots: number | boolean;
+            track_serials: number | boolean;
             has_movements: number | string;
             specific_lot_policy: number | string;
           }>
         >(
-          `SELECT p.track_lots,
+          `SELECT p.track_lots, p.track_serials,
                   EXISTS(SELECT 1 FROM inventory_movements im
                          WHERE im.tenant_id = p.tenant_id AND im.product_id = p.id) AS has_movements,
                   EXISTS(SELECT 1 FROM inventory_valuation_policies ivp
@@ -147,6 +150,13 @@ export class CatalogRepository {
           dto.trackLots !== Boolean(currentTracking.track_lots) &&
           (Number(currentTracking.has_movements) === 1 ||
             Number(currentTracking.specific_lot_policy) === 1)
+        ) {
+          throw new ProductLotTrackingLockedError();
+        }
+        if (
+          dto.trackSerials !== undefined &&
+          dto.trackSerials !== Boolean(currentTracking.track_serials) &&
+          Number(currentTracking.has_movements) === 1
         ) {
           throw new ProductLotTrackingLockedError();
         }
@@ -170,6 +180,7 @@ export class CatalogRepository {
           `UPDATE products
            SET name = ?, sku = ?, normalized_sku = ?, barcode = ?,
                track_lots = COALESCE(?, track_lots),
+               track_serials = COALESCE(?, track_serials),
                category_id = ?, brand_id = ?, cost = ?, price = ?, version = version + 1
            WHERE id = ? AND tenant_id = ? AND version = ?`,
           [
@@ -178,6 +189,7 @@ export class CatalogRepository {
             this.normalize(dto.sku),
             dto.barcode ?? null,
             dto.trackLots ?? null,
+            dto.trackSerials ?? null,
             categoryId,
             brandId,
             dto.cost,
@@ -528,7 +540,7 @@ export class CatalogRepository {
   }
 
   private productSelect(): string {
-    return `SELECT p.id, p.name, p.sku, p.barcode, p.track_lots, p.cost, p.price, p.active, p.version,
+    return `SELECT p.id, p.name, p.sku, p.barcode, p.track_lots, p.track_serials, p.cost, p.price, p.active, p.version,
                    c.id AS category_id, c.name AS category_name,
                    b.id AS brand_id, b.name AS brand_name
             FROM products p
@@ -594,6 +606,7 @@ export class CatalogRepository {
       sku: row.sku,
       barcode: row.barcode,
       trackLots: Boolean(row.track_lots),
+      trackSerials: Boolean(row.track_serials),
       category:
         row.category_id && row.category_name
           ? { id: row.category_id, name: row.category_name }

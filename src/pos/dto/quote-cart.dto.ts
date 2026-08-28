@@ -2,6 +2,7 @@ import { Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   ArrayMinSize,
+  ArrayUnique,
   IsArray,
   IsOptional,
   IsString,
@@ -21,6 +22,13 @@ export class QuoteCartLineDto {
   @IsUUID()
   @IsOptional()
   lotId?: string;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(1000)
+  @ArrayUnique((value: string) => value.trim().toUpperCase())
+  @IsString({ each: true })
+  serialNumbers?: string[];
 }
 
 export class QuoteCartDto {

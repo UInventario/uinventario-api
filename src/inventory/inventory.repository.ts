@@ -29,9 +29,12 @@ import {
   InventoryLotAllocation,
   InventoryFifoLayerData,
   InventoryFifoAllocation,
+  InventorySerialData,
+  InventorySerialEventData,
 } from './inventory.types';
 import { applyInventoryValuation } from './inventory-valuation';
 import { applyInventoryLotTracking } from './inventory-lot-tracking';
+import { applyInventorySerialTracking } from './inventory-serial-tracking';
 import type { InventoryValuationMethod } from './inventory-valuation-policy.types';
 
 interface MovementRow {
@@ -96,6 +99,184 @@ export class InventoryRepository {
        WHERE tenant_id = ? AND warehouse_id = ? AND active = TRUE ORDER BY name, id`,
       [tenantId, warehouseId],
     );
+  }
+
+  async listSerials(
+    tenantId: string,
+    warehouseId: string,
+    productId: string,
+  ): Promise<{ items: InventorySerialData[]; tracked: boolean }> {
+    const [product] = await this.dataSource.query<
+      Array<{ id: string; name: string; sku: string; track_serials: boolean }>
+    >(
+      `SELECT id, name, sku, track_serials FROM products
+       WHERE id = ? AND tenant_id = ? LIMIT 1`,
+      [productId, tenantId],
+    );
+    if (!product) throw new InventoryTargetNotFoundError();
+    const rows = await this.dataSource.query<
+      Array<{
+        id: string;
+        serial_number: string;
+        status: InventorySerialData['status'];
+        created_at: Date | string;
+        updated_at: Date | string;
+        location_id: string | null;
+        location_name: string | null;
+        location_code: string | null;
+      }>
+    >(
+      `SELECT serial.id, serial.serial_number, serial.status,
+              serial.created_at, serial.updated_at,
+              location.id AS location_id, location.name AS location_name,
+              location.code AS location_code
+       FROM inventory_serials serial
+       LEFT JOIN locations location
+         ON location.id = serial.current_location_id
+        AND location.tenant_id = serial.tenant_id
+       WHERE serial.tenant_id = ? AND serial.product_id = ?
+         AND (
+           location.warehouse_id = ? OR EXISTS (
+             SELECT 1 FROM inventory_serial_events event
+             LEFT JOIN locations source_location
+               ON source_location.id = event.from_location_id
+              AND source_location.tenant_id = event.tenant_id
+             LEFT JOIN locations target_location
+               ON target_location.id = event.to_location_id
+              AND target_location.tenant_id = event.tenant_id
+             WHERE event.tenant_id = serial.tenant_id
+               AND event.serial_id = serial.id
+               AND (source_location.warehouse_id = ? OR target_location.warehouse_id = ?)
+           )
+         )
+       ORDER BY serial.updated_at DESC, serial.normalized_serial
+       LIMIT 500`,
+      [tenantId, productId, warehouseId, warehouseId, warehouseId],
+    );
+    return {
+      tracked: Boolean(product.track_serials),
+      items: rows.map((row) => ({
+        id: row.id,
+        serialNumber: row.serial_number,
+        status: row.status,
+        product: { id: product.id, name: product.name, sku: product.sku },
+        currentLocation:
+          row.location_id && row.location_name && row.location_code
+            ? {
+                id: row.location_id,
+                name: row.location_name,
+                code: row.location_code,
+              }
+            : null,
+        createdAt: new Date(row.created_at).toISOString(),
+        updatedAt: new Date(row.updated_at).toISOString(),
+      })),
+    };
+  }
+
+  async serialHistory(
+    tenantId: string,
+    warehouseId: string,
+    serialId: string,
+  ): Promise<{
+    serial: InventorySerialData;
+    events: InventorySerialEventData[];
+  }> {
+    const [header] = await this.dataSource.query<Array<{ product_id: string }>>(
+      `SELECT serial.product_id FROM inventory_serials serial
+       WHERE serial.id = ? AND serial.tenant_id = ?
+         AND EXISTS (
+           SELECT 1 FROM inventory_serial_events event
+           LEFT JOIN locations source_location
+             ON source_location.id = event.from_location_id
+            AND source_location.tenant_id = event.tenant_id
+           LEFT JOIN locations target_location
+             ON target_location.id = event.to_location_id
+            AND target_location.tenant_id = event.tenant_id
+           WHERE event.serial_id = serial.id AND event.tenant_id = serial.tenant_id
+             AND (source_location.warehouse_id = ? OR target_location.warehouse_id = ?)
+         ) LIMIT 1`,
+      [serialId, tenantId, warehouseId, warehouseId],
+    );
+    if (!header) throw new InventoryTargetNotFoundError();
+    const listed = await this.listSerials(
+      tenantId,
+      warehouseId,
+      header.product_id,
+    );
+    const serial = listed.items.find((item) => item.id === serialId);
+    if (!serial) throw new InventoryTargetNotFoundError();
+    const rows = await this.dataSource.query<
+      Array<{
+        id: string;
+        from_status: InventorySerialData['status'] | null;
+        to_status: InventorySerialData['status'];
+        created_at: Date | string;
+        movement_id: string;
+        movement_type: InventoryMovementType;
+        reference: string | null;
+        reason: string;
+        from_location_id: string | null;
+        from_location_name: string | null;
+        from_location_code: string | null;
+        to_location_id: string | null;
+        to_location_name: string | null;
+        to_location_code: string | null;
+        user_id: string;
+        user_email: string;
+      }>
+    >(
+      `SELECT event.id, event.from_status, event.to_status, event.created_at,
+              movement.id AS movement_id, movement.type AS movement_type,
+              movement.reference, movement.reason,
+              source.id AS from_location_id, source.name AS from_location_name,
+              source.code AS from_location_code,
+              target.id AS to_location_id, target.name AS to_location_name,
+              target.code AS to_location_code,
+              user.id AS user_id, user.email AS user_email
+       FROM inventory_serial_events event
+       INNER JOIN inventory_movements movement ON movement.id = event.movement_id
+       INNER JOIN users user
+         ON user.id = event.created_by_user_id AND user.tenant_id = event.tenant_id
+       LEFT JOIN locations source
+         ON source.id = event.from_location_id AND source.tenant_id = event.tenant_id
+       LEFT JOIN locations target
+         ON target.id = event.to_location_id AND target.tenant_id = event.tenant_id
+       WHERE event.tenant_id = ? AND event.serial_id = ?
+       ORDER BY event.created_at, event.id`,
+      [tenantId, serialId],
+    );
+    const location = (
+      id: string | null,
+      name: string | null,
+      code: string | null,
+    ) => (id && name && code ? { id, name, code } : null);
+    return {
+      serial,
+      events: rows.map((row) => ({
+        id: row.id,
+        movement: {
+          id: row.movement_id,
+          type: row.movement_type,
+          reference: row.reference,
+          reason: row.reason,
+        },
+        fromStatus: row.from_status,
+        toStatus: row.to_status,
+        fromLocation: location(
+          row.from_location_id,
+          row.from_location_name,
+          row.from_location_code,
+        ),
+        toLocation: location(
+          row.to_location_id,
+          row.to_location_name,
+          row.to_location_code,
+        ),
+        responsible: { id: row.user_id, email: row.user_email },
+        createdAt: new Date(row.created_at).toISOString(),
+      })),
+    };
   }
 
   async listLots(
@@ -1127,6 +1308,7 @@ export class InventoryRepository {
           quantity: quantityChange,
           reason: input.dto.reason,
           reference: input.dto.reference ?? null,
+          serialNumbers: input.dto.serialNumbers ?? [],
         }),
       )
       .digest('hex');
@@ -1236,6 +1418,9 @@ export class InventoryRepository {
           await applyInventoryValuation(manager, movementId);
           await applyInventoryLotTracking(manager, movementId, {
             lotCode: input.dto.lotCode,
+          });
+          await applyInventorySerialTracking(manager, movementId, {
+            serialNumbers: input.dto.serialNumbers,
           });
           const movement = await this.findMovement(
             manager,
@@ -1377,6 +1562,7 @@ export class InventoryRepository {
             );
             await applyInventoryValuation(manager, movementId);
             await applyInventoryLotTracking(manager, movementId);
+            await applyInventorySerialTracking(manager, movementId);
           }
           await manager.query(
             `INSERT INTO inventory_counts
@@ -1453,6 +1639,7 @@ export class InventoryRepository {
           quantity: normalizedQuantity,
           reason: input.dto.reason,
           reference: input.dto.reference,
+          serialNumbers: input.dto.serialNumbers ?? [],
         }),
       )
       .digest('hex');
@@ -1556,6 +1743,9 @@ export class InventoryRepository {
           );
           await applyInventoryValuation(manager, movementId);
           await applyInventoryLotTracking(manager, movementId);
+          await applyInventorySerialTracking(manager, movementId, {
+            serialNumbers: input.dto.serialNumbers,
+          });
           const movement = await this.findMovement(
             manager,
             input.tenantId,

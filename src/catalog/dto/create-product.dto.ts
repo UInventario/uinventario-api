@@ -37,6 +37,10 @@ export class CreateProductDto {
   @IsBoolean()
   trackLots?: boolean;
 
+  @IsOptional()
+  @IsBoolean()
+  trackSerials?: boolean;
+
   @Transform(optionalTrim)
   @IsOptional()
   @IsString()

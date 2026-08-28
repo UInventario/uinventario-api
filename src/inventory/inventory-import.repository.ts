@@ -11,6 +11,7 @@ import {
 } from './inventory-import.errors';
 import { applyInventoryValuation } from './inventory-valuation';
 import { applyInventoryLotTracking } from './inventory-lot-tracking';
+import { applyInventorySerialTracking } from './inventory-serial-tracking';
 import type {
   InventoryImportPreviewRow,
   InventoryImportResponse,
@@ -455,6 +456,7 @@ export class InventoryImportRepository {
             );
             await applyInventoryValuation(manager, movementId);
             await applyInventoryLotTracking(manager, movementId);
+            await applyInventorySerialTracking(manager, movementId);
             movementCount += 1;
           }
           await manager.query(

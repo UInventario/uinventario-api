@@ -44,6 +44,13 @@ import {
   InventoryFifoLayerShortageError,
   InventoryLotNotFoundError,
 } from '../inventory/inventory.errors';
+import {
+  InventorySerialDuplicateError,
+  InventorySerialNotFoundError,
+  InventorySerialQuantityError,
+  InventorySerialRequiredError,
+  InventorySerialStateConflictError,
+} from '../inventory/inventory-serial-tracking';
 
 @Injectable()
 export class PosService {
@@ -299,6 +306,22 @@ export class PosService {
           code: 'INVENTORY_FIFO_CURRENCY_MISMATCH',
         });
       }
+      if (
+        error instanceof InventorySerialRequiredError ||
+        error instanceof InventorySerialQuantityError
+      ) {
+        throw new BadRequestException({ code: 'INVENTORY_SERIALS_REQUIRED' });
+      }
+      if (error instanceof InventorySerialNotFoundError)
+        throw new NotFoundException({ code: 'INVENTORY_SERIAL_NOT_FOUND' });
+      if (
+        error instanceof InventorySerialDuplicateError ||
+        error instanceof InventorySerialStateConflictError
+      ) {
+        throw new ConflictException({
+          code: 'INVENTORY_SERIAL_STATE_CONFLICT',
+        });
+      }
       throw error;
     }
   }
@@ -357,6 +380,7 @@ export class PosService {
       const context = await this.pos.getContext(input);
       const requested = new Map<string, bigint>();
       const requestedLots = new Map<string, string | null>();
+      const requestedSerials = new Map<string, string[]>();
       for (const line of input.dto.lines) {
         const quantity = this.toQuantityUnits(line.quantity);
         if (quantity <= 0n) {
@@ -375,6 +399,10 @@ export class PosService {
           throw new BadRequestException({ code: 'MIXED_PRODUCT_LOTS' });
         }
         requestedLots.set(line.productId, selectedLot);
+        requestedSerials.set(line.productId, [
+          ...(requestedSerials.get(line.productId) ?? []),
+          ...(line.serialNumbers ?? []),
+        ]);
       }
       const products = await this.pos.getProducts(
         input.tenantId,
@@ -414,6 +442,16 @@ export class PosService {
           if (!product)
             throw new NotFoundException({ code: 'PRODUCT_NOT_FOUND' });
           if (!product.active) throw new PosProductNotAvailableError(productId);
+          const serialNumbers = requestedSerials.get(productId) ?? [];
+          if (
+            product.trackSerials &&
+            BigInt(serialNumbers.length) * 1000n !== quantityUnits
+          ) {
+            throw new BadRequestException({
+              code: 'INVENTORY_SERIALS_REQUIRED',
+              message: 'Escanea una serie por cada unidad vendida.',
+            });
+          }
           const selectedLotId = requestedLots.get(productId) ?? null;
           const availableQuantity = selectedLotId
             ? lotAvailability.get(`${productId}:${selectedLotId}`)
@@ -443,6 +481,7 @@ export class PosService {
             product: { id: product.id, name: product.name, sku: product.sku },
             quantity: this.fromQuantityUnits(quantityUnits),
             lotId: requestedLots.get(productId) ?? null,
+            serialNumbers,
             availableQuantity: availableQuantity!,
             unitPrice: this.fromMoneyCents(this.toMoneyCents(product.price)),
             subtotal: this.fromMoneyCents(lineSubtotal),
@@ -592,6 +631,7 @@ export class PosService {
   private saleFingerprint(dto: CreateSaleDto): string {
     const quantities = new Map<string, bigint>();
     const lots = new Map<string, string | null>();
+    const serials = new Map<string, string[]>();
     for (const line of dto.lines) {
       quantities.set(
         line.productId,
@@ -604,6 +644,10 @@ export class PosService {
         throw new BadRequestException({ code: 'MIXED_PRODUCT_LOTS' });
       }
       lots.set(line.productId, lotId);
+      serials.set(line.productId, [
+        ...(serials.get(line.productId) ?? []),
+        ...(line.serialNumbers ?? []),
+      ]);
     }
     const canonical = {
       lines: [...quantities.entries()]
@@ -612,6 +656,9 @@ export class PosService {
           productId,
           quantity: this.fromQuantityUnits(quantity),
           lotId: lots.get(productId) ?? null,
+          serialNumbers: (serials.get(productId) ?? [])
+            .map((value) => value.trim().toUpperCase())
+            .sort(),
         })),
       payments: (dto.payments ?? (dto.payment ? [dto.payment] : [])).map(
         (payment) => ({

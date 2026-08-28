@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import { applyInventoryValuation } from '../inventory/inventory-valuation';
 import { applyInventoryLotTracking } from '../inventory/inventory-lot-tracking';
+import { applyInventorySerialTracking } from '../inventory/inventory-serial-tracking';
 import { ReceivePurchaseOrderDto } from './dto/receive-purchase-order.dto';
 import {
   InvalidPurchaseReceiptError,
@@ -51,6 +52,7 @@ export class PurchaseReceiptRepository {
       purchaseOrderLineId: line.purchaseOrderLineId,
       receivedQuantity: this.fromUnits(this.toUnits(line.receivedQuantity)),
       lotCode: line.lotCode ?? null,
+      serialNumbers: line.serialNumbers ?? [],
     }));
     const fingerprint = createHash('sha256')
       .update(
@@ -136,6 +138,7 @@ export class PurchaseReceiptRepository {
               received,
               overage,
               lotCode: line.lotCode ?? null,
+              serialNumbers: line.serialNumbers,
             };
           });
           const hasOverage = requested.some(({ overage }) => overage > 0n);
@@ -166,14 +169,23 @@ export class PurchaseReceiptRepository {
           for (const [index, item] of requested.entries()) {
             const receiptLineId = randomUUID();
             const [product] = await manager.query<
-              Array<{ cost: string; track_lots: number | boolean }>
+              Array<{
+                cost: string;
+                track_lots: number | boolean;
+                track_serials: number | boolean;
+              }>
             >(
-              `SELECT cost, track_lots FROM products
+              `SELECT cost, track_lots, track_serials FROM products
                WHERE id = ? AND tenant_id = ? FOR UPDATE`,
               [item.orderLine.product_id, input.tenantId],
             );
             if (!product) throw new InvalidPurchaseReceiptError();
             if (Boolean(product.track_lots) && !item.lotCode)
+              throw new InvalidPurchaseReceiptError();
+            if (
+              Boolean(product.track_serials) &&
+              BigInt(item.serialNumbers.length) * 1000n !== item.received
+            )
               throw new InvalidPurchaseReceiptError();
             const movementId = randomUUID();
             await manager.query(
@@ -275,6 +287,9 @@ export class PurchaseReceiptRepository {
             );
             await applyInventoryValuation(manager, movementId);
             await applyInventoryLotTracking(manager, movementId);
+            await applyInventorySerialTracking(manager, movementId, {
+              serialNumbers: item.serialNumbers,
+            });
             await manager.query(
               `UPDATE purchase_receipt_lines prl
                INNER JOIN products p
