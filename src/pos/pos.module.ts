@@ -13,6 +13,8 @@ import { CashRegisterClosureRepository } from './cash-register-closure.repositor
 import { CashRegisterClosureService } from './cash-register-closure.service';
 import { PermissionGuard } from '../auth/authorization/permission.guard';
 import { PaymentAuthorizationService } from './payment-authorization.service';
+import { SalesCashReportRepository } from './sales-cash-report.repository';
+import { SalesCashReportService } from './sales-cash-report.service';
 
 @Module({
   imports: [SessionModule],
@@ -28,6 +30,8 @@ import { PaymentAuthorizationService } from './payment-authorization.service';
     CashRegisterClosureService,
     PermissionGuard,
     PaymentAuthorizationService,
+    SalesCashReportRepository,
+    SalesCashReportService,
     PosService,
     PosAccessGuard,
   ],

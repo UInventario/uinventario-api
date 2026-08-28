@@ -5941,6 +5941,164 @@ describe('UInventario API (e2e)', () => {
       expect(balance.quantity).toBe('1.000');
     });
 
+    it('reconciles tenant-scoped sales, payments and cash shifts with local-date filters', async () => {
+      const { cookie, productId } = await preparePos();
+      const mixedSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'report-mixed-sale')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          payments: [
+            { method: 'CASH', amount: '60.00', amountReceived: '70.00' },
+            { method: 'CARD', amount: '59.90', reference: 'REPORT-CARD-001' },
+          ],
+        })
+        .expect(201);
+      const mixedData = mixedSale.body as {
+        data: { id: string; context: { branch: { id: string } } };
+      };
+      const cashSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'report-cash-sale')
+        .send({ lines: [{ productId, quantity: '1' }], cashReceived: '120.00' })
+        .expect(201);
+      const cashData = cashSale.body as { data: { id: string } };
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${cashData.data.id}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'report-cash-sale-void')
+        .send({ reason: 'Venta anulada para conciliación' })
+        .expect(201);
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/closure')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'report-shift-close')
+        .send({ countedAmount: '310.00' })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/reports/sales-cash')
+        .set('Cookie', cookie)
+        .query({
+          branchId: mixedData.data.context.branch.id,
+          page: 1,
+          pageSize: 1,
+        })
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: {
+                summary: {
+                  sales: unknown;
+                  payments: unknown[];
+                  cash: unknown;
+                  reconciliation: unknown;
+                };
+                sales: unknown[];
+                shifts: unknown[];
+              };
+              meta: unknown;
+            };
+          }) => {
+            expect(body).toMatchObject({
+              data: {
+                summary: {
+                  sales: {
+                    total: 2,
+                    completed: 1,
+                    voided: 1,
+                    net: '119.90',
+                    voidedAmount: '119.90',
+                  },
+                  cash: {
+                    shifts: 1,
+                    open: 0,
+                    closed: 1,
+                    expected: '310.00',
+                    counted: '310.00',
+                    difference: '0.00',
+                  },
+                  reconciliation: {
+                    salesNet: '119.90',
+                    paymentsApplied: '119.90',
+                    matches: true,
+                  },
+                },
+                shifts: [
+                  expect.objectContaining({
+                    status: 'CLOSED',
+                    difference: '0.00',
+                  }),
+                ],
+              },
+              meta: {
+                pagination: { page: 1, pageSize: 1, total: 2, totalPages: 2 },
+                periodTimezone: 'BRANCH_LOCAL',
+              },
+            });
+            expect(body.data.sales).toHaveLength(1);
+            expect(body.data.summary.payments).toEqual(
+              expect.arrayContaining([
+                expect.objectContaining({
+                  method: 'CASH',
+                  status: 'COMPLETED',
+                  amount: '60.00',
+                }),
+                expect.objectContaining({
+                  method: 'CARD',
+                  status: 'COMPLETED',
+                  amount: '59.90',
+                }),
+                expect.objectContaining({
+                  method: 'CASH',
+                  status: 'REVERSED',
+                  amount: '119.90',
+                }),
+              ]),
+            );
+          },
+        );
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/reports/sales-cash')
+        .set('Cookie', cookie)
+        .query({ status: 'VOIDED' })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { summary: { sales: { total: 1, completed: 0, voided: 1 } } },
+          });
+        });
+
+      await dataSource.query(
+        `UPDATE sales SET created_at = '2026-01-02 05:30:00' WHERE id = ?`,
+        [mixedData.data.id],
+      );
+      await dataSource.query(
+        `UPDATE sales SET created_at = '2026-01-02 06:30:00' WHERE id = ?`,
+        [cashData.data.id],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/reports/sales-cash')
+        .set('Cookie', cookie)
+        .query({ dateFrom: '2026-01-01', dateTo: '2026-01-01' })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { summary: { sales: { total: 1, completed: 1, voided: 0 } } },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/reports/sales-cash')
+        .set('Cookie', cookie)
+        .query({ dateFrom: '2026-01-01T00:00:00Z' })
+        .expect(400);
+    });
+
     it('manages tenant customers and associates an optional active customer to sales', async () => {
       const { cookie, productId } = await preparePos();
       await request(app.getHttpServer())
