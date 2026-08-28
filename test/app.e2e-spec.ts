@@ -674,6 +674,97 @@ describe('UInventario API (e2e)', () => {
         .set('Cookie', cookie)
         .expect(401);
     });
+
+    it('supports a rotating bearer session and tenant-bound bootstrap for Mobile', async () => {
+      await registerAccount('mobile-session-registration');
+
+      const login = await request(app.getHttpServer())
+        .post('/api/v1/auth/mobile/sessions')
+        .send({
+          email: registrationPayload.email,
+          password: registrationPayload.password,
+        })
+        .expect(200);
+      expect(login.headers['set-cookie']).toBeUndefined();
+      expect(login.headers['cache-control']).toContain('no-store');
+      expect(login.body).toMatchObject({
+        data: {
+          user: { email: registrationPayload.email, roles: ['ADMIN'] },
+          tenant: { name: registrationPayload.organizationName },
+        },
+        meta: { apiVersion: '1' },
+        auth: { tokenType: 'Bearer' },
+      });
+
+      const originalToken = (
+        login.body as {
+          auth: { accessToken: string };
+        }
+      ).auth.accessToken;
+      expect(originalToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+      const current = await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Authorization', `Bearer ${originalToken}`)
+        .set('X-Tenant-Id', '00000000-0000-0000-0000-000000000000')
+        .expect(200);
+      const tenantId = (current.body as { data: { tenant: { id: string } } })
+        .data.tenant.id;
+      const currentUserId = (current.body as { data: { user: { id: string } } })
+        .data.user.id;
+
+      await request(app.getHttpServer())
+        .get('/api/v1/offline/bootstrap')
+        .set('Authorization', `Bearer ${originalToken}`)
+        .query({
+          protocolVersion: '1.0',
+          deviceId: '11111111-1111-4111-8111-111111111111',
+          pageSize: 500,
+        })
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: {
+                scope: { tenantId: string; userId: string };
+                identity: { tenant: { id: string } };
+              };
+            };
+          }) => {
+            expect(body.data.scope.tenantId).toBe(tenantId);
+            expect(body.data.identity.tenant.id).toBe(tenantId);
+            expect(body.data.scope.userId).toBe(currentUserId);
+          },
+        );
+
+      const refresh = await request(app.getHttpServer())
+        .post('/api/v1/auth/mobile/sessions/refresh')
+        .set('Authorization', `Bearer ${originalToken}`)
+        .expect(200);
+      const rotatedToken = (
+        refresh.body as {
+          auth: { accessToken: string };
+        }
+      ).auth.accessToken;
+      expect(refresh.headers['cache-control']).toContain('no-store');
+      expect(rotatedToken).not.toBe(originalToken);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Authorization', `Bearer ${originalToken}`)
+        .expect(401);
+
+      await request(app.getHttpServer())
+        .delete('/api/v1/auth/sessions/current')
+        .set('Authorization', `Bearer ${rotatedToken}`)
+        .expect(204);
+      await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Authorization', `Bearer ${rotatedToken}`)
+        .expect(401);
+    });
   });
 
   describe('company onboarding', () => {

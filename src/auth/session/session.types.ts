@@ -24,6 +24,13 @@ export interface SessionResponse {
   meta: { apiVersion: '1'; sessionExpiresAt: string };
 }
 
+export interface MobileSessionResponse extends SessionResponse {
+  auth: {
+    tokenType: 'Bearer';
+    accessToken: string;
+  };
+}
+
 export interface AuthenticatedRequest extends Request {
   requestId?: string;
   principal: SessionIdentity;
