@@ -95,8 +95,8 @@ steps:
         sh deploy/cloud-run.sh "${_DEPLOY_ENV}" "$$image" "$$web_origin"
         api_url="$$(gcloud run services describe uinventario-api --project="$PROJECT_ID" --region="${_REGION}" --format='value(status.url)')"
         printf '%s' "$$api_url" > /workspace/deployed-api-url.txt
+        gcloud run services describe uinventario-api --project="$PROJECT_ID" --region="${_REGION}" --format=json > /workspace/deployed-api-service.json
         sh deploy/security-smoke.sh "$$api_url" "$$web_origin"
-        python deploy/verify-cloud-run-scaling.py "$PROJECT_ID" "${_REGION}"
         backup_image="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REPOSITORY}/database-backup:$COMMIT_SHA"
         sh deploy/database-backup-jobs.sh "${_DEPLOY_ENV}" "$$backup_image"
 
@@ -110,6 +110,15 @@ steps:
           curl --fail --silent --show-error "$$web_url/health/live" >/dev/null
           curl --fail --silent --show-error "$$web_url/config.json" >/dev/null
         fi
+
+  - id: verify-scaling
+    name: python:3.13-alpine
+    entrypoint: python
+    args:
+      - deploy/verify-cloud-run-scaling.py
+      - $PROJECT_ID
+      - ${_REGION}
+      - /workspace/deployed-api-service.json
 
   - id: performance-smoke
     name: node:24-alpine

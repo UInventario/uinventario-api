@@ -10,26 +10,30 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
-if len(sys.argv) != 3:
-    fail("Usage: verify-cloud-run-scaling.py <project-id> <region>")
+if len(sys.argv) not in (3, 4):
+    fail("Usage: verify-cloud-run-scaling.py <project-id> <region> [service-json]")
 
-project_id, region = sys.argv[1:]
-gcloud = shutil.which("gcloud") or shutil.which("gcloud.cmd")
-if not gcloud:
-    fail("gcloud CLI is not available.")
-raw = subprocess.check_output(
-    [
-        gcloud,
-        "run",
-        "services",
-        "describe",
-        "uinventario-api",
-        f"--project={project_id}",
-        f"--region={region}",
-        "--format=json",
-    ],
-    text=True,
-)
+project_id, region = sys.argv[1:3]
+if len(sys.argv) == 4:
+    with open(sys.argv[3], encoding="utf-8-sig") as service_file:
+        raw = service_file.read()
+else:
+    gcloud = shutil.which("gcloud") or shutil.which("gcloud.cmd")
+    if not gcloud:
+        fail("gcloud CLI is not available.")
+    raw = subprocess.check_output(
+        [
+            gcloud,
+            "run",
+            "services",
+            "describe",
+            "uinventario-api",
+            f"--project={project_id}",
+            f"--region={region}",
+            "--format=json",
+        ],
+        text=True,
+    )
 service = json.loads(raw)
 template = service.get("spec", {}).get("template", {})
 service_annotations = service.get("metadata", {}).get("annotations", {})
