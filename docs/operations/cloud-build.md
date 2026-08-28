@@ -41,7 +41,7 @@ conexión llega a `COMPLETE`.
   las dos cuentas runtime. Si existe el bucket temporal `PROJECT_ID_cloudbuild`,
   recibe lectura de objetos sólo sobre ese bucket para builds manuales.
 - `uinventario-api-runtime`: acceso sólo al secret de base del ambiente, aplicado
-  cuando UIN-27 crea ese secret.
+  automáticamente cuando existe su contenedor.
 - `uinventario-web-runtime`: sin acceso a secretos ni datos GCP.
 
 Dev y Prod usan cuentas, imágenes, conexión, Project ID y secrets separados.
@@ -50,8 +50,10 @@ Dev y Prod usan cuentas, imágenes, conexión, Project ID y secrets separados.
 
 Web puede desplegar primero con `https://placeholder.invalid`; su health queda
 disponible, pero el proxy no sirve operaciones hasta que exista API. API se detiene
-antes de migrar o desplegar si falta el secret de UIN-27. Cuando API queda lista,
-su pipeline actualiza `API_UPSTREAM` de Web y verifica ambos health checks.
+antes de migrar o desplegar si falta una versión `latest` habilitada del secret de
+UIN-27. Crear sólo el contenedor no habilita un despliegue con datos ficticios.
+Cuando API queda lista, su pipeline actualiza `API_UPSTREAM` de Web y verifica ambos
+health checks.
 
 ## Verificación
 

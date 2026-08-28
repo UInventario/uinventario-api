@@ -16,11 +16,13 @@ case "$environment" in
     project_id="software-inventario-dev"
     project_number="624020863656"
     branch="develop"
+    database_secret="uinventario-dev-database-url"
     ;;
   prod)
     project_id="software-inventario-prod"
     project_number="356622377746"
     branch="master"
+    database_secret="uinventario-prod-database-url"
     ;;
   *)
     echo "Environment must be dev or prod." >&2
@@ -56,6 +58,15 @@ for account in uinventario-cloud-build uinventario-api-runtime uinventario-web-r
     gcloud iam service-accounts create "$account" --project="$project_id" --display-name="$account" --quiet
   fi
 done
+
+if gcloud secrets describe "$database_secret" --project="$project_id" >/dev/null 2>&1; then
+  gcloud secrets add-iam-policy-binding "$database_secret" \
+    --project="$project_id" \
+    --member="serviceAccount:uinventario-api-runtime@${project_id}.iam.gserviceaccount.com" \
+    --role=roles/secretmanager.secretAccessor \
+    --condition=None \
+    --quiet >/dev/null
+fi
 
 for role in roles/logging.logWriter roles/run.admin roles/serviceusage.serviceUsageConsumer; do
   gcloud projects add-iam-policy-binding "$project_id" \
