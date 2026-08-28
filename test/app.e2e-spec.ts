@@ -6285,6 +6285,139 @@ describe('UInventario API (e2e)', () => {
         .expect(404);
     });
 
+    it('previews and atomically confirms idempotent CSV and Excel product imports', async () => {
+      const { cookie, productId } = await preparePos(false);
+      const csv = [
+        'name,sku,barcode,category,brand,cost,price,active',
+        'Café actualizado,CAFE-POS,7501234500000,Bebidas,Marca Casa,81.50,125.00,true',
+        '=2+2 Tea,TE-VERDE,7501234500099,Bebidas,Marca Casa,35.00,65.00,true',
+      ].join('\n');
+      const preview = await request(app.getHttpServer())
+        .post('/api/v1/products/imports/preview')
+        .set('Cookie', cookie)
+        .attach('file', Buffer.from(csv), {
+          filename: 'productos-v1.csv',
+          contentType: 'text/csv',
+        })
+        .expect(201);
+      const previewData = preview.body as {
+        data: {
+          id: string;
+          status: string;
+          templateVersion: string;
+          summary: { creates: number; updates: number; errors: number };
+          canConfirm: boolean;
+        };
+      };
+      expect(previewData.data).toMatchObject({
+        status: 'PREVIEWED',
+        templateVersion: '1.0',
+        summary: { creates: 1, updates: 1, errors: 0 },
+        canConfirm: true,
+      });
+      const [before] = await dataSource.query<Array<{ name: string }>>(
+        'SELECT name FROM products WHERE id = ?',
+        [productId],
+      );
+      expect(before.name).not.toBe('Café actualizado');
+
+      const confirmationKey = 'product-import-confirm-001';
+      await request(app.getHttpServer())
+        .post(`/api/v1/products/imports/${previewData.data.id}/confirm`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', confirmationKey)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { status: 'CONFIRMED' } });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/products/imports/${previewData.data.id}/confirm`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', confirmationKey)
+        .expect(201);
+      const products = await dataSource.query<
+        Array<{
+          sku: string;
+          name: string;
+          cost: string;
+          category: string;
+          brand: string;
+        }>
+      >(
+        `SELECT p.sku, p.name, p.cost, c.name AS category, b.name AS brand
+         FROM products p LEFT JOIN categories c ON c.id = p.category_id
+         LEFT JOIN brands b ON b.id = p.brand_id
+         WHERE p.tenant_id = (SELECT tenant_id FROM users WHERE normalized_email = ?)
+         ORDER BY p.sku`,
+        [registrationPayload.email],
+      );
+      expect(products).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            sku: 'CAFE-POS',
+            name: 'Café actualizado',
+            cost: '81.50',
+          }),
+          expect.objectContaining({
+            sku: 'TE-VERDE',
+            category: 'Bebidas',
+            brand: 'Marca Casa',
+          }),
+        ]),
+      );
+      await request(app.getHttpServer())
+        .get(`/api/v1/products/imports/${previewData.data.id}/result`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect('Content-Type', /text\/csv/)
+        .expect(({ text }: { text: string }) => {
+          expect(text).toContain('TE-VERDE');
+          expect(text).toContain(`"'=2+2 Tea"`);
+          expect(text).toContain('APPLIED');
+        });
+      const [auditCount] = await dataSource.query<Array<{ total: string }>>(
+        `SELECT COUNT(*) AS total FROM audit_events
+         WHERE action = 'PRODUCT_IMPORT_CONFIRMED' AND entity_id = ?`,
+        [previewData.data.id],
+      );
+      expect(Number(auditCount.total)).toBe(1);
+
+      const workbook = new ExcelJS.Workbook();
+      const sheet = workbook.addWorksheet('Productos');
+      sheet.addRow([
+        'name',
+        'sku',
+        'barcode',
+        'category',
+        'brand',
+        'cost',
+        'price',
+        'active',
+      ]);
+      sheet.addRow(['Duplicado A', 'DUP-1', 'BAR-0001', '', '', 1, 2, true]);
+      sheet.addRow(['Duplicado B', 'DUP-1', 'BAR-0002', '', '', 1, 2, true]);
+      const xlsx = Buffer.from(await workbook.xlsx.writeBuffer());
+      const invalid = await request(app.getHttpServer())
+        .post('/api/v1/products/imports/preview')
+        .set('Cookie', cookie)
+        .attach('file', xlsx, {
+          filename: 'productos-invalidos.xlsx',
+          contentType:
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        })
+        .expect(201);
+      const invalidData = invalid.body as {
+        data: { id: string; summary: { errors: number }; canConfirm: boolean };
+      };
+      expect(invalidData.data.summary.errors).toBe(1);
+      expect(invalidData.data.canConfirm).toBe(false);
+      await request(app.getHttpServer())
+        .post(`/api/v1/products/imports/${invalidData.data.id}/confirm`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'product-import-invalid-001')
+        .expect(409);
+    });
+
     it('manages tenant customers and associates an optional active customer to sales', async () => {
       const { cookie, productId } = await preparePos();
       await request(app.getHttpServer())
