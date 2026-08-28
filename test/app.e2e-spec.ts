@@ -956,6 +956,7 @@ describe('UInventario API (e2e)', () => {
                   'SALE_REPRINT',
                   'SALES_DISCOUNT',
                   'SALES_MANAGE',
+                  'SALES_RETURN',
                   'SALES_VOID',
                   'SUPPLIERS_MANAGE',
                   'TENANT_MANAGE',
