@@ -83,11 +83,12 @@ y abrir incidente antes de modificar Prod.
 ## Verificación y alertas
 
 Cloud Build y Cloud Run son la fuente inmediata para fallos de gates, migración,
-deploy y probes. Revisar los builds del trigger y los logs de `uinventario-api`,
-`uinventario-web` y `uinventario-api-migrate` con el Project ID explícito. Hasta que
-UIN-155 configure SLO y alertas automáticas, cualquier fallo del pipeline o smoke es
-una condición manual de rollback y debe registrarse en Jira; no se declara una alerta
-automática inexistente.
+deploy y probes. Revisar los builds del trigger y los eventos estructurados de
+`uinventario-api`, `uinventario-web` y `uinventario-api-migrate` con el Project ID
+explícito. UIN-155 mantiene alertas de disponibilidad, errores, latencia y colas
+críticas; consultar `docs/operations/observability.md` para correlación, retención y
+umbrales. Un fallo del pipeline o smoke sigue siendo condición de rollback aunque
+todavía no haya abierto un incidente de Monitoring.
 
 Tras un rollback, conservar las revisiones, SHA, build IDs y resultado de smoke en el
 ticket. Corregir mediante `hotfix/*` desde `master`; nunca alterar el tag publicado.

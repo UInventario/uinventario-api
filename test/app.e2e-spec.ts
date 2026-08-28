@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { INestApplication, Logger } from '@nestjs/common';
+import { INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { App } from 'supertest/types';
 import { AppModule } from './../src/app.module';
@@ -17,6 +17,7 @@ import { AuditService } from '../src/audit/audit.service';
 import { SupplierProductData } from '../src/suppliers/supplier-product.types';
 import type { OfflineBootstrapResponseV1 } from '../src/offline-sync/offline-sync-v1.contract';
 import type { OfflineChangesResponseV1 } from '../src/offline-sync/offline-sync-v1.contract';
+import { StructuredTelemetryService } from '../src/observability/structured-telemetry.service';
 
 jest.setTimeout(15_000);
 
@@ -244,8 +245,8 @@ describe('UInventario API (e2e)', () => {
       const service = jest
         .spyOn(registration, 'register')
         .mockRejectedValueOnce(new Error(sensitiveValue));
-      const logger = jest
-        .spyOn(Logger.prototype, 'error')
+      const telemetry = jest
+        .spyOn(app.get(StructuredTelemetryService), 'emit')
         .mockImplementation(() => undefined);
 
       try {
@@ -261,13 +262,15 @@ describe('UInventario API (e2e)', () => {
           });
 
         expect(JSON.stringify(response.body)).not.toContain(sensitiveValue);
-        expect(JSON.stringify(logger.mock.calls)).not.toContain(sensitiveValue);
-        expect(logger).toHaveBeenCalledWith(
-          expect.stringContaining('unhandled_request_error'),
+        expect(JSON.stringify(telemetry.mock.calls)).not.toContain(
+          sensitiveValue,
+        );
+        expect(telemetry).toHaveBeenCalledWith(
+          expect.objectContaining({ event: 'unhandled_request_error' }),
         );
       } finally {
         service.mockRestore();
-        logger.mockRestore();
+        telemetry.mockRestore();
       }
     });
   });

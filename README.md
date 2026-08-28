@@ -76,6 +76,8 @@ expand/contract está en
 [`docs/compatibility-policy.md`](docs/compatibility-policy.md).
 El threat model, los límites de confianza, gates adversariales y riesgos residuales
 están en [`docs/security/threat-model-v1.md`](docs/security/threat-model-v1.md).
+Los eventos correlacionados, health seguro, SLO, alertas y retención económica están
+en [`docs/operations/observability.md`](docs/operations/observability.md).
 
 ## Aislamiento multiempresa
 

@@ -8,4 +8,7 @@ export const appConfig = registerAs('app', () => ({
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean),
+  observabilitySuccessSampleRate: Number(
+    process.env.OBSERVABILITY_SUCCESS_SAMPLE_RATE ?? 0.1,
+  ),
 }));

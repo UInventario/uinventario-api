@@ -8,6 +8,7 @@ import { HttpAdapterHost } from '@nestjs/core';
 import type { NextFunction, Response } from 'express';
 import helmet from 'helmet';
 import { randomUUID } from 'node:crypto';
+import { StructuredTelemetryService } from '../observability/structured-telemetry.service';
 import type { RequestContext } from './request-context';
 import { SanitizedExceptionFilter } from './sanitized-exception.filter';
 
@@ -72,7 +73,13 @@ export function configureApp(app: INestApplication): void {
       transform: true,
     }),
   );
-  app.useGlobalFilters(new SanitizedExceptionFilter(app.get(HttpAdapterHost)));
+  app.useGlobalFilters(
+    new SanitizedExceptionFilter(
+      app.get(HttpAdapterHost),
+      app.get(StructuredTelemetryService),
+      config.getOrThrow<string>('app.deploymentEnvironment'),
+    ),
+  );
   app.enableCors({
     origin: origins,
     credentials: true,
