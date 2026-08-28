@@ -816,8 +816,9 @@ export class SalesRepository {
             await manager.query(
               `INSERT INTO sale_lines
               (id, tenant_id, sale_id, line_number, product_id, product_name,
-               product_sku, quantity, unit_price, unit_cost, subtotal, tax, total)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               product_sku, quantity, unit_price, price_source, price_list_id,
+               price_list_name, unit_cost, subtotal, tax, total)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 saleLineId,
                 input.tenantId,
@@ -828,6 +829,9 @@ export class SalesRepository {
                 line.product.sku,
                 line.quantity,
                 line.unitPrice,
+                line.priceSource,
+                line.priceList?.id ?? null,
+                line.priceList?.name ?? null,
                 productCost.cost,
                 line.subtotal,
                 line.tax,
@@ -1008,13 +1012,16 @@ export class SalesRepository {
         product_sku: string;
         quantity: string;
         unit_price: string;
+        price_source: 'BASE' | 'PRICE_LIST';
+        price_list_id: string | null;
+        price_list_name: string | null;
         subtotal: string;
         tax: string;
         total: string;
       }>
     >(
       `SELECT id, product_id, product_name, product_sku, quantity, unit_price,
-              subtotal, tax, total
+              price_source, price_list_id, price_list_name, subtotal, tax, total
        FROM sale_lines WHERE tenant_id = ? AND sale_id = ? ORDER BY line_number`,
       [tenantId, row.id],
     );
@@ -1082,6 +1089,10 @@ export class SalesRepository {
           },
           quantity: this.decimal(line.quantity, 3),
           unitPrice: this.decimal(line.unit_price, 2),
+          priceSource: line.price_source,
+          priceList: line.price_list_id
+            ? { id: line.price_list_id, name: line.price_list_name! }
+            : null,
           subtotal: this.decimal(line.subtotal, 2),
           tax: this.decimal(line.tax, 2),
           total: this.decimal(line.total, 2),

@@ -14,6 +14,8 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { QuoteCartLineDto } from './quote-cart.dto';
+import { PRICE_CHANNELS } from '../../pricing/price-list.types';
+import type { PriceChannel } from '../../pricing/price-list.types';
 
 export const PAYMENT_METHODS = ['CASH', 'CARD', 'TRANSFER', 'VOUCHER'] as const;
 export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
@@ -41,6 +43,10 @@ export class SalePaymentDto {
 }
 
 export class CreateSaleDto {
+  @IsOptional()
+  @IsIn(PRICE_CHANNELS)
+  channel?: PriceChannel;
+
   @IsOptional()
   @IsUUID()
   suspendedSaleId?: string;

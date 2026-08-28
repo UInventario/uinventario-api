@@ -52,6 +52,7 @@ import {
   InventorySerialStateConflictError,
 } from '../inventory/inventory-serial-tracking';
 import { SuspendedSaleStateError } from './suspended-sale.errors';
+import { PriceListRepository } from '../pricing/price-list.repository';
 
 @Injectable()
 export class PosService {
@@ -60,6 +61,7 @@ export class PosService {
     private readonly sales: SalesRepository,
     private readonly shifts: CashRegisterShiftService,
     private readonly paymentAuthorization: PaymentAuthorizationService,
+    private readonly priceLists: PriceListRepository,
     @Inject(posConfig.KEY)
     private readonly config: ConfigType<typeof posConfig>,
   ) {}
@@ -168,6 +170,7 @@ export class PosService {
     return this.createSale({
       ...input,
       dto: {
+        channel: input.dto.channel,
         customerId: input.dto.customerId,
         reservationId: input.dto.reservationId,
         lines: input.dto.lines,
@@ -207,7 +210,12 @@ export class PosService {
         warehouseId: input.warehouseId,
         cashRegisterId: input.cashRegisterId,
         userId: input.userId,
-        dto: { lines: input.dto.lines, reservationId: input.dto.reservationId },
+        dto: {
+          lines: input.dto.lines,
+          reservationId: input.dto.reservationId,
+          customerId: input.dto.customerId,
+          channel: input.dto.channel,
+        },
       });
       if (input.expectedSnapshot) {
         this.assertOfflineSnapshot(input.expectedSnapshot, quote.data);
@@ -444,6 +452,15 @@ export class PosService {
         this.config.taxRates.DEFAULT ??
         '0.0000';
       const taxBasisPoints = this.taxBasisPoints(taxRate);
+      const currency = this.currencyFor(context.countryCode);
+      const resolvedPrices = await this.priceLists.resolve({
+        tenantId: input.tenantId,
+        branchId: input.branchId,
+        ...(input.dto.customerId ? { customerId: input.dto.customerId } : {}),
+        channel: input.dto.channel ?? 'POS',
+        currency,
+        productIds: [...requested.keys()],
+      });
       let subtotalCents = 0n;
       let taxCents = 0n;
       let totalCents = 0n;
@@ -473,8 +490,10 @@ export class PosService {
           if (quantityUnits > this.toQuantityUnits(availableQuantity!)) {
             throw new PosInsufficientStockError(productId);
           }
+          const resolvedPrice = resolvedPrices.get(productId);
+          const effectivePrice = resolvedPrice?.price ?? product.price;
           const lineTotal = this.roundDivide(
-            this.toMoneyCents(product.price) * quantityUnits,
+            this.toMoneyCents(effectivePrice) * quantityUnits,
             1000n,
           );
           const lineTax =
@@ -494,7 +513,9 @@ export class PosService {
             lotId: requestedLots.get(productId) ?? null,
             serialNumbers,
             availableQuantity: availableQuantity!,
-            unitPrice: this.fromMoneyCents(this.toMoneyCents(product.price)),
+            unitPrice: this.fromMoneyCents(this.toMoneyCents(effectivePrice)),
+            priceSource: resolvedPrice?.source ?? ('BASE' as const),
+            priceList: resolvedPrice?.priceList ?? null,
             subtotal: this.fromMoneyCents(lineSubtotal),
             tax: this.fromMoneyCents(lineTax),
             total: this.fromMoneyCents(lineTotal),
@@ -508,7 +529,7 @@ export class PosService {
             warehouse: context.warehouse,
             cashRegister: context.cashRegister,
           },
-          currency: this.currencyFor(context.countryCode),
+          currency,
           taxRate: this.normalizeTaxRate(taxRate),
           lines,
           totals: {
