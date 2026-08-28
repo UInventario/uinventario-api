@@ -11,6 +11,7 @@ import {
   OfflineBootstrapResponseV1,
   OfflineSyncScopeV1,
 } from './offline-sync-v1.contract';
+import { InventoryValuationPolicyService } from '../inventory/inventory-valuation-policy.service';
 
 export interface OfflineServerCursorV1 {
   kind: 'bootstrap';
@@ -31,6 +32,7 @@ export class OfflineBootstrapService {
   constructor(
     private readonly repository: OfflineBootstrapRepository,
     private readonly pos: PosService,
+    private readonly valuationPolicy: InventoryValuationPolicyService,
   ) {}
 
   async bootstrap(
@@ -57,6 +59,9 @@ export class OfflineBootstrapService {
         .replace('T', ' ')
         .replace('Z', ''),
     });
+    const valuationPolicy = (
+      await this.valuationPolicy.current(principal.tenant.id)
+    ).data;
     const { branch, warehouse, cashRegister } = principal.context;
     let posPolicy: OfflineBootstrapResponseV1['posPolicy'] = null;
     if (
@@ -111,6 +116,7 @@ export class OfflineBootstrapService {
           permissions: principal.user.permissions,
         },
       },
+      valuationPolicy,
       posPolicy,
       page: {
         initialSyncCursor: this.encode(

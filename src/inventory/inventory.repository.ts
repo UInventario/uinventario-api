@@ -55,6 +55,9 @@ interface MovementRow {
   value_change: string | null;
   resulting_inventory_value: string | null;
   average_unit_cost: string | null;
+  valuation_method: import('./inventory-valuation-policy.types').InventoryValuationMethod;
+  valuation_policy_version: number | string;
+  valuation_effective_at: Date | string;
   fifo_unit_cost: string | null;
   fifo_value_change: string | null;
   fifo_resulting_inventory_value: string | null;
@@ -519,6 +522,9 @@ export class InventoryRepository {
           value_change: string | null;
           resulting_inventory_value: string | null;
           average_unit_cost: string | null;
+          valuation_method: import('./inventory-valuation-policy.types').InventoryValuationMethod;
+          valuation_policy_version: number | string;
+          valuation_effective_at: Date | string;
           fifo_unit_cost: string | null;
           fifo_value_change: string | null;
           fifo_resulting_inventory_value: string | null;
@@ -530,7 +536,9 @@ export class InventoryRepository {
                 im.reservation_id,
                 im.from_state, im.to_state, im.state_quantity,
                 im.unit_cost, im.value_change, im.resulting_inventory_value,
-                im.average_unit_cost, im.fifo_unit_cost, im.fifo_value_change,
+                im.average_unit_cost, im.valuation_method,
+                im.valuation_policy_version, im.valuation_effective_at,
+                im.fifo_unit_cost, im.fifo_value_change,
                 im.fifo_resulting_inventory_value,
                 im.reason, im.reference, im.created_at,
                 p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
@@ -724,6 +732,9 @@ export class InventoryRepository {
         valuation:
           row.unit_cost !== null && row.value_change !== null
             ? {
+                method: row.valuation_method,
+                policyVersion: Number(row.valuation_policy_version),
+                effectiveAt: new Date(row.valuation_effective_at).toISOString(),
                 unitCost: this.normalizeCost(row.unit_cost),
                 valueChange: this.normalizeCost(row.value_change),
                 resultingInventoryValue:
@@ -1541,7 +1552,9 @@ export class InventoryRepository {
       `SELECT im.id, im.type, im.quantity_change, im.resulting_quantity,
               im.from_state, im.to_state, im.state_quantity,
               im.unit_cost, im.value_change, im.resulting_inventory_value,
-              im.average_unit_cost, im.fifo_unit_cost, im.fifo_value_change,
+              im.average_unit_cost, im.valuation_method,
+              im.valuation_policy_version, im.valuation_effective_at,
+              im.fifo_unit_cost, im.fifo_value_change,
               im.fifo_resulting_inventory_value,
               im.reason, im.reference, im.request_fingerprint, im.created_at,
               p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
@@ -1686,6 +1699,9 @@ export class InventoryRepository {
       valuation:
         row.unit_cost !== null && row.value_change !== null
           ? {
+              method: row.valuation_method,
+              policyVersion: Number(row.valuation_policy_version),
+              effectiveAt: new Date(row.valuation_effective_at).toISOString(),
               unitCost: this.normalizeCost(row.unit_cost),
               valueChange: this.normalizeCost(row.value_change),
               resultingInventoryValue:

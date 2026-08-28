@@ -14,6 +14,10 @@ import {
   ValidateIf,
   ValidateNested,
 } from 'class-validator';
+import {
+  INVENTORY_VALUATION_METHODS,
+  type InventoryValuationMethod,
+} from '../../inventory/inventory-valuation-policy.types';
 
 export class OfflineCommandScopeDto {
   @IsUUID()
@@ -58,6 +62,14 @@ export class OfflineCommandDto {
 
   @IsISO8601({ strict: true })
   createdAt!: string;
+
+  @IsIn(INVENTORY_VALUATION_METHODS)
+  valuationMethod!: InventoryValuationMethod;
+
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  valuationPolicyVersion!: number;
 
   @IsIn(['CASH_SALE', 'INVENTORY_COUNT', 'INVENTORY_MOVEMENT'])
   kind!: 'CASH_SALE' | 'INVENTORY_COUNT' | 'INVENTORY_MOVEMENT';

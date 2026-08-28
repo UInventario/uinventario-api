@@ -31,6 +31,7 @@ import {
   OfflineCommandResult,
 } from './offline-command.types';
 import { OFFLINE_FRESHNESS_POLICY_V1 } from './offline-sync-v1.contract';
+import { InventoryValuationPolicyService } from '../inventory/inventory-valuation-policy.service';
 
 @Injectable()
 export class OfflineCommandService {
@@ -39,6 +40,7 @@ export class OfflineCommandService {
     private readonly inventory: InventoryService,
     private readonly pos: PosService,
     private readonly audit: AuditService,
+    private readonly valuationPolicy: InventoryValuationPolicyService,
   ) {}
 
   async executeBatch(
@@ -88,6 +90,10 @@ export class OfflineCommandService {
   ): Promise<OfflineCommandExecution> {
     try {
       this.assertFresh(command);
+      await this.valuationPolicy.assertSnapshot(principal.tenant.id, {
+        method: command.valuationMethod,
+        version: command.valuationPolicyVersion,
+      });
       if (command.kind === 'INVENTORY_MOVEMENT') {
         this.requirePermission(principal, 'INVENTORY_ADJUST');
         if (!principal.context.warehouse) throw new ForbiddenException();

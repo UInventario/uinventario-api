@@ -29,6 +29,11 @@ import { AuditService } from '../audit/audit.service';
 import { PreviewInventoryImportDto } from './dto/preview-inventory-import.dto';
 import { InventoryImportService } from './inventory-import.service';
 import type { InventoryImportFile } from './inventory-import.types';
+import { InventoryValuationPolicyService } from './inventory-valuation-policy.service';
+import {
+  ChangeInventoryValuationPolicyDto,
+  PreviewInventoryValuationPolicyDto,
+} from './dto/change-inventory-valuation-policy.dto';
 
 @Controller('inventory')
 @UseGuards(SessionGuard, PermissionGuard)
@@ -37,7 +42,42 @@ export class InventoryController {
     private readonly inventory: InventoryService,
     private readonly audit: AuditService,
     private readonly inventoryImports: InventoryImportService,
+    private readonly valuationPolicy: InventoryValuationPolicyService,
   ) {}
+
+  @Get('valuation-policy')
+  @RequirePermissions('INVENTORY_VIEW')
+  getValuationPolicy(@Req() request: AuthenticatedRequest) {
+    return this.valuationPolicy.current(request.principal.tenant.id);
+  }
+
+  @Post('valuation-policy/preview')
+  @RequirePermissions('INVENTORY_VALUATION_MANAGE')
+  previewValuationPolicy(
+    @Req() request: AuthenticatedRequest,
+    @Body() dto: PreviewInventoryValuationPolicyDto,
+  ) {
+    return this.valuationPolicy.preview(
+      request.principal.tenant.id,
+      dto.targetMethod,
+    );
+  }
+
+  @Post('valuation-policy/changes')
+  @RequirePermissions('INVENTORY_VALUATION_MANAGE')
+  changeValuationPolicy(
+    @Req() request: AuthenticatedRequest,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: ChangeInventoryValuationPolicyDto,
+  ) {
+    return this.valuationPolicy.change({
+      tenantId: request.principal.tenant.id,
+      userId: request.principal.user.id,
+      idempotencyKey,
+      correlationId: request.requestId!,
+      dto,
+    });
+  }
 
   @Post('imports/preview')
   @RequirePermissions('INVENTORY_ADJUST')

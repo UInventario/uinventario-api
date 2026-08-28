@@ -48,6 +48,10 @@ export class CatalogRepository {
   ): Promise<ProductData> {
     try {
       return await this.dataSource.transaction(async (manager) => {
+        const specificLotPolicy = await this.specificLotPolicy(
+          manager,
+          tenantId,
+        );
         const categoryId = dto.categoryName
           ? await this.findOrCreateClassification(
               manager,
@@ -77,7 +81,7 @@ export class CatalogRepository {
             dto.sku,
             this.normalize(dto.sku),
             dto.barcode ?? null,
-            dto.trackLots ?? false,
+            specificLotPolicy || (dto.trackLots ?? false),
             categoryId,
             brandId,
             dto.cost,
@@ -125,11 +129,15 @@ export class CatalogRepository {
           Array<{
             track_lots: number | boolean;
             has_movements: number | string;
+            specific_lot_policy: number | string;
           }>
         >(
           `SELECT p.track_lots,
                   EXISTS(SELECT 1 FROM inventory_movements im
-                         WHERE im.tenant_id = p.tenant_id AND im.product_id = p.id) AS has_movements
+                         WHERE im.tenant_id = p.tenant_id AND im.product_id = p.id) AS has_movements,
+                  EXISTS(SELECT 1 FROM inventory_valuation_policies ivp
+                         WHERE ivp.tenant_id = p.tenant_id
+                           AND ivp.method = 'SPECIFIC_LOT') AS specific_lot_policy
            FROM products p WHERE p.id = ? AND p.tenant_id = ? LIMIT 1 FOR UPDATE`,
           [id, tenantId],
         );
@@ -137,7 +145,8 @@ export class CatalogRepository {
         if (
           dto.trackLots !== undefined &&
           dto.trackLots !== Boolean(currentTracking.track_lots) &&
-          Number(currentTracking.has_movements) === 1
+          (Number(currentTracking.has_movements) === 1 ||
+            Number(currentTracking.specific_lot_policy) === 1)
         ) {
           throw new ProductLotTrackingLockedError();
         }
@@ -525,6 +534,18 @@ export class CatalogRepository {
             FROM products p
             LEFT JOIN categories c ON c.id = p.category_id AND c.tenant_id = p.tenant_id
             LEFT JOIN brands b ON b.id = p.brand_id AND b.tenant_id = p.tenant_id`;
+  }
+
+  private async specificLotPolicy(
+    manager: EntityManager,
+    tenantId: string,
+  ): Promise<boolean> {
+    const [row] = await manager.query<Array<{ active: number | string }>>(
+      `SELECT EXISTS(SELECT 1 FROM inventory_valuation_policies
+                     WHERE tenant_id = ? AND method = 'SPECIFIC_LOT') AS active`,
+      [tenantId],
+    );
+    return Number(row.active) === 1;
   }
 
   private classification(kind: CatalogClassificationKind) {

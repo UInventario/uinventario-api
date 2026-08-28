@@ -1,5 +1,6 @@
 import { EntityManager } from 'typeorm';
 import { applyInventoryFifoValuation } from './inventory-fifo-valuation';
+import { sealInventoryMovementValuation } from './inventory-valuation-policy';
 
 interface MovementValuationRow {
   tenant_id: string;
@@ -205,4 +206,5 @@ export async function applyInventoryValuation(
   }
 
   await applyInventoryFifoValuation(manager, movementId);
+  await sealInventoryMovementValuation(manager, movementId);
 }

@@ -1,4 +1,5 @@
 import type { AppPermission } from '../auth/authorization/authorization.types';
+import type { InventoryValuationPolicyData } from '../inventory/inventory-valuation-policy.types';
 
 export const OFFLINE_SYNC_PROTOCOL_VERSION = '1.0' as const;
 export const OFFLINE_SYNC_MAX_PAGE_SIZE = 500 as const;
@@ -138,6 +139,7 @@ export interface OfflineBootstrapResponseV1 {
     tenant: { id: string; name: string };
     user: { id: string; roles: string[]; permissions: AppPermission[] };
   };
+  valuationPolicy: InventoryValuationPolicyData;
   posPolicy: OfflinePosPolicyV1 | null;
   page: {
     initialSyncCursor: string;
@@ -177,6 +179,8 @@ export interface OfflineCommandV1 {
   scope: OfflineSyncScopeV1;
   sequence: number;
   createdAt: string;
+  valuationMethod: InventoryValuationPolicyData['method'];
+  valuationPolicyVersion: number;
   kind: 'CASH_SALE' | 'INVENTORY_COUNT' | 'INVENTORY_MOVEMENT';
   payload: Readonly<Record<string, unknown>>;
 }
