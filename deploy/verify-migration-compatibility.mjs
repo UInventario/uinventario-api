@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 const baseRef = process.env.COMPATIBILITY_BASE_REF ?? 'v1.0.0';
 const files = execFileSync(
