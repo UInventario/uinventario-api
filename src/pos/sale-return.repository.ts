@@ -16,6 +16,7 @@ import {
   SaleReturnSerialError,
 } from './sale-return.types';
 import { normalizeProductQuantity } from '../common/quantity-policy';
+import { LoyaltyRepository } from '../loyalty/loyalty.repository';
 
 interface SaleLineRow {
   id: string;
@@ -52,6 +53,7 @@ interface ReturnRow {
   subtotal: string;
   tax_total: string;
   total: string;
+  loyalty_value_restored: string;
   returned_by_user_id: string;
   returned_by_email: string;
   created_at: Date | string;
@@ -64,6 +66,7 @@ export class SaleReturnRepository {
     private readonly dataSource: DataSource,
     private readonly audit: AuditService,
     private readonly settlements: SaleReturnSettlementRepository,
+    private readonly loyalty: LoyaltyRepository,
   ) {}
 
   async listBySale(
@@ -131,9 +134,11 @@ export class SaleReturnRepository {
               id: string;
               receipt_number: string;
               status: 'COMPLETED' | 'VOIDED';
+              total: string;
+              loyalty_value: string;
             }>
           >(
-            `SELECT id, receipt_number, status FROM sales
+            `SELECT id, receipt_number, status, total, loyalty_value FROM sales
              WHERE id = ? AND tenant_id = ? AND branch_id = ? LIMIT 1 FOR UPDATE`,
             [input.saleId, input.tenantId, input.branchId],
           );
@@ -378,12 +383,32 @@ export class SaleReturnRepository {
           );
           const tax = prepared.reduce((sum, line) => sum + line.tax, 0n);
           const total = subtotal + tax;
+          const [previousReturns] = await manager.query<
+            Array<{ total: string; loyalty_value_restored: string }>
+          >(
+            `SELECT COALESCE(SUM(total), 0) AS total,
+                    COALESCE(SUM(loyalty_value_restored), 0) AS loyalty_value_restored
+             FROM sale_returns WHERE tenant_id = ? AND sale_id = ?`,
+            [input.tenantId, sale.id],
+          );
+          const previousTotal = this.toMoney(previousReturns?.total ?? '0');
+          const previousLoyalty = this.toMoney(
+            previousReturns?.loyalty_value_restored ?? '0',
+          );
+          const saleTotal = this.toMoney(sale.total);
+          const loyaltyTotal = this.toMoney(sale.loyalty_value);
+          const cumulativeTotal = previousTotal + total;
+          const targetLoyalty =
+            cumulativeTotal >= saleTotal
+              ? loyaltyTotal
+              : (loyaltyTotal * cumulativeTotal + saleTotal / 2n) / saleTotal;
+          const loyaltyValueRestored = targetLoyalty - previousLoyalty;
           await manager.query(
             `INSERT INTO sale_returns
               (id, tenant_id, sale_id, exchange_sale_id, reason,
-               settlement_status, subtotal, tax_total, total, idempotency_key,
-               request_fingerprint, returned_by_user_id)
-             VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?)`,
+               settlement_status, subtotal, tax_total, total, loyalty_value_restored,
+               idempotency_key, request_fingerprint, returned_by_user_id)
+              VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?)`,
             [
               returnId,
               input.tenantId,
@@ -393,6 +418,7 @@ export class SaleReturnRepository {
               this.money(subtotal),
               this.money(tax),
               this.money(total),
+              this.money(loyaltyValueRestored),
               input.idempotencyKey,
               input.fingerprint,
               input.userId,
@@ -506,6 +532,13 @@ export class SaleReturnRepository {
               });
             }
           }
+          await this.loyalty.compensateSale(manager, {
+            tenantId: input.tenantId,
+            saleId: sale.id,
+            saleReturnId: returnId,
+            userId: input.userId,
+            mode: 'RETURN',
+          });
           await this.audit.recordInTransaction(manager, {
             tenantId: input.tenantId,
             actorUserId: input.userId,
@@ -627,7 +660,7 @@ export class SaleReturnRepository {
     return `SELECT sr.id, sr.tenant_id, sr.sale_id, sr.exchange_sale_id,
                    exchange_sale.receipt_number AS exchange_receipt_number,
                    sr.reason, sr.settlement_status, sr.subtotal, sr.tax_total,
-                   sr.total, sr.returned_by_user_id,
+                    sr.total, sr.loyalty_value_restored, sr.returned_by_user_id,
                    returned_by.email AS returned_by_email, sr.created_at,
                    sr.request_fingerprint
             FROM sale_returns sr
@@ -651,7 +684,10 @@ export class SaleReturnRepository {
     const settled = settlements
       .filter(({ status }) => status === 'COMPLETED')
       .reduce((sum, settlement) => sum + this.toMoney(settlement.amount), 0n);
-    const refundable = this.toMoney(row.total) - settled;
+    const refundable =
+      this.toMoney(row.total) -
+      this.toMoney(row.loyalty_value_restored) -
+      settled;
     const lines = await manager.query<
       Array<{
         id: string;
@@ -691,6 +727,7 @@ export class SaleReturnRepository {
       reason: row.reason,
       settlementStatus: row.settlement_status,
       refundableAmount: this.money(refundable),
+      loyaltyValueRestored: this.decimal(row.loyalty_value_restored, 2),
       totals: {
         subtotal: this.decimal(row.subtotal, 2),
         tax: this.decimal(row.tax_total, 2),

@@ -70,6 +70,13 @@ export class CreateSaleDto {
   @IsUUID()
   reservationId?: string;
 
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(10_000_000)
+  loyaltyPointsToRedeem?: number;
+
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(100)

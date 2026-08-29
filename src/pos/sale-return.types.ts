@@ -28,6 +28,7 @@ export interface SaleReturnData {
   reason: string;
   settlementStatus: SaleReturnSettlementStatus;
   refundableAmount: string;
+  loyaltyValueRestored: string;
   totals: { subtotal: string; tax: string; total: string };
   returnedBy: { id: string; email: string };
   createdAt: string;

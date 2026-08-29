@@ -41,6 +41,9 @@ describe('UInventario API (e2e)', () => {
   async function resetIdentityData(): Promise<void> {
     await dataSource.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const table of [
+      'loyalty_point_allocations',
+      'loyalty_point_entries',
+      'loyalty_rules',
       'external_email_events',
       'external_adapter_executions',
       'external_adapter_configs',
@@ -8428,6 +8431,202 @@ describe('UInventario API (e2e)', () => {
         .expect(201)
         .expect(({ body }: { body: unknown }) => {
           expect(body).toMatchObject({ data: { totals: { total: '59.95' } } });
+        });
+    });
+
+    it('accrues, redeems and compensates versioned loyalty points through sale history', async () => {
+      const { cookie, productId } = await preparePos();
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Cliente fiel',
+          identifier: 'LOYAL-1',
+          dataProcessingConsent: false,
+        })
+        .expect(201);
+      const customer = customerResponse.body as { data: { id: string } };
+      await request(app.getHttpServer())
+        .put('/api/v1/loyalty/rules/current')
+        .set('Cookie', cookie)
+        .send({
+          active: true,
+          earnAmount: '1.00',
+          earnPoints: 1,
+          redeemPoints: 100,
+          redeemAmount: '10.00',
+          expirationDays: 365,
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { version: 1, active: true } });
+        });
+
+      const firstSaleResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'loyalty-earn-sale-001')
+        .send({
+          customerId: customer.data.id,
+          lines: [{ productId, quantity: '1' }],
+          payments: [
+            { method: 'CASH', amount: '119.90', amountReceived: '120.00' },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { loyalty: { pointsEarned: 119, pointsRedeemed: 0 } },
+          });
+        });
+      const firstSale = firstSaleResponse.body as { data: { id: string } };
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({
+          customerId: customer.data.id,
+          loyaltyPointsToRedeem: 100,
+          lines: [{ productId, quantity: '1' }],
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              loyalty: {
+                balanceBefore: 119,
+                pointsRedeemed: 100,
+                redemptionValue: '10.00',
+                pointsEarned: 109,
+                balanceAfter: 128,
+              },
+              totals: { total: '119.90', payable: '109.90' },
+            },
+          });
+        });
+
+      const redeemedSaleResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'loyalty-sale-b')
+        .send({
+          customerId: customer.data.id,
+          loyaltyPointsToRedeem: 100,
+          lines: [{ productId, quantity: '1' }],
+          payments: [
+            { method: 'CASH', amount: '109.90', amountReceived: '110.00' },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          const response = body as {
+            data: {
+              loyalty: {
+                ruleVersion: number;
+                pointsRedeemed: number;
+                redemptionValue: string;
+                pointsEarned: number;
+              };
+              payments: Array<{ method: string; provider: string }>;
+            };
+          };
+          expect(response).toMatchObject({
+            data: {
+              loyalty: {
+                ruleVersion: 1,
+                pointsRedeemed: 100,
+                redemptionValue: '10.00',
+                pointsEarned: 109,
+              },
+            },
+          });
+          expect(
+            response.data.payments.some(
+              ({ method, provider }) =>
+                method === 'VOUCHER' && provider === 'LOYALTY',
+            ),
+          ).toBe(true);
+        });
+      const redeemedSale = redeemedSaleResponse.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${redeemedSale.data.id}/receipt/reprints`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              loyalty: {
+                pointsRedeemed: 100,
+                redemptionValue: '10.00',
+                pointsEarned: 109,
+              },
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${redeemedSale.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'loyalty-return-a')
+        .send({
+          reason: 'Devolución total con restitución de puntos',
+          lines: [
+            {
+              saleLineId: redeemedSale.data.lines[0].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              refundableAmount: '109.90',
+              loyaltyValueRestored: '10.00',
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${firstSale.data.id}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'loyalty-void-001')
+        .send({ reason: 'Anulación completa de prueba de fidelización' })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .get(`/api/v1/loyalty/customers/${customer.data.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          const response = body as {
+            data: {
+              balance: number;
+              entries: Array<{ type: string; points: number }>;
+            };
+          };
+          expect(response.data.balance).toBe(0);
+          expect(response.data.entries).toContainEqual(
+            expect.objectContaining({
+              type: 'RETURN_REDEEM_RESTORE',
+              points: 100,
+            }),
+          );
+          expect(response.data.entries).toContainEqual(
+            expect.objectContaining({
+              type: 'RETURN_EARN_REVERSAL',
+              points: -109,
+            }),
+          );
+          expect(response.data.entries).toContainEqual(
+            expect.objectContaining({
+              type: 'VOID_EARN_REVERSAL',
+              points: -119,
+            }),
+          );
         });
     });
 

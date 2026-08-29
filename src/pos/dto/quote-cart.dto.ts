@@ -6,12 +6,15 @@ import {
   IsArray,
   IsIn,
   IsOptional,
+  IsInt,
   IsString,
   IsUUID,
   MaxLength,
   Matches,
   MinLength,
   ValidateNested,
+  Max,
+  Min,
 } from 'class-validator';
 import { PRICE_CHANNELS } from '../../pricing/price-list.types';
 import type { PriceChannel } from '../../pricing/price-list.types';
@@ -79,6 +82,13 @@ export class QuoteCartDto {
   @IsUUID()
   @IsOptional()
   reservationId?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(10_000_000)
+  loyaltyPointsToRedeem?: number;
 
   @IsArray()
   @ArrayMinSize(1)

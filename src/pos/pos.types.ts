@@ -45,6 +45,7 @@ export interface PosCartQuoteResponse {
     currency: string;
     taxRate: string;
     discount: PosAppliedDiscount | null;
+    loyalty?: import('../loyalty/loyalty.types').LoyaltyQuoteData | null;
     lines: Array<{
       product: {
         id: string;
@@ -92,6 +93,7 @@ export interface PosCartQuoteResponse {
       subtotal: string;
       tax: string;
       total: string;
+      payable?: string;
     };
   };
   meta: { apiVersion: '1'; recalculatedAt: string };
@@ -153,6 +155,12 @@ export interface CashSaleData {
   currency: string;
   taxRate: string;
   discount: PosAppliedDiscount | null;
+  loyalty?: {
+    ruleVersion: number;
+    pointsRedeemed: number;
+    redemptionValue: string;
+    pointsEarned: number;
+  } | null;
   lines: Array<{
     id: string;
     product: { id: string; name: string; sku: string };
