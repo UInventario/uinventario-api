@@ -7,6 +7,8 @@ import type {
   ExternalAdapterConfigData,
   ExternalAdapterExecutionData,
   ExternalAdapterStatus,
+  ExternalEmailEventData,
+  ExternalEmailEventType,
 } from './external-adapter.types';
 
 interface ConfigRow {
@@ -36,6 +38,16 @@ interface ExecutionRow {
   duration_ms: number | string;
   created_at: Date | string;
   updated_at: Date | string;
+}
+
+interface EmailEventRow {
+  webhook_event_id: string;
+  provider_key: string;
+  provider_reference: string;
+  event_type: ExternalEmailEventType;
+  error_code: string | null;
+  occurred_at: Date | string;
+  received_at: Date | string;
 }
 
 @Injectable()
@@ -197,6 +209,55 @@ export class ExternalAdapterRepository {
       parameters,
     );
     return rows.map((row) => this.toExecution(row));
+  }
+
+  async recordEmailEvent(input: {
+    webhookEventId: string;
+    provider: string;
+    providerReference: string;
+    eventType: ExternalEmailEventType;
+    errorCode: string | null;
+    occurredAt: Date;
+  }): Promise<boolean> {
+    const result = await this.dataSource.query<{ affectedRows?: number }>(
+      `INSERT IGNORE INTO external_email_events
+         (webhook_event_id, tenant_id, provider_key, provider_reference,
+          event_type, error_code, occurred_at)
+       SELECT ?, execution.tenant_id, ?, ?, ?, ?, ?
+       FROM external_adapter_executions execution
+       WHERE execution.provider_key = ? AND execution.provider_reference = ?
+       ORDER BY execution.updated_at DESC LIMIT 1`,
+      [
+        input.webhookEventId,
+        input.provider,
+        input.providerReference,
+        input.eventType,
+        input.errorCode,
+        input.occurredAt,
+        input.provider,
+        input.providerReference,
+      ],
+    );
+    return Number(result.affectedRows ?? 0) === 1;
+  }
+
+  async listEmailEvents(tenantId: string): Promise<ExternalEmailEventData[]> {
+    const rows = await this.dataSource.query<EmailEventRow[]>(
+      `SELECT webhook_event_id, provider_key, provider_reference,
+              event_type, error_code, occurred_at, received_at
+       FROM external_email_events WHERE tenant_id = ?
+       ORDER BY occurred_at DESC LIMIT 100`,
+      [tenantId],
+    );
+    return rows.map((row) => ({
+      webhookEventId: row.webhook_event_id,
+      provider: row.provider_key,
+      providerReference: row.provider_reference,
+      eventType: row.event_type,
+      errorCode: row.error_code,
+      occurredAt: new Date(row.occurred_at).toISOString(),
+      receivedAt: new Date(row.received_at).toISOString(),
+    }));
   }
 
   private toConfig(row: ConfigRow): ExternalAdapterConfigData {

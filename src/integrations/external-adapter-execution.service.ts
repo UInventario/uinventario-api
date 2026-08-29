@@ -4,6 +4,7 @@ import { ExternalAdapterRepository } from './external-adapter.repository';
 import type {
   ExternalAdapterCapability,
   ExternalAdapterExecutionData,
+  ExternalEmailTemplate,
   ExternalAdapterScenario,
   ExternalAdapterStatus,
   VersionedExternalAdapter,
@@ -22,7 +23,12 @@ export class ExternalAdapterExecutionService {
     idempotencyKey: string;
     correlationId: string;
     scenario?: ExternalAdapterScenario;
-    payload: { recipient: string; title: string; body: string };
+    payload: {
+      recipient: string;
+      title: string;
+      body: string;
+      template: ExternalEmailTemplate;
+    };
   }): Promise<ExternalAdapterExecutionData> {
     const config = await this.repository.config(
       input.tenantId,
@@ -72,6 +78,7 @@ export class ExternalAdapterExecutionService {
         ...input,
         attempt,
         timeoutMs: config.timeoutMs,
+        secretReference: config.secretReference,
       });
       status = result.status;
       errorCode = result.errorCode;
@@ -98,8 +105,14 @@ export class ExternalAdapterExecutionService {
       correlationId: string;
       attempt: number;
       timeoutMs: number;
+      secretReference: string | null;
       scenario?: ExternalAdapterScenario;
-      payload: { recipient: string; title: string; body: string };
+      payload: {
+        recipient: string;
+        title: string;
+        body: string;
+        template: ExternalEmailTemplate;
+      };
     },
   ): Promise<{
     status: Exclude<ExternalAdapterStatus, 'PENDING'>;
@@ -117,6 +130,7 @@ export class ExternalAdapterExecutionService {
           idempotencyKey: input.idempotencyKey,
           correlationId: input.correlationId,
           attempt: input.attempt,
+          secretReference: input.secretReference,
           scenario: input.scenario,
           payload: input.payload,
         },

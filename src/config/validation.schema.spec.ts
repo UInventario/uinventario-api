@@ -34,6 +34,22 @@ describe('environment validation', () => {
     });
   });
 
+  it('accepts the structured Resend secret contract without exposing fields separately', () => {
+    const result = validationSchema.validate({
+      DATABASE_URL: 'mysql://localhost:3307/uinventario',
+      PASSWORD_RESET_DELIVERY: 'adapter',
+      EMAIL_PROVIDER_SECRET_REFERENCE: 'uinventario-local-resend-config',
+      RESEND_CONFIG: JSON.stringify({
+        apiKey: 're_test_only',
+        from: 'UInventario <noreply@example.com>',
+        diagnosticRecipient: 'sandbox@example.com',
+        webhookSecret: 'whsec_test_only',
+      }),
+    });
+
+    expect(result.error).toBeUndefined();
+  });
+
   it.each([
     [
       'missing database',
@@ -68,6 +84,14 @@ describe('environment validation', () => {
         PASSWORD_RESET_PUBLIC_URL: 'https://app.example.invalid/restablecer',
       },
       '"CORS_ORIGINS" must contain only HTTPS origins in production',
+    ],
+    [
+      'malformed Resend secret',
+      {
+        DATABASE_URL: 'mysql://localhost:3307/uinventario',
+        RESEND_CONFIG: '{"apiKey":"not-a-key"}',
+      },
+      'must be JSON with apiKey, from, diagnosticRecipient and webhookSecret',
     ],
   ])('rejects %s with a clear message', (_name, input, message) => {
     const { error } = validationSchema.validate(input);

@@ -16,11 +16,13 @@ describe.each([
       idempotencyKey: `diagnostic-${scenario}`,
       correlationId: 'request-1',
       attempt,
+      secretReference: null,
       scenario,
       payload: {
         recipient: 'diagnostic@example.invalid',
         title: 'Diagnostic',
         body: 'No business data',
+        template: { key: 'ADAPTER_DIAGNOSTIC', version: '1' },
       },
     }) satisfies ExternalAdapterCommand;
 

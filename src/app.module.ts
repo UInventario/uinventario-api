@@ -36,6 +36,7 @@ import { CustomerOrderModule } from './orders/customer-order.module';
 import { SalesQuotationModule } from './quotations/sales-quotation.module';
 import { NotificationModule } from './notifications/notification.module';
 import { ExternalAdapterModule } from './integrations/external-adapter.module';
+import { emailProviderConfig } from './config/email-provider.config';
 
 @Module({
   imports: [
@@ -48,6 +49,7 @@ import { ExternalAdapterModule } from './integrations/external-adapter.module';
         sessionConfig,
         posConfig,
         passwordResetConfig,
+        emailProviderConfig,
       ],
       validationSchema,
       validationOptions: { abortEarly: true, allowUnknown: true },

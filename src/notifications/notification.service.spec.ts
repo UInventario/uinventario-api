@@ -1,4 +1,5 @@
 import { InventoryStockAlertRepository } from '../inventory/inventory-stock-alert.repository';
+import { ExternalAdapterRepository } from '../integrations/external-adapter.repository';
 import { NotificationDeliveryService } from './notification-delivery.service';
 import { NotificationRepository } from './notification.repository';
 import { NotificationService } from './notification.service';
@@ -13,12 +14,14 @@ describe('NotificationService', () => {
     const delivery = {
       process: jest.fn().mockResolvedValue({ sent: 1, failed: 0 }),
     };
+    const adapters = { config: jest.fn().mockResolvedValue(null) };
     const service = new NotificationService(
       repository as unknown as NotificationRepository,
       stock as unknown as InventoryStockAlertRepository,
       delivery as unknown as NotificationDeliveryService,
+      adapters as unknown as ExternalAdapterRepository,
     );
-    return { service, repository, stock, delivery };
+    return { service, repository, stock, delivery, adapters };
   };
 
   it('reconciles alert state before deduplicating and delivering tenant notifications', async () => {

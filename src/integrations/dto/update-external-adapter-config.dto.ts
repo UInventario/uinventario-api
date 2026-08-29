@@ -13,7 +13,7 @@ export class UpdateExternalAdapterConfigDto {
   @IsISO31661Alpha2()
   countryCode!: string;
 
-  @IsIn(['SIMULATOR'])
+  @IsIn(['SIMULATOR', 'RESEND'])
   provider!: string;
 
   @IsIn(['1'])

@@ -7,6 +7,7 @@ import {
   SimulatedEmailExternalAdapter,
   SimulatedPushExternalAdapter,
 } from './simulated-notification.adapter';
+import { ResendEmailExternalAdapter } from './resend-email.adapter';
 
 @Injectable()
 export class ExternalAdapterRegistry {
@@ -15,9 +16,10 @@ export class ExternalAdapterRegistry {
   constructor(
     email: SimulatedEmailExternalAdapter,
     push: SimulatedPushExternalAdapter,
+    resend: ResendEmailExternalAdapter,
   ) {
     this.adapters = new Map(
-      [email, push].map((adapter) => [this.key(adapter), adapter]),
+      [email, push, resend].map((adapter) => [this.key(adapter), adapter]),
     );
   }
 
@@ -38,7 +40,10 @@ export class ExternalAdapterRegistry {
       capability: adapter.capability,
       provider: adapter.provider,
       version: adapter.version,
-      mode: 'SIMULATOR' as const,
+      mode:
+        adapter.provider === 'SIMULATOR'
+          ? ('SIMULATOR' as const)
+          : ('LIVE' as const),
     }));
   }
 

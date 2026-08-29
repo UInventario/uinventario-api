@@ -72,6 +72,7 @@ export class ExternalAdapterService {
           recipient: 'diagnostic@example.invalid',
           title: 'Diagnóstico de adaptador',
           body: 'Mensaje simulado sin datos de negocio.',
+          template: { key: 'ADAPTER_DIAGNOSTIC', version: '1' },
         },
       }),
       meta: { apiVersion: '1' as const },
@@ -81,6 +82,13 @@ export class ExternalAdapterService {
   async executions(tenantId: string, query: ListExternalAdapterExecutionsDto) {
     return {
       data: await this.repository.listExecutions(tenantId, query.status),
+      meta: { apiVersion: '1' as const },
+    };
+  }
+
+  async emailEvents(tenantId: string) {
+    return {
+      data: await this.repository.listEmailEvents(tenantId),
       meta: { apiVersion: '1' as const },
     };
   }

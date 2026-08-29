@@ -36,8 +36,19 @@ export class PasswordResetService {
       expiresAt,
       now,
     });
-    if (user)
-      await this.delivery.deliver({ email: user.email, token, expiresAt });
+    if (user) {
+      const deliveryKey = this.hashToken(token);
+      await this.delivery
+        .deliver({
+          tenantId: user.tenantId,
+          email: user.email,
+          token,
+          expiresAt,
+          idempotencyKey: `password-reset:${deliveryKey}`,
+          correlationId: `password-reset:${deliveryKey.slice(0, 32)}`,
+        })
+        .catch(() => undefined);
+    }
     return {
       data: { accepted: true },
       meta: { apiVersion: '1' as const },

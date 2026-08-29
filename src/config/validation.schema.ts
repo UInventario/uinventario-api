@@ -41,6 +41,34 @@ const secureOriginList = originList
       '{{#label}} must contain only HTTPS origins in production',
   });
 
+const resendSecretConfig = Joi.string()
+  .custom((value: string, helpers) => {
+    try {
+      const parsed = JSON.parse(value) as Record<string, unknown>;
+      const diagnosticRecipientValid =
+        typeof parsed.diagnosticRecipient === 'string' &&
+        !Joi.string().email().validate(parsed.diagnosticRecipient).error;
+      if (
+        typeof parsed.apiKey !== 'string' ||
+        !parsed.apiKey.startsWith('re_') ||
+        typeof parsed.from !== 'string' ||
+        !parsed.from.includes('@') ||
+        !diagnosticRecipientValid ||
+        typeof parsed.webhookSecret !== 'string' ||
+        !parsed.webhookSecret.startsWith('whsec_')
+      ) {
+        return helpers.error('resend.invalid');
+      }
+      return value;
+    } catch {
+      return helpers.error('resend.invalid');
+    }
+  }, 'Resend secret configuration')
+  .messages({
+    'resend.invalid':
+      '{{#label}} must be JSON with apiKey, from, diagnosticRecipient and webhookSecret',
+  });
+
 export const validationSchema = Joi.object({
   NODE_ENV: Joi.string()
     .valid('development', 'test', 'production')
@@ -81,7 +109,16 @@ export const validationSchema = Joi.object({
         .uri()
         .default('http://localhost:4200/restablecer'),
     }),
-  PASSWORD_RESET_DELIVERY: Joi.string().valid('local', 'disabled').optional(),
+  PASSWORD_RESET_DELIVERY: Joi.string()
+    .valid('local', 'adapter', 'disabled')
+    .optional(),
+  EMAIL_PROVIDER_SECRET_REFERENCE: Joi.string()
+    .pattern(/^uinventario-(?:local|dev|prod)-resend-config$/)
+    .optional(),
+  RESEND_CONFIG: resendSecretConfig.optional(),
+  RESEND_API_BASE_URL: Joi.string()
+    .uri({ scheme: ['https'] })
+    .default('https://api.resend.com'),
   POS_TAX_RATES: Joi.string()
     .pattern(
       /^(?:[A-Z]{2}|DEFAULT)=(?:0|0\.\d{1,4}|1\.0{1,4})(?:,(?:[A-Z]{2}|DEFAULT)=(?:0|0\.\d{1,4}|1\.0{1,4}))*$/,

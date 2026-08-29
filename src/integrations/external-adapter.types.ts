@@ -9,6 +9,35 @@ export type ExternalAdapterStatus =
   'PENDING' | 'SUCCEEDED' | 'REJECTED' | 'RETRYABLE_FAILURE' | 'TIMED_OUT';
 export type ExternalAdapterScenario =
   'SUCCESS' | 'REJECT' | 'TIMEOUT' | 'RETRY';
+export type ExternalEmailTemplateKey =
+  | 'ADAPTER_DIAGNOSTIC'
+  | 'PASSWORD_RESET'
+  | 'SALE_RECEIPT'
+  | 'OPERATIONAL_NOTIFICATION';
+
+export interface ExternalEmailTemplate {
+  key: ExternalEmailTemplateKey;
+  version: '1';
+}
+
+export type ExternalEmailEventType =
+  | 'SENT'
+  | 'DELIVERED'
+  | 'DELIVERY_DELAYED'
+  | 'BOUNCED'
+  | 'FAILED'
+  | 'SUPPRESSED'
+  | 'COMPLAINED';
+
+export interface ExternalEmailEventData {
+  webhookEventId: string;
+  provider: string;
+  providerReference: string;
+  eventType: ExternalEmailEventType;
+  errorCode: string | null;
+  occurredAt: string;
+  receivedAt: string;
+}
 
 export interface ExternalAdapterConfigData {
   id: string;
@@ -46,8 +75,14 @@ export interface ExternalAdapterCommand {
   idempotencyKey: string;
   correlationId: string;
   attempt: number;
+  secretReference: string | null;
   scenario?: ExternalAdapterScenario;
-  payload: { recipient: string; title: string; body: string };
+  payload: {
+    recipient: string;
+    title: string;
+    body: string;
+    template: ExternalEmailTemplate;
+  };
 }
 
 export type ExternalAdapterResult =

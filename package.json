@@ -49,6 +49,7 @@
     "mysql2": "^3.24.2",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
+    "svix": "1.99.1",
     "typeorm": "^1.1.0"
   },
   "devDependencies": {

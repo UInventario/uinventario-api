@@ -43,6 +43,11 @@ export class ExternalAdapterController {
     return this.adapters.executions(request.principal.tenant.id, query);
   }
 
+  @Get('email-events')
+  emailEvents(@Req() request: AuthenticatedRequest) {
+    return this.adapters.emailEvents(request.principal.tenant.id);
+  }
+
   @Put(':capability')
   async update(
     @Req() request: AuthenticatedRequest,
