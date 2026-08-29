@@ -1060,6 +1060,7 @@ describe('UInventario API (e2e)', () => {
                   'INVENTORY_ADJUST',
                   'INVENTORY_APPROVE',
                   'INVENTORY_COUNT',
+                  'INVENTORY_EXPIRED_STOCK_OVERRIDE',
                   'INVENTORY_TRANSFER',
                   'INVENTORY_VALUATION_MANAGE',
                   'INVENTORY_VIEW',
