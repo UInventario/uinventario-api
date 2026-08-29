@@ -78,9 +78,12 @@ describe('UInventario API (e2e)', () => {
       'customer_order_payments',
       'customer_order_lines',
       'customer_orders',
+      'sales_quotation_operations',
+      'sales_quotation_lines',
       'sale_payments',
       'sale_lines',
       'sales',
+      'sales_quotations',
       'price_lists',
       'cash_register_movements',
       'cash_register_shifts',
@@ -16637,6 +16640,369 @@ describe('UInventario API (e2e)', () => {
         .expect(({ body }: { body: { data: unknown[] } }) =>
           expect(body.data).toEqual([]),
         );
+    });
+  });
+
+  describe('sales quotation lifecycle', () => {
+    beforeEach(resetIdentityData);
+
+    it('edits, recalculates and converts once without touching stock beforehand or crossing tenants', async () => {
+      await registerAccount('quotation-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Cotizaciones SA',
+          tradeName: 'Cotizaciones',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega',
+          locationName: 'General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Principal' })
+        .expect(200);
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto cotizado',
+          sku: 'QUOTE-001',
+          cost: '40',
+          price: '100',
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-stock')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '5',
+          reason: 'Stock para cotización',
+        })
+        .expect(201);
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({ name: 'Cliente cotizado', dataProcessingConsent: false })
+        .expect(201);
+      const customerId = (customerResponse.body as { data: { id: string } })
+        .data.id;
+      await openCurrentCashRegister(cookie, 'quotation-open-shift', '100.00');
+
+      const validUntil = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+      const payload = {
+        channel: 'WEB',
+        validUntil,
+        notes: 'Propuesta inicial',
+        lines: [{ productId, quantity: '1' }],
+      };
+      const created = await request(app.getHttpServer())
+        .post('/api/v1/quotations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-create-main')
+        .send(payload)
+        .expect(201);
+      const createdData = (
+        created.body as { data: { id: string; version: number } }
+      ).data;
+      expect(created.body).toMatchObject({
+        data: {
+          status: 'ACTIVE',
+          customer: null,
+          totals: { total: '100.00' },
+          lines: [{ product: { id: productId }, quantity: '1.000' }],
+          sale: null,
+        },
+        meta: { idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .post('/api/v1/quotations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-create-main')
+        .send(payload)
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: { id: string }; meta: { idempotentReplay: boolean } };
+          }) => {
+            expect(body.data.id).toBe(createdData.id);
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+      const [beforeEdit] = await dataSource.query<
+        Array<{ quantity: string; available_quantity: string }>
+      >(
+        'SELECT quantity, available_quantity FROM inventory_balances WHERE product_id = ? AND location_id = ?',
+        [productId, location.id],
+      );
+      expect(beforeEdit).toMatchObject({
+        quantity: '5.000',
+        available_quantity: '5.000',
+      });
+
+      const updatePayload = {
+        ...payload,
+        customerId,
+        notes: 'Propuesta revisada',
+        version: createdData.version,
+        lines: [{ productId, quantity: '2' }],
+      };
+      const updated = await request(app.getHttpServer())
+        .put(`/api/v1/quotations/${createdData.id}`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-update-main')
+        .send(updatePayload)
+        .expect(200);
+      const updatedData = (updated.body as { data: { version: number } }).data;
+      expect(updated.body).toMatchObject({
+        data: {
+          version: 2,
+          customer: { id: customerId },
+          notes: 'Propuesta revisada',
+          totals: { total: '200.00' },
+        },
+      });
+      await request(app.getHttpServer())
+        .put(`/api/v1/quotations/${createdData.id}`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-update-main')
+        .send(updatePayload)
+        .expect(200)
+        .expect(({ body }: { body: { meta: { idempotentReplay: boolean } } }) =>
+          expect(body.meta.idempotentReplay).toBe(true),
+        );
+
+      await dataSource.query(
+        'UPDATE products SET price = ?, version = version + 1 WHERE id = ?',
+        ['110.00', productId],
+      );
+      const preview = await request(app.getHttpServer())
+        .post(`/api/v1/quotations/${createdData.id}/preview`)
+        .set('Cookie', cookie)
+        .expect(201);
+      const previewData = (
+        preview.body as {
+          data: {
+            canConvert: boolean;
+            differences: Array<{
+              field: string;
+              quoted: string;
+              current: string;
+              blocking: boolean;
+            }>;
+          };
+        }
+      ).data;
+      expect(previewData.canConvert).toBe(true);
+      expect(
+        previewData.differences.some(
+          (difference) =>
+            difference.field === 'UNIT_PRICE' &&
+            difference.quoted === '100.00' &&
+            difference.current === '110.00' &&
+            !difference.blocking,
+        ),
+      ).toBe(true);
+      expect(
+        previewData.differences.some(
+          (difference) =>
+            difference.field === 'TOTAL' &&
+            difference.quoted === '200.00' &&
+            difference.current === '220.00' &&
+            !difference.blocking,
+        ),
+      ).toBe(true);
+      await request(app.getHttpServer())
+        .post(`/api/v1/quotations/${createdData.id}/convert`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-convert-main')
+        .send({
+          version: updatedData.version,
+          acceptDifferences: false,
+          payments: [{ method: 'CASH', amountReceived: '300.00' }],
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code: string } }) =>
+          expect(body.code).toBe('QUOTATION_CHANGED'),
+        );
+
+      const converted = await request(app.getHttpServer())
+        .post(`/api/v1/quotations/${createdData.id}/convert`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-convert-main')
+        .send({
+          version: updatedData.version,
+          acceptDifferences: true,
+          payments: [{ method: 'CASH', amountReceived: '300.00' }],
+        })
+        .expect(201);
+      const convertedData = converted.body as {
+        data: {
+          quotation: { version: number; status: string; sale: { id: string } };
+          sale: { id: string; receiptNumber: string };
+        };
+        meta: { idempotentReplay: boolean };
+      };
+      expect(convertedData.data.quotation.status).toBe('CONVERTED');
+      expect(convertedData.data.sale.receiptNumber).toMatch(/^V-/);
+      expect(convertedData.meta.idempotentReplay).toBe(false);
+      await request(app.getHttpServer())
+        .post(`/api/v1/quotations/${createdData.id}/convert`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-convert-retry')
+        .send({
+          version: updatedData.version,
+          acceptDifferences: true,
+          payments: [{ method: 'CASH', amountReceived: '300.00' }],
+        })
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: { sale: { id: string } };
+              meta: { idempotentReplay: boolean };
+            };
+          }) => {
+            expect(body.data.sale.id).toBe(convertedData.data.sale.id);
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${convertedData.data.sale.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: { quotation: { id: createdData.id } },
+          }),
+        );
+      const [afterSale] = await dataSource.query<
+        Array<{ quantity: string; available_quantity: string }>
+      >(
+        'SELECT quantity, available_quantity FROM inventory_balances WHERE product_id = ? AND location_id = ?',
+        [productId, location.id],
+      );
+      expect(afterSale).toMatchObject({
+        quantity: '3.000',
+        available_quantity: '3.000',
+      });
+      const [saleCount] = await dataSource.query<
+        Array<{ total: number | string }>
+      >('SELECT COUNT(*) AS total FROM sales WHERE quotation_id = ?', [
+        createdData.id,
+      ]);
+      expect(Number(saleCount.total)).toBe(1);
+
+      const expired = await request(app.getHttpServer())
+        .post('/api/v1/quotations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-create-expired')
+        .send({ ...payload, notes: 'Por vencer' })
+        .expect(201);
+      const expiredData = (
+        expired.body as { data: { id: string; version: number } }
+      ).data;
+      await dataSource.query(
+        'UPDATE sales_quotations SET valid_until = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 1 SECOND) WHERE id = ?',
+        [expiredData.id],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/quotations/${expiredData.id}/convert`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-convert-expired')
+        .send({
+          version: expiredData.version,
+          acceptDifferences: true,
+          payments: [{ method: 'CASH', amountReceived: '200.00' }],
+        })
+        .expect(409)
+        .expect(({ body }: { body: { status: string } }) =>
+          expect(body.status).toBe('EXPIRED'),
+        );
+
+      const other = {
+        organizationName: 'Otro tenant cotizaciones',
+        email: 'other-quotes@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'quotation-other-registration')
+        .send(other)
+        .expect(201);
+      const otherCookie = await createPersistedSession(other.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Otro Cotizaciones',
+          tradeName: 'Otro',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Otra',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Otra Bodega',
+          locationName: 'Otra General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Otra Caja' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/quotations/${createdData.id}`)
+        .set('Cookie', otherCookie)
+        .expect(404);
+      await request(app.getHttpServer())
+        .get('/api/v1/quotations')
+        .set('Cookie', otherCookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) =>
+          expect(body.data).toEqual([]),
+        );
+
+      const actions = await dataSource.query<Array<{ action: string }>>(
+        "SELECT action FROM audit_events WHERE action LIKE 'SALES_QUOTATION_%'",
+      );
+      expect(actions.map(({ action }) => action)).toEqual(
+        expect.arrayContaining([
+          'SALES_QUOTATION_CREATED',
+          'SALES_QUOTATION_UPDATED',
+          'SALES_QUOTATION_CONVERTED',
+        ]),
+      );
     });
   });
 
