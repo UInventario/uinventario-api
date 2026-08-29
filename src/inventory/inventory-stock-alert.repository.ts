@@ -21,6 +21,16 @@ interface AlertRow {
 export class InventoryStockAlertRepository {
   constructor(private readonly dataSource: DataSource) {}
 
+  async reconcileTenant(tenantId: string): Promise<void> {
+    const warehouses = await this.dataSource.query<Array<{ id: string }>>(
+      'SELECT id FROM warehouses WHERE tenant_id = ? AND active = TRUE',
+      [tenantId],
+    );
+    for (const warehouse of warehouses) {
+      await this.reconcile(tenantId, warehouse.id);
+    }
+  }
+
   async list(
     tenantId: string,
     branchId: string,

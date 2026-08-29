@@ -100,8 +100,9 @@ export class RegistrationRepository {
         (?, ?, 'INVENTORY_TRANSFER'), (?, ?, 'INVENTORY_COUNT'),
         (?, ?, 'INVENTORY_APPROVE'),
         (?, ?, 'INVENTORY_VALUATION_MANAGE'),
-        (?, ?, 'INVENTORY_EXPIRED_STOCK_OVERRIDE')`,
-      Array.from({ length: 27 }, () => [role.id, tenant.id]).flat(),
+        (?, ?, 'INVENTORY_EXPIRED_STOCK_OVERRIDE'),
+        (?, ?, 'NOTIFICATIONS_VIEW'), (?, ?, 'NOTIFICATIONS_MANAGE')`,
+      Array.from({ length: 29 }, () => [role.id, tenant.id]).flat(),
     );
     await manager.query(
       `INSERT INTO privacy_policies
