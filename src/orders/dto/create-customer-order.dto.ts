@@ -15,6 +15,7 @@ import {
 import { PRICE_CHANNELS } from '../../pricing/price-list.types';
 import { QuoteCartLineDto } from '../../pos/dto/quote-cart.dto';
 import { SalePaymentDto } from '../../pos/dto/create-sale.dto';
+import { CustomerOrderFulfillmentDto } from './customer-order-fulfillment.dto';
 
 export const CUSTOMER_ORDER_PRIORITIES = [
   'LOW',
@@ -32,6 +33,10 @@ export class CreateCustomerOrderDto {
 
   @IsUUID()
   locationId!: string;
+
+  @ValidateNested()
+  @Type(() => CustomerOrderFulfillmentDto)
+  fulfillment!: CustomerOrderFulfillmentDto;
 
   @IsOptional()
   @IsIn(CUSTOMER_ORDER_PRIORITIES)

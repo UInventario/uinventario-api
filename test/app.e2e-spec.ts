@@ -74,9 +74,11 @@ describe('UInventario API (e2e)', () => {
       'sale_returns',
       'suspended_sale_lines',
       'suspended_sales',
+      'customer_order_dispatch_attempts',
       'customer_order_transitions',
       'customer_order_payments',
       'customer_order_lines',
+      'customer_order_fulfillments',
       'customer_orders',
       'sales_quotation_operations',
       'sales_quotation_lines',
@@ -10356,6 +10358,15 @@ describe('UInventario API (e2e)', () => {
           'PRODUCT_RESERVATION_CONSUMED',
         ]),
       );
+      const [piiAudit] = await dataSource.query<
+        Array<{ total: number | string }>
+      >(
+        `SELECT COUNT(*) AS total FROM audit_events
+         WHERE after_data LIKE '%Calle Privada 123%'
+            OR after_data LIKE '%55 1234 9876%'
+            OR after_data LIKE '%Persona privada%'`,
+      );
+      expect(Number(piiAudit.total)).toBe(0);
     });
 
     it('opens one auditable register shift idempotently and requires it for POS operations', async () => {
@@ -16355,12 +16366,25 @@ describe('UInventario API (e2e)', () => {
       const customerId = (customer.body as { data: { id: string } }).data.id;
       await openCurrentCashRegister(cookie, 'order-open-shift', '200.00');
 
+      const pickupWindowStart = new Date(
+        Date.now() + 60 * 60_000,
+      ).toISOString();
+      const pickupWindowEnd = new Date(
+        Date.now() + 3 * 60 * 60_000,
+      ).toISOString();
+
       const orderPayload = {
         channel: 'WEB',
         customerId,
         locationId: location.id,
         priority: 'HIGH',
         expiresInHours: 48,
+        fulfillment: {
+          method: 'PICKUP',
+          deliveryCost: '0.00',
+          windowStart: pickupWindowStart,
+          windowEnd: pickupWindowEnd,
+        },
         lines: [{ productId, quantity: '2' }],
         payments: [{ method: 'CASH', amountReceived: '500.00' }],
       };
@@ -16383,6 +16407,13 @@ describe('UInventario API (e2e)', () => {
           payments: [{ method: 'CASH', status: 'PLANNED' }],
           reservation: null,
           sale: null,
+          fulfillment: {
+            method: 'PICKUP',
+            status: 'PENDING',
+            deliveryCost: '0.00',
+            address: null,
+            carrier: null,
+          },
         },
         meta: { idempotentReplay: false },
       });
@@ -16475,6 +16506,178 @@ describe('UInventario API (e2e)', () => {
           expect(body.meta.idempotentReplay).toBe(true),
         );
 
+      const deliveryWindowStart = new Date(
+        Date.now() + 4 * 60 * 60_000,
+      ).toISOString();
+      const deliveryWindowEnd = new Date(
+        Date.now() + 6 * 60 * 60_000,
+      ).toISOString();
+      const delivery = await request(app.getHttpServer())
+        .post('/api/v1/orders')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-create-delivery')
+        .send({
+          ...orderPayload,
+          lines: [{ productId, quantity: '1' }],
+          fulfillment: {
+            method: 'DELIVERY',
+            deliveryCost: '85.50',
+            windowStart: deliveryWindowStart,
+            windowEnd: deliveryWindowEnd,
+            recipientName: 'Persona privada',
+            recipientPhone: '+52 55 1234 9876',
+            addressLine1: 'Calle Privada 123',
+            addressLine2: 'Interior 4',
+            city: 'Ciudad de México',
+            region: 'CDMX',
+            postalCode: '01000',
+            countryCode: 'MX',
+            carrierCode: 'SIMULATED_RETRY',
+          },
+        })
+        .expect(201);
+      const deliveryCreated = delivery.body as {
+        data: { id: string; version: number };
+      };
+      expect(JSON.stringify(delivery.body)).not.toContain('Calle Privada 123');
+      expect(JSON.stringify(delivery.body)).not.toContain('+52 55 1234 9876');
+      expect(delivery.body).toMatchObject({
+        data: {
+          fulfillment: {
+            method: 'DELIVERY',
+            status: 'PENDING',
+            deliveryCost: '85.50',
+            address: {
+              recipientNameMasked: 'P***',
+              phoneMasked: '***9876',
+              summary: 'Ciudad de México, CDMX, MX',
+            },
+            carrier: { code: 'SIMULATED_RETRY', attempts: 0 },
+          },
+        },
+      });
+      const deliveryConfirmed = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/confirm`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-confirm')
+        .send({ version: deliveryCreated.data.version })
+        .expect(201);
+      const deliveryConfirmedData = deliveryConfirmed.body as {
+        data: { version: number };
+      };
+      const deliveryPrepared = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/prepare`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-prepare')
+        .send({ version: deliveryConfirmedData.data.version })
+        .expect(201);
+      const deliveryPreparedData = deliveryPrepared.body as {
+        data: {
+          version: number;
+          fulfillment: {
+            responsible: { preparation: { email: string } | null };
+          };
+        };
+      };
+      expect(
+        deliveryPreparedData.data.fulfillment.responsible.preparation,
+      ).toMatchObject({
+        email: registrationPayload.email,
+      });
+      const deliveryReady = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/ready`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-ready')
+        .send({ version: deliveryPreparedData.data.version })
+        .expect(201);
+      const deliveryReadyData = deliveryReady.body as {
+        data: { version: number };
+      };
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/deliver`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-too-soon')
+        .send({ version: deliveryReadyData.data.version })
+        .expect(409);
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/dispatch`)
+        .set('Idempotency-Key', 'order-delivery-no-session')
+        .send({ version: deliveryReadyData.data.version })
+        .expect(401);
+      const failedDispatch = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/dispatch`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-dispatch-1')
+        .send({ version: deliveryReadyData.data.version })
+        .expect(201);
+      const failedDispatchData = failedDispatch.body as {
+        data: { version: number };
+      };
+      expect(failedDispatch.body).toMatchObject({
+        data: {
+          status: 'READY',
+          fulfillment: {
+            status: 'RETRYABLE_FAILURE',
+            carrier: {
+              attempts: 1,
+              lastErrorCode: 'SIMULATED_CARRIER_UNAVAILABLE',
+            },
+          },
+        },
+        meta: { idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/dispatch`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-dispatch-1')
+        .send({ version: deliveryReadyData.data.version })
+        .expect(201)
+        .expect(({ body }: { body: { meta: { idempotentReplay: boolean } } }) =>
+          expect(body.meta.idempotentReplay).toBe(true),
+        );
+      const dispatched = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/dispatch`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-dispatch-2')
+        .send({ version: failedDispatchData.data.version })
+        .expect(201);
+      const dispatchedData = dispatched.body as {
+        data: {
+          version: number;
+          fulfillment: {
+            carrier: { trackingReference: string | null };
+          };
+        };
+      };
+      expect(dispatched.body).toMatchObject({
+        data: {
+          fulfillment: {
+            status: 'DISPATCHED',
+            carrier: { attempts: 2, lastErrorCode: null },
+          },
+        },
+      });
+      expect(dispatchedData.data.fulfillment.carrier.trackingReference).toMatch(
+        /^SIM-O-/,
+      );
+      const deliveredDispatch = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/deliver`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-complete')
+        .send({ version: dispatchedData.data.version })
+        .expect(201);
+      expect(deliveredDispatch.body).toMatchObject({
+        data: {
+          status: 'DELIVERED',
+          fulfillment: {
+            status: 'DELIVERED',
+            responsible: {
+              delivery: { email: registrationPayload.email },
+            },
+          },
+        },
+      });
+
       const cancellable = await request(app.getHttpServer())
         .post('/api/v1/orders')
         .set('Cookie', cookie)
@@ -16559,8 +16762,8 @@ describe('UInventario API (e2e)', () => {
         [productId, location.id],
       );
       expect(balance).toMatchObject({
-        quantity: '3.000',
-        available_quantity: '3.000',
+        quantity: '2.000',
+        available_quantity: '2.000',
         reserved_quantity: '0.000',
       });
       const [counts] = await dataSource.query<
@@ -16570,8 +16773,8 @@ describe('UInventario API (e2e)', () => {
            (SELECT COUNT(*) FROM sales) AS sales,
            (SELECT COUNT(*) FROM customer_order_transitions) AS transitions`,
       );
-      expect(Number(counts.sales)).toBe(1);
-      expect(Number(counts.transitions)).toBe(6);
+      expect(Number(counts.sales)).toBe(2);
+      expect(Number(counts.transitions)).toBe(10);
       const auditActions = await dataSource.query<Array<{ action: string }>>(
         `SELECT action FROM audit_events
          WHERE action LIKE 'CUSTOMER_ORDER_%' OR action IN (
@@ -16585,6 +16788,8 @@ describe('UInventario API (e2e)', () => {
           'CUSTOMER_ORDER_CONFIRMED',
           'CUSTOMER_ORDER_PREPARED',
           'CUSTOMER_ORDER_READY',
+          'CUSTOMER_ORDER_DISPATCH_RETRYABLE',
+          'CUSTOMER_ORDER_DISPATCHED',
           'CUSTOMER_ORDER_DELIVERED',
           'CUSTOMER_ORDER_CANCELLED',
           'PRODUCT_RESERVATION_CREATED',

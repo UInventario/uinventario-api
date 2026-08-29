@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  Inject,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -25,6 +26,11 @@ import type {
 import type { CreateCustomerOrderDto } from './dto/create-customer-order.dto';
 import type { ListCustomerOrdersDto } from './dto/list-customer-orders.dto';
 import type { TransitionCustomerOrderDto } from './dto/transition-customer-order.dto';
+import {
+  CUSTOMER_ORDER_CARRIER_ADAPTER,
+  type CustomerOrderCarrierAdapter,
+} from './customer-order-carrier.adapter';
+import type { CustomerOrderFulfillmentDto } from './dto/customer-order-fulfillment.dto';
 
 interface CustomerOrderTransitionInput {
   tenantId: string;
@@ -43,6 +49,8 @@ export class CustomerOrderService {
     private readonly orders: CustomerOrderRepository,
     private readonly reservations: ProductReservationService,
     private readonly pos: PosService,
+    @Inject(CUSTOMER_ORDER_CARRIER_ADAPTER)
+    private readonly carrier: CustomerOrderCarrierAdapter,
   ) {}
 
   async create(input: {
@@ -114,6 +122,7 @@ export class CustomerOrderService {
         expiresInHours: input.dto.expiresInHours,
         lines: input.dto.lines,
         payments,
+        fulfillment: this.normalizeFulfillment(input.dto.fulfillment),
         quote: quote.data,
         fingerprint,
       });
@@ -207,6 +216,65 @@ export class CustomerOrderService {
     return this.change({ ...input, from: ['PREPARING'], to: 'READY' });
   }
 
+  async dispatch(
+    input: CustomerOrderTransitionInput,
+  ): Promise<CustomerOrderResponse> {
+    this.assertKey(input.idempotencyKey);
+    try {
+      const replay = await this.orders.findDispatchByIdempotency({
+        tenantId: input.tenantId,
+        branchId: input.branchId,
+        orderId: input.orderId,
+        version: input.dto.version,
+        idempotencyKey: input.idempotencyKey!,
+      });
+      if (replay) {
+        return {
+          data: replay,
+          meta: { apiVersion: '1', idempotentReplay: true },
+        };
+      }
+    } catch (error) {
+      this.rethrow(error);
+    }
+    const current = await this.requireOrder(input);
+    if (
+      current.status !== 'READY' ||
+      current.fulfillment.method !== 'DELIVERY' ||
+      !['READY', 'RETRYABLE_FAILURE', 'DISPATCHED'].includes(
+        current.fulfillment.status,
+      ) ||
+      !current.fulfillment.carrier
+    )
+      this.state(current.fulfillment.status);
+    if (current.version !== input.dto.version)
+      this.rethrow(new CustomerOrderVersionConflictError());
+    const result = await this.carrier.dispatch({
+      carrierCode: current.fulfillment.carrier.code,
+      orderNumber: current.orderNumber,
+      attempt: current.fulfillment.carrier.attempts + 1,
+      windowStart: current.fulfillment.window.start,
+      windowEnd: current.fulfillment.window.end,
+    });
+    try {
+      const dispatched = await this.orders.dispatch({
+        tenantId: input.tenantId,
+        branchId: input.branchId,
+        orderId: input.orderId,
+        actorUserId: input.userId,
+        version: input.dto.version,
+        idempotencyKey: input.idempotencyKey!,
+        result,
+      });
+      return {
+        data: dispatched.order,
+        meta: { apiVersion: '1', idempotentReplay: dispatched.replay },
+      };
+    } catch (error) {
+      this.rethrow(error);
+    }
+  }
+
   async deliver(
     input: CustomerOrderTransitionInput & { canViewMargin: boolean },
   ) {
@@ -215,6 +283,14 @@ export class CustomerOrderService {
     if (!['READY', 'DELIVERED'].includes(current.status))
       this.state(current.status);
     if (!current.reservation) this.state(current.status);
+    if (
+      current.status === 'READY' &&
+      ((current.fulfillment.method === 'PICKUP' &&
+        current.fulfillment.status !== 'READY') ||
+        (current.fulfillment.method === 'DELIVERY' &&
+          current.fulfillment.status !== 'DISPATCHED'))
+    )
+      this.state(current.fulfillment.status);
     if (current.status === 'READY') {
       const quote = await this.pos.quoteCart({
         tenantId: input.tenantId,
@@ -399,6 +475,91 @@ export class CustomerOrderService {
           'La suma del plan de pagos debe coincidir con el total del pedido.',
       });
     return normalized;
+  }
+
+  private normalizeFulfillment(dto: CustomerOrderFulfillmentDto) {
+    const windowStart = new Date(dto.windowStart);
+    const windowEnd = new Date(dto.windowEnd);
+    if (
+      Number.isNaN(windowStart.getTime()) ||
+      Number.isNaN(windowEnd.getTime()) ||
+      windowStart.getTime() < Date.now() - 5 * 60_000 ||
+      windowEnd <= windowStart ||
+      windowEnd.getTime() - windowStart.getTime() > 7 * 24 * 60 * 60_000
+    ) {
+      throw new BadRequestException({
+        code: 'ORDER_FULFILLMENT_WINDOW_INVALID',
+        message:
+          'La ventana debe ser futura, terminar después de iniciar y durar como máximo 7 días.',
+      });
+    }
+    const deliveryCost = this.money(this.cents(dto.deliveryCost));
+    if (dto.method === 'PICKUP') {
+      if (
+        deliveryCost !== '0.00' ||
+        dto.carrierCode ||
+        dto.addressLine1 ||
+        dto.recipientName ||
+        dto.recipientPhone
+      ) {
+        throw new BadRequestException({
+          code: 'ORDER_PICKUP_DATA_INVALID',
+          message: 'El retiro no admite costo, transportista ni dirección.',
+        });
+      }
+      return {
+        method: dto.method,
+        deliveryCost,
+        windowStart,
+        windowEnd,
+        recipientName: null,
+        recipientPhone: null,
+        addressLine1: null,
+        addressLine2: null,
+        city: null,
+        region: null,
+        postalCode: null,
+        countryCode: null,
+        carrierCode: null,
+        carrierName: null,
+      };
+    }
+    const required = [
+      dto.recipientName,
+      dto.recipientPhone,
+      dto.addressLine1,
+      dto.city,
+      dto.region,
+      dto.postalCode,
+      dto.countryCode,
+      dto.carrierCode,
+    ];
+    if (required.some((value) => !value?.trim())) {
+      throw new BadRequestException({
+        code: 'ORDER_DELIVERY_DATA_REQUIRED',
+        message:
+          'Completa destinatario, teléfono, dirección, ciudad, región, código postal, país y transportista.',
+      });
+    }
+    return {
+      method: dto.method,
+      deliveryCost,
+      windowStart,
+      windowEnd,
+      recipientName: dto.recipientName!.trim(),
+      recipientPhone: dto.recipientPhone!.trim(),
+      addressLine1: dto.addressLine1!.trim(),
+      addressLine2: dto.addressLine2?.trim() || null,
+      city: dto.city!.trim(),
+      region: dto.region!.trim(),
+      postalCode: dto.postalCode!.trim(),
+      countryCode: dto.countryCode!,
+      carrierCode: dto.carrierCode!,
+      carrierName:
+        dto.carrierCode === 'SIMULATED_RETRY'
+          ? 'Transportista simulado con reintento'
+          : 'Transportista simulado',
+    };
   }
 
   private assertKey(value: string | undefined): void {

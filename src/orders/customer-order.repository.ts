@@ -17,6 +17,7 @@ import type {
   CustomerOrderStatus,
 } from './customer-order.types';
 import type { ListCustomerOrdersDto } from './dto/list-customer-orders.dto';
+import type { CustomerOrderDispatchResult } from './customer-order-carrier.adapter';
 
 interface OrderRow {
   id: string;
@@ -50,6 +51,26 @@ interface OrderRow {
   location_id: string;
   location_name: string;
   location_code: string;
+  fulfillment_method: 'PICKUP' | 'DELIVERY';
+  fulfillment_status: CustomerOrderData['fulfillment']['status'];
+  recipient_name: string | null;
+  recipient_phone: string | null;
+  fulfillment_city: string | null;
+  fulfillment_region: string | null;
+  fulfillment_country_code: string | null;
+  carrier_code: 'SIMULATED' | 'SIMULATED_RETRY' | null;
+  carrier_name: string | null;
+  delivery_cost: string;
+  window_start: Date | string;
+  window_end: Date | string;
+  tracking_reference: string | null;
+  attempt_count: number;
+  last_error_code: string | null;
+  last_attempt_at: Date | string | null;
+  assigned_user_id: string | null;
+  assigned_user_email: string | null;
+  delivered_user_id: string | null;
+  delivered_user_email: string | null;
   created_at: Date | string;
   updated_at: Date | string;
 }
@@ -81,6 +102,22 @@ export class CustomerOrderRepository {
     quote: PosCartQuoteResponse['data'];
     idempotencyKey: string;
     fingerprint: string;
+    fulfillment: {
+      method: 'PICKUP' | 'DELIVERY';
+      deliveryCost: string;
+      windowStart: Date;
+      windowEnd: Date;
+      recipientName: string | null;
+      recipientPhone: string | null;
+      addressLine1: string | null;
+      addressLine2: string | null;
+      city: string | null;
+      region: string | null;
+      postalCode: string | null;
+      countryCode: string | null;
+      carrierCode: 'SIMULATED' | 'SIMULATED_RETRY' | null;
+      carrierName: string | null;
+    };
   }): Promise<{ order: CustomerOrderData; replay: boolean }> {
     try {
       return await this.dataSource.transaction(
@@ -149,6 +186,31 @@ export class CustomerOrderRepository {
               input.idempotencyKey,
               input.fingerprint,
               input.userId,
+            ],
+          );
+          await manager.query(
+            `INSERT INTO customer_order_fulfillments
+            (order_id, tenant_id, method, status, recipient_name, recipient_phone,
+             address_line1, address_line2, city, region, postal_code, country_code,
+             carrier_code, carrier_name, delivery_cost, window_start, window_end)
+           VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              id,
+              input.tenantId,
+              input.fulfillment.method,
+              input.fulfillment.recipientName,
+              input.fulfillment.recipientPhone,
+              input.fulfillment.addressLine1,
+              input.fulfillment.addressLine2,
+              input.fulfillment.city,
+              input.fulfillment.region,
+              input.fulfillment.postalCode,
+              input.fulfillment.countryCode,
+              input.fulfillment.carrierCode,
+              input.fulfillment.carrierName,
+              input.fulfillment.deliveryCost,
+              input.fulfillment.windowStart,
+              input.fulfillment.windowEnd,
             ],
           );
           for (const [index, quoted] of input.quote.lines.entries()) {
@@ -288,6 +350,35 @@ export class CustomerOrderRepository {
     return order ? { order, fingerprint: row.request_fingerprint } : null;
   }
 
+  async findDispatchByIdempotency(input: {
+    tenantId: string;
+    branchId: string;
+    orderId: string;
+    version: number;
+    idempotencyKey: string;
+  }): Promise<CustomerOrderData | null> {
+    const replay = await this.findDispatch(
+      this.dataSource.manager,
+      input.tenantId,
+      input.idempotencyKey,
+    );
+    if (!replay) return null;
+    if (
+      replay.order_id !== input.orderId ||
+      replay.request_fingerprint !==
+        this.dispatchFingerprint(input.orderId, input.version)
+    )
+      throw new CustomerOrderIdempotencyConflictError();
+    const order = await this.findById(
+      this.dataSource.manager,
+      input.tenantId,
+      input.branchId,
+      input.orderId,
+    );
+    if (!order) throw new CustomerOrderNotFoundError();
+    return order;
+  }
+
   async transition(input: {
     tenantId: string;
     branchId: string;
@@ -386,6 +477,33 @@ export class CustomerOrderRepository {
               input.tenantId,
             ],
           );
+          if (input.to === 'PREPARING') {
+            await manager.query(
+              `UPDATE customer_order_fulfillments
+               SET status = 'PREPARING', assigned_user_id = COALESCE(assigned_user_id, ?)
+               WHERE order_id = ? AND tenant_id = ?`,
+              [input.actorUserId, input.orderId, input.tenantId],
+            );
+          } else if (input.to === 'READY') {
+            await manager.query(
+              `UPDATE customer_order_fulfillments SET status = 'READY'
+               WHERE order_id = ? AND tenant_id = ?`,
+              [input.orderId, input.tenantId],
+            );
+          } else if (input.to === 'DELIVERED') {
+            await manager.query(
+              `UPDATE customer_order_fulfillments
+               SET status = 'DELIVERED', delivered_user_id = ?
+               WHERE order_id = ? AND tenant_id = ?`,
+              [input.actorUserId, input.orderId, input.tenantId],
+            );
+          } else if (input.to === 'CANCELLED') {
+            await manager.query(
+              `UPDATE customer_order_fulfillments SET status = 'CANCELLED'
+               WHERE order_id = ? AND tenant_id = ?`,
+              [input.orderId, input.tenantId],
+            );
+          }
           if (input.to === 'DELIVERED') {
             await manager.query(
               `UPDATE customer_order_payments SET status = 'COMPLETED'
@@ -450,6 +568,151 @@ export class CustomerOrderRepository {
     }
   }
 
+  async dispatch(input: {
+    tenantId: string;
+    branchId: string;
+    orderId: string;
+    actorUserId: string;
+    version: number;
+    idempotencyKey: string;
+    result: CustomerOrderDispatchResult;
+  }): Promise<{ order: CustomerOrderData; replay: boolean }> {
+    const fingerprint = this.dispatchFingerprint(input.orderId, input.version);
+    try {
+      return await this.dataSource.transaction(
+        'READ COMMITTED',
+        async (manager) => {
+          const replay = await this.findDispatch(
+            manager,
+            input.tenantId,
+            input.idempotencyKey,
+          );
+          if (replay) {
+            if (
+              replay.request_fingerprint !== fingerprint ||
+              replay.order_id !== input.orderId
+            )
+              throw new CustomerOrderIdempotencyConflictError();
+            const order = await this.findById(
+              manager,
+              input.tenantId,
+              input.branchId,
+              input.orderId,
+            );
+            if (!order) throw new CustomerOrderNotFoundError();
+            return { order, replay: true };
+          }
+          const [current] = await manager.query<
+            Array<{
+              status: CustomerOrderStatus;
+              version: number;
+              method: 'PICKUP' | 'DELIVERY';
+              fulfillment_status: CustomerOrderData['fulfillment']['status'];
+              carrier_code: 'SIMULATED' | 'SIMULATED_RETRY' | null;
+              attempt_count: number;
+            }>
+          >(
+            `SELECT o.status, o.version, f.method,
+                    f.status AS fulfillment_status, f.carrier_code, f.attempt_count
+             FROM customer_orders o
+             INNER JOIN customer_order_fulfillments f
+               ON f.order_id = o.id AND f.tenant_id = o.tenant_id
+             WHERE o.id = ? AND o.tenant_id = ? AND o.branch_id = ? FOR UPDATE`,
+            [input.orderId, input.tenantId, input.branchId],
+          );
+          if (!current) throw new CustomerOrderNotFoundError();
+          if (
+            current.status !== 'READY' ||
+            current.method !== 'DELIVERY' ||
+            !['READY', 'RETRYABLE_FAILURE'].includes(current.fulfillment_status)
+          )
+            throw new CustomerOrderStateError(current.fulfillment_status);
+          if (Number(current.version) !== input.version)
+            throw new CustomerOrderVersionConflictError();
+          const attempt = Number(current.attempt_count) + 1;
+          await manager.query(
+            `INSERT INTO customer_order_dispatch_attempts
+            (id, tenant_id, order_id, attempt_number, status, carrier_code,
+             tracking_reference, error_code, actor_user_id, idempotency_key,
+             request_fingerprint)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              randomUUID(),
+              input.tenantId,
+              input.orderId,
+              attempt,
+              input.result.status,
+              current.carrier_code,
+              input.result.status === 'SUCCEEDED'
+                ? input.result.trackingReference
+                : null,
+              input.result.status === 'FAILED_RETRYABLE'
+                ? input.result.errorCode
+                : null,
+              input.actorUserId,
+              input.idempotencyKey,
+              fingerprint,
+            ],
+          );
+          await manager.query(
+            `UPDATE customer_order_fulfillments
+             SET status = ?, attempt_count = ?, tracking_reference = ?,
+                 last_error_code = ?, last_attempt_at = CURRENT_TIMESTAMP(6)
+             WHERE order_id = ? AND tenant_id = ?`,
+            [
+              input.result.status === 'SUCCEEDED'
+                ? 'DISPATCHED'
+                : 'RETRYABLE_FAILURE',
+              attempt,
+              input.result.status === 'SUCCEEDED'
+                ? input.result.trackingReference
+                : null,
+              input.result.status === 'FAILED_RETRYABLE'
+                ? input.result.errorCode
+                : null,
+              input.orderId,
+              input.tenantId,
+            ],
+          );
+          await manager.query(
+            `UPDATE customer_orders SET version = version + 1
+             WHERE id = ? AND tenant_id = ?`,
+            [input.orderId, input.tenantId],
+          );
+          const order = await this.findById(
+            manager,
+            input.tenantId,
+            input.branchId,
+            input.orderId,
+          );
+          if (!order) throw new CustomerOrderNotFoundError();
+          return { order, replay: false };
+        },
+      );
+    } catch (error) {
+      if (!this.isDuplicate(error)) throw error;
+      const replay = await this.findDispatch(
+        this.dataSource.manager,
+        input.tenantId,
+        input.idempotencyKey,
+      );
+      if (
+        !replay ||
+        replay.request_fingerprint !== fingerprint ||
+        replay.order_id !== input.orderId
+      )
+        throw new CustomerOrderIdempotencyConflictError();
+      const order = await this.findById(
+        this.dataSource.manager,
+        input.tenantId,
+        input.branchId,
+        input.orderId,
+      );
+      if (!order) throw new CustomerOrderNotFoundError();
+      return { order, replay: true };
+    }
+  }
+
   private async findByCreateKey(
     manager: EntityManager,
     tenantId: string,
@@ -478,6 +741,28 @@ export class CustomerOrderRepository {
     return row;
   }
 
+  private async findDispatch(
+    manager: EntityManager,
+    tenantId: string,
+    key: string,
+  ) {
+    const [row] = await manager.query<
+      Array<{ order_id: string; request_fingerprint: string }>
+    >(
+      `SELECT order_id, request_fingerprint
+       FROM customer_order_dispatch_attempts
+       WHERE tenant_id = ? AND idempotency_key = ? LIMIT 1`,
+      [tenantId, key],
+    );
+    return row;
+  }
+
+  private dispatchFingerprint(orderId: string, version: number): string {
+    return createHash('sha256')
+      .update(JSON.stringify({ orderId, version, action: 'dispatch' }))
+      .digest('hex');
+  }
+
   private async findById(
     manager: EntityManager,
     tenantId: string,
@@ -498,7 +783,16 @@ export class CustomerOrderRepository {
               b.name AS branch_name, w.name AS warehouse_name,
               cr.name AS cash_register_name, cr.code AS cash_register_code,
               l.name AS location_name, l.code AS location_code,
-              r.reservation_number, r.status AS reservation_status, s.receipt_number
+              r.reservation_number, r.status AS reservation_status, s.receipt_number,
+              f.method AS fulfillment_method, f.status AS fulfillment_status,
+              f.recipient_name, f.recipient_phone,
+              f.city AS fulfillment_city, f.region AS fulfillment_region,
+              f.country_code AS fulfillment_country_code,
+              f.carrier_code, f.carrier_name, f.delivery_cost,
+              f.window_start, f.window_end, f.tracking_reference,
+              f.attempt_count, f.last_error_code, f.last_attempt_at,
+              au.id AS assigned_user_id, au.email AS assigned_user_email,
+              du.id AS delivered_user_id, du.email AS delivered_user_email
        FROM customer_orders o
        INNER JOIN customers c ON c.id = o.customer_id AND c.tenant_id = o.tenant_id
        INNER JOIN branches b ON b.id = o.branch_id AND b.tenant_id = o.tenant_id
@@ -507,6 +801,10 @@ export class CustomerOrderRepository {
        INNER JOIN locations l ON l.id = o.location_id AND l.tenant_id = o.tenant_id
        LEFT JOIN product_reservations r ON r.id = o.reservation_id AND r.tenant_id = o.tenant_id
        LEFT JOIN sales s ON s.id = o.sale_id AND s.tenant_id = o.tenant_id
+       INNER JOIN customer_order_fulfillments f
+         ON f.order_id = o.id AND f.tenant_id = o.tenant_id
+       LEFT JOIN users au ON au.id = f.assigned_user_id
+       LEFT JOIN users du ON du.id = f.delivered_user_id
        ${suffix}`,
       values,
     );
@@ -602,6 +900,53 @@ export class CustomerOrderRepository {
       currency: row.currency,
       totals: { subtotal: row.subtotal, tax: row.tax, total: row.total },
       expiresInHours: Number(row.expires_in_hours),
+      fulfillment: {
+        method: row.fulfillment_method,
+        status: row.fulfillment_status,
+        deliveryCost: row.delivery_cost,
+        window: {
+          start: this.iso(row.window_start),
+          end: this.iso(row.window_end),
+        },
+        address:
+          row.fulfillment_method === 'DELIVERY'
+            ? {
+                recipientNameMasked: this.maskName(row.recipient_name!),
+                phoneMasked: this.maskPhone(row.recipient_phone!),
+                summary: [
+                  row.fulfillment_city,
+                  row.fulfillment_region,
+                  row.fulfillment_country_code,
+                ]
+                  .filter(Boolean)
+                  .join(', '),
+                countryCode: row.fulfillment_country_code!,
+              }
+            : null,
+        carrier:
+          row.carrier_code && row.carrier_name
+            ? {
+                code: row.carrier_code,
+                name: row.carrier_name,
+                trackingReference: row.tracking_reference,
+                attempts: Number(row.attempt_count),
+                lastErrorCode: row.last_error_code,
+                lastAttemptAt: row.last_attempt_at
+                  ? this.iso(row.last_attempt_at)
+                  : null,
+              }
+            : null,
+        responsible: {
+          preparation:
+            row.assigned_user_id && row.assigned_user_email
+              ? { id: row.assigned_user_id, email: row.assigned_user_email }
+              : null,
+          delivery:
+            row.delivered_user_id && row.delivered_user_email
+              ? { id: row.delivered_user_id, email: row.delivered_user_email }
+              : null,
+        },
+      },
       reservation: row.reservation_id
         ? {
             id: row.reservation_id,
@@ -661,6 +1006,16 @@ export class CustomerOrderRepository {
 
   private iso(value: Date | string): string {
     return new Date(value).toISOString();
+  }
+
+  private maskPhone(value: string): string {
+    const digits = value.replace(/\D/g, '');
+    return digits.length > 4 ? `***${digits.slice(-4)}` : '***';
+  }
+
+  private maskName(value: string): string {
+    const trimmed = value.trim();
+    return trimmed ? `${trimmed.slice(0, 1)}***` : '***';
   }
 
   private isDuplicate(error: unknown): boolean {
