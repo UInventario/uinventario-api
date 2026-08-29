@@ -7684,6 +7684,38 @@ describe('UInventario API (e2e)', () => {
           });
         });
       await request(app.getHttpServer())
+        .get('/api/v1/pos/reports/profitability')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              currencies: [
+                expect.objectContaining({
+                  currency: 'MXN',
+                  grossRevenue: '119.90',
+                  discounts: '19.90',
+                  salesTotal: '100.00',
+                  returnTotal: '100.00',
+                  netRevenue: '0.00',
+                  netCost: '0.00',
+                  margin: '0.00',
+                  refundsSettled: '0.00',
+                  salesMatchPayments: true,
+                }),
+              ],
+              products: [
+                expect.objectContaining({
+                  soldQuantity: '1.000',
+                  returnedQuantity: '1.000',
+                  margin: '0.00',
+                }),
+              ],
+              total: 2,
+            },
+          });
+        });
+      await request(app.getHttpServer())
         .get('/api/v1/audit-events')
         .query({ entityType: 'SALE', q: sale.data.id, page: 1, pageSize: 10 })
         .set('Cookie', cookie)
@@ -7726,6 +7758,13 @@ describe('UInventario API (e2e)', () => {
          WHERE role_id = ? AND tenant_id = ? AND permission = 'INVENTORY_VALUATION_MANAGE'`,
         [principal.role_id, principal.tenant_id],
       );
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/reports/profitability')
+        .set('Cookie', cookie)
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVENTORY_ACCESS_DENIED');
+        });
       await request(app.getHttpServer())
         .get(`/api/v1/pos/sales/${sale.data.id}`)
         .set('Cookie', cookie)
@@ -8297,6 +8336,41 @@ describe('UInventario API (e2e)', () => {
             );
           },
         );
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/reports/profitability')
+        .set('Cookie', cookie)
+        .query({
+          branchId: mixedData.data.context.branch.id,
+          page: 1,
+          pageSize: 10,
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              currencies: [
+                expect.objectContaining({
+                  currency: 'MXN',
+                  sales: 1,
+                  cancellations: 1,
+                  salesTotal: '119.90',
+                  paymentObligations: '119.90',
+                  salesMatchPayments: true,
+                }),
+              ],
+              products: [
+                expect.objectContaining({
+                  soldQuantity: '1.000',
+                }),
+              ],
+              total: 2,
+            },
+            meta: {
+              pagination: { page: 1, pageSize: 10, total: 2, totalPages: 1 },
+              periodTimezone: 'BRANCH_LOCAL',
+            },
+          });
+        });
       await request(app.getHttpServer())
         .get('/api/v1/pos/reports/sales-cash')
         .set('Cookie', cookie)
@@ -9119,6 +9193,25 @@ describe('UInventario API (e2e)', () => {
                   matches: true,
                 },
               },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/reports/profitability')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              currencies: [
+                expect.objectContaining({
+                  currency: 'MXN',
+                  salesTotal: '119.90',
+                  paymentObligations: '119.90',
+                  creditSales: '119.90',
+                  salesMatchPayments: true,
+                }),
+              ],
             },
           });
         });

@@ -42,6 +42,8 @@ import { CustomerModule } from '../customers/customer.module';
 import { CustomerCreditPaymentController } from './customer-credit-payment.controller';
 import { CustomerCreditPaymentRepository } from './customer-credit-payment.repository';
 import { CustomerCreditPaymentService } from './customer-credit-payment.service';
+import { PosProfitabilityReportRepository } from './pos-profitability-report.repository';
+import { PosProfitabilityReportService } from './pos-profitability-report.service';
 
 @Module({
   imports: [SessionModule, PriceListModule, CustomerModule],
@@ -66,6 +68,8 @@ import { CustomerCreditPaymentService } from './customer-credit-payment.service'
     PaymentAuthorizationService,
     SalesCashReportRepository,
     SalesCashReportService,
+    PosProfitabilityReportRepository,
+    PosProfitabilityReportService,
     SaleReceiptRepository,
     SaleReceiptService,
     SaleReturnRepository,
