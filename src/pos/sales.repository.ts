@@ -38,6 +38,13 @@ interface SaleRow {
   customer_identifier: string | null;
   currency: string;
   tax_rate: string;
+  gross_total: string;
+  line_discount_total: string;
+  sale_discount_total: string;
+  discount_total: string;
+  discount_type: 'PERCENT' | 'AMOUNT' | null;
+  discount_value: string | null;
+  discount_reason: string | null;
   subtotal: string;
   tax_total: string;
   total: string;
@@ -783,9 +790,12 @@ export class SalesRepository {
           await manager.query(
             `INSERT INTO sales
             (id, tenant_id, branch_id, warehouse_id, cash_register_id,
-             cash_register_shift_id, created_by_user_id, customer_id, reservation_id, receipt_number, currency, tax_rate, subtotal,
-             tax_total, total, status, idempotency_key, request_fingerprint)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
+             cash_register_shift_id, created_by_user_id, customer_id, reservation_id,
+             receipt_number, currency, tax_rate, gross_total, line_discount_total,
+             sale_discount_total, discount_total, discount_type, discount_value,
+             discount_reason, subtotal, tax_total, total, status, idempotency_key,
+             request_fingerprint)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
             [
               saleId,
               input.tenantId,
@@ -799,6 +809,13 @@ export class SalesRepository {
               receiptNumber,
               input.quote.currency,
               input.quote.taxRate,
+              input.quote.totals.gross,
+              input.quote.totals.lineDiscount,
+              input.quote.totals.saleDiscount,
+              input.quote.totals.discount,
+              input.quote.discount?.type ?? null,
+              input.quote.discount?.value ?? null,
+              input.quote.discount?.reason ?? null,
               input.quote.totals.subtotal,
               input.quote.totals.tax,
               input.quote.totals.total,
@@ -817,8 +834,10 @@ export class SalesRepository {
               `INSERT INTO sale_lines
               (id, tenant_id, sale_id, line_number, product_id, product_name,
                product_sku, quantity, unit_price, price_source, price_list_id,
-               price_list_name, unit_cost, subtotal, tax, total)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               price_list_name, unit_cost, gross_total, line_discount_total,
+               sale_discount_total, discount_total, discount_type, discount_value,
+               discount_reason, subtotal, tax, total)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 saleLineId,
                 input.tenantId,
@@ -833,6 +852,13 @@ export class SalesRepository {
                 line.priceList?.id ?? null,
                 line.priceList?.name ?? null,
                 productCost.cost,
+                line.grossTotal,
+                line.discount.line?.amount ?? '0.00',
+                line.discount.sale?.amount ?? '0.00',
+                line.discount.total,
+                line.discount.line?.type ?? null,
+                line.discount.line?.value ?? null,
+                line.discount.line?.reason ?? null,
                 line.subtotal,
                 line.tax,
                 line.total,
@@ -986,7 +1012,9 @@ export class SalesRepository {
       `SELECT s.id, s.receipt_number, s.status, s.created_by_user_id,
               c.id AS customer_id, c.name AS customer_name,
               c.identifier AS customer_identifier,
-              s.currency, s.tax_rate, s.subtotal, s.tax_total, s.total,
+              s.currency, s.tax_rate, s.gross_total, s.line_discount_total,
+              s.sale_discount_total, s.discount_total, s.discount_type,
+              s.discount_value, s.discount_reason, s.subtotal, s.tax_total, s.total,
               s.request_fingerprint, s.created_at, s.voided_by_user_id,
               vu.email AS voided_by_email, s.void_reason, s.voided_at,
               b.id AS branch_id, b.name AS branch_name,
@@ -1015,13 +1043,24 @@ export class SalesRepository {
         price_source: 'BASE' | 'PRICE_LIST';
         price_list_id: string | null;
         price_list_name: string | null;
+        unit_cost: string;
+        gross_total: string;
+        line_discount_total: string;
+        sale_discount_total: string;
+        discount_total: string;
+        discount_type: 'PERCENT' | 'AMOUNT' | null;
+        discount_value: string | null;
+        discount_reason: string | null;
         subtotal: string;
         tax: string;
         total: string;
       }>
     >(
       `SELECT id, product_id, product_name, product_sku, quantity, unit_price,
-              price_source, price_list_id, price_list_name, subtotal, tax, total
+              price_source, price_list_id, price_list_name, unit_cost,
+              gross_total, line_discount_total, sale_discount_total,
+              discount_total, discount_type, discount_value, discount_reason,
+              subtotal, tax, total
        FROM sale_lines WHERE tenant_id = ? AND sale_id = ? ORDER BY line_number`,
       [tenantId, row.id],
     );
@@ -1055,6 +1094,16 @@ export class SalesRepository {
       authorizationCode: payment.authorization_code,
     }));
     if (!payments[0]) throw new Error('SALE_PAYMENT_NOT_FOUND');
+    const grossProfit = lines.reduce(
+      (sum, line) =>
+        sum +
+        this.toMoney(line.subtotal) -
+        this.roundDivide(
+          this.toMoney(line.unit_cost) * this.toQuantityUnits(line.quantity),
+          1000n,
+        ),
+      0n,
+    );
     return {
       fingerprint: row.request_fingerprint,
       sale: {
@@ -1080,6 +1129,14 @@ export class SalesRepository {
           : null,
         currency: row.currency,
         taxRate: this.decimal(row.tax_rate, 4),
+        discount: row.discount_type
+          ? {
+              type: row.discount_type,
+              value: this.decimal(row.discount_value!, 2),
+              reason: row.discount_reason!,
+              amount: this.decimal(row.sale_discount_total, 2),
+            }
+          : null,
         lines: lines.map((line) => ({
           id: line.id,
           product: {
@@ -1093,14 +1150,47 @@ export class SalesRepository {
           priceList: line.price_list_id
             ? { id: line.price_list_id, name: line.price_list_name! }
             : null,
+          grossTotal: this.decimal(line.gross_total, 2),
+          discount: {
+            line: line.discount_type
+              ? {
+                  type: line.discount_type,
+                  value: this.decimal(line.discount_value!, 2),
+                  reason: line.discount_reason!,
+                  amount: this.decimal(line.line_discount_total, 2),
+                }
+              : null,
+            sale: row.discount_type
+              ? {
+                  type: row.discount_type,
+                  value: this.decimal(row.discount_value!, 2),
+                  reason: row.discount_reason!,
+                  amount: this.decimal(line.sale_discount_total, 2),
+                }
+              : null,
+            total: this.decimal(line.discount_total, 2),
+          },
           subtotal: this.decimal(line.subtotal, 2),
           tax: this.decimal(line.tax, 2),
           total: this.decimal(line.total, 2),
+          grossProfit: this.money(
+            this.toMoney(line.subtotal) -
+              this.roundDivide(
+                this.toMoney(line.unit_cost) *
+                  this.toQuantityUnits(line.quantity),
+                1000n,
+              ),
+          ),
         })),
         totals: {
+          gross: this.decimal(row.gross_total, 2),
+          lineDiscount: this.decimal(row.line_discount_total, 2),
+          saleDiscount: this.decimal(row.sale_discount_total, 2),
+          discount: this.decimal(row.discount_total, 2),
           subtotal: this.decimal(row.subtotal, 2),
           tax: this.decimal(row.tax_total, 2),
           total: this.decimal(row.total, 2),
+          grossProfit: this.money(grossProfit),
         },
         payment: payments[0],
         payments,
@@ -1154,6 +1244,24 @@ export class SalesRepository {
     const sign = value < 0n ? '-' : '';
     const absolute = value < 0n ? -value : value;
     return `${sign}${absolute / 1000n}.${String(absolute % 1000n).padStart(3, '0')}`;
+  }
+
+  private toMoney(value: string): bigint {
+    const negative = value.startsWith('-');
+    const unsigned = negative ? value.slice(1) : value;
+    const [whole, fraction = ''] = unsigned.split('.');
+    const cents = BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0'));
+    return negative ? -cents : cents;
+  }
+
+  private money(value: bigint): string {
+    const sign = value < 0n ? '-' : '';
+    const absolute = value < 0n ? -value : value;
+    return `${sign}${absolute / 100n}.${String(absolute % 100n).padStart(2, '0')}`;
+  }
+
+  private roundDivide(numerator: bigint, denominator: bigint): bigint {
+    return (numerator + denominator / 2n) / denominator;
   }
 
   private isDuplicate(error: unknown): boolean {

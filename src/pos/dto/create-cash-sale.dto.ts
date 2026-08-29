@@ -10,7 +10,7 @@ import {
   Matches,
   ValidateNested,
 } from 'class-validator';
-import { QuoteCartLineDto } from './quote-cart.dto';
+import { QuoteCartLineDto, SaleDiscountDto } from './quote-cart.dto';
 import { PRICE_CHANNELS } from '../../pricing/price-list.types';
 import type { PriceChannel } from '../../pricing/price-list.types';
 
@@ -33,6 +33,11 @@ export class CreateCashSaleDto {
   @ValidateNested({ each: true })
   @Type(() => QuoteCartLineDto)
   lines!: QuoteCartLineDto[];
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => SaleDiscountDto)
+  discount?: SaleDiscountDto;
 
   @IsString()
   @Matches(/^(0|[1-9]\d{0,11})(\.\d{1,2})?$/)

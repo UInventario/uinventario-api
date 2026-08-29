@@ -8,11 +8,30 @@ import {
   IsOptional,
   IsString,
   IsUUID,
+  MaxLength,
   Matches,
+  MinLength,
   ValidateNested,
 } from 'class-validator';
 import { PRICE_CHANNELS } from '../../pricing/price-list.types';
 import type { PriceChannel } from '../../pricing/price-list.types';
+
+export const DISCOUNT_TYPES = ['PERCENT', 'AMOUNT'] as const;
+export type DiscountType = (typeof DISCOUNT_TYPES)[number];
+
+export class SaleDiscountDto {
+  @IsIn(DISCOUNT_TYPES)
+  type!: DiscountType;
+
+  @IsString()
+  @Matches(/^(?:[1-9]\d{0,11}(?:\.\d{1,2})?|0\.(?:0[1-9]|[1-9]\d?))$/)
+  value!: string;
+
+  @IsString()
+  @MinLength(3)
+  @MaxLength(240)
+  reason!: string;
+}
 
 export class QuoteCartLineDto {
   @IsUUID()
@@ -32,6 +51,11 @@ export class QuoteCartLineDto {
   @ArrayUnique((value: string) => value.trim().toUpperCase())
   @IsString({ each: true })
   serialNumbers?: string[];
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => SaleDiscountDto)
+  discount?: SaleDiscountDto;
 }
 
 export class QuoteCartDto {
@@ -53,4 +77,9 @@ export class QuoteCartDto {
   @ValidateNested({ each: true })
   @Type(() => QuoteCartLineDto)
   lines!: QuoteCartLineDto[];
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => SaleDiscountDto)
+  discount?: SaleDiscountDto;
 }

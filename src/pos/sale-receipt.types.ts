@@ -6,6 +6,10 @@ export interface SaleReceiptLine {
   productSku: string;
   quantity: string;
   unitPrice: string;
+  grossTotal: string;
+  discountTotal: string;
+  lineDiscountReason: string | null;
+  saleDiscountReason: string | null;
   subtotal: string;
   tax: string;
   total: string;
@@ -39,7 +43,13 @@ export interface SaleReceiptData {
   taxRate: string;
   lines: SaleReceiptLine[];
   payments: SaleReceiptPayment[];
-  totals: { subtotal: string; tax: string; total: string };
+  totals: {
+    gross: string;
+    discount: string;
+    subtotal: string;
+    tax: string;
+    total: string;
+  };
   issuedAt: string;
   saleStatus: 'COMPLETED' | 'VOIDED';
   void: { reason: string; voidedAt: string } | null;
