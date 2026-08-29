@@ -27,3 +27,15 @@ export class ProductLotTrackingLockedError extends Error {
     super('PRODUCT_LOT_TRACKING_LOCKED');
   }
 }
+
+export class ProductVariantConfigurationError extends Error {
+  constructor(readonly reason: string) {
+    super('PRODUCT_VARIANT_CONFIGURATION_INVALID');
+  }
+}
+
+export class ProductVariantsRequireZeroStockError extends Error {
+  constructor() {
+    super('PRODUCT_VARIANTS_REQUIRE_ZERO_STOCK');
+  }
+}

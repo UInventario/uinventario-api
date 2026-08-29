@@ -207,7 +207,8 @@ export class SupplierProductRepository {
     >(
       `SELECT
          EXISTS(SELECT 1 FROM suppliers WHERE id = ? AND tenant_id = ? AND active = TRUE) AS supplier_exists,
-         EXISTS(SELECT 1 FROM products WHERE id = ? AND tenant_id = ? AND active = TRUE) AS product_exists`,
+         EXISTS(SELECT 1 FROM products WHERE id = ? AND tenant_id = ? AND active = TRUE
+           AND variant_schema IS NULL) AS product_exists`,
       [supplierId, tenantId, productId, tenantId],
     );
     if (!Number(state.supplier_exists))

@@ -11,6 +11,8 @@ import {
   ProductIdentifierConflictError,
   ProductVersionConflictError,
   ProductLotTrackingLockedError,
+  ProductVariantConfigurationError,
+  ProductVariantsRequireZeroStockError,
 } from './catalog.errors';
 import {
   CatalogOptionsResponse,
@@ -25,6 +27,7 @@ import {
   CatalogClassificationKind,
   UpdateCatalogClassificationDto,
 } from './dto/catalog-classification.dto';
+import { UpdateProductVariantsDto } from './dto/update-product-variants.dto';
 
 @Injectable()
 export class CatalogService {
@@ -122,6 +125,48 @@ export class CatalogService {
     const product = await this.catalog.getProduct(tenantId, id);
     if (!product) throw new NotFoundException();
     return { data: product, meta: { apiVersion: '1' } };
+  }
+
+  async updateProductVariants(
+    tenantId: string,
+    id: string,
+    dto: UpdateProductVariantsDto,
+  ): Promise<ProductResponse> {
+    try {
+      const product = await this.catalog.updateProductVariants(
+        tenantId,
+        id,
+        dto,
+      );
+      if (!product) throw new NotFoundException();
+      return { data: product, meta: { apiVersion: '1' } };
+    } catch (error) {
+      if (error instanceof ProductIdentifierConflictError) {
+        this.throwIdentifierConflict(error);
+      }
+      if (error instanceof ProductVersionConflictError) {
+        throw new ConflictException({
+          code: 'PRODUCT_VERSION_CONFLICT',
+          currentVersion: error.currentVersion,
+          message:
+            'El producto o una variante cambió. Recarga antes de guardar.',
+        });
+      }
+      if (error instanceof ProductVariantsRequireZeroStockError) {
+        throw new ConflictException({
+          code: 'PRODUCT_VARIANTS_REQUIRE_ZERO_STOCK',
+          message:
+            'El producto padre debe quedar sin existencias antes de habilitar variantes.',
+        });
+      }
+      if (error instanceof ProductVariantConfigurationError) {
+        throw new BadRequestException({
+          code: 'PRODUCT_VARIANT_CONFIGURATION_INVALID',
+          message: error.reason,
+        });
+      }
+      throw error;
+    }
   }
 
   async resolveCode(tenantId: string, code: string): Promise<ProductResponse> {

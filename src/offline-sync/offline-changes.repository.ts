@@ -108,7 +108,7 @@ export class OfflineChangesRepository {
         }>
       >(
         `SELECT id, sku, barcode, name, category_id, brand_id, price, version, updated_at
-         FROM products WHERE tenant_id = ? AND active = FALSE
+         FROM products WHERE tenant_id = ? AND active = FALSE AND variant_schema IS NULL
            AND updated_at > ? AND updated_at <= ?`,
         [input.tenantId, input.since, input.until],
       );

@@ -393,7 +393,8 @@ export class PurchaseOrderRepository {
        FROM supplier_products sp
        INNER JOIN products p ON p.id = sp.product_id AND p.tenant_id = sp.tenant_id
        WHERE sp.tenant_id = ? AND sp.supplier_id = ? AND sp.active = TRUE
-         AND p.active = TRUE AND sp.id IN (${ids.map(() => '?').join(',')})`,
+         AND p.active = TRUE AND p.variant_schema IS NULL
+         AND sp.id IN (${ids.map(() => '?').join(',')})`,
       [tenantId, dto.supplierId, ...ids],
     );
     const byId = new Map(

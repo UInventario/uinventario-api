@@ -11,6 +11,11 @@ export interface ProductData {
   price: string;
   active: boolean;
   version: number;
+  parentProductId: string | null;
+  variantAttributes: Array<{ name: string; values: string[] }>;
+  variantValues: Array<{ attribute: string; value: string }>;
+  sellable: boolean;
+  variants: ProductData[];
 }
 
 export interface ProductResponse {

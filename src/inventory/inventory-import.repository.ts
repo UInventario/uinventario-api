@@ -95,7 +95,7 @@ export class InventoryImportRepository {
           }>
         >(
           `SELECT id, name, sku, normalized_sku FROM products
-           WHERE tenant_id = ? AND active = TRUE`,
+           WHERE tenant_id = ? AND active = TRUE AND variant_schema IS NULL`,
           [input.tenantId],
         ),
         manager.query<Array<{ id: string; name: string; code: string }>>(
@@ -365,7 +365,8 @@ export class InventoryImportRepository {
               `SELECT 1 AS ok FROM products p
            INNER JOIN locations l ON l.id = ? AND l.tenant_id = p.tenant_id
              AND l.warehouse_id = ? AND l.active = TRUE
-           WHERE p.id = ? AND p.tenant_id = ? AND p.active = TRUE LIMIT 1`,
+           WHERE p.id = ? AND p.tenant_id = ? AND p.active = TRUE
+             AND p.variant_schema IS NULL LIMIT 1`,
               [
                 row.location.id,
                 input.warehouseId,

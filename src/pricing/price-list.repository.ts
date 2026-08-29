@@ -176,7 +176,8 @@ export class PriceListRepository {
       }>
     >(
       `SELECT
-        (SELECT COUNT(*) FROM products WHERE tenant_id = ? AND active = TRUE AND id IN (${placeholders})) AS products,
+        (SELECT COUNT(*) FROM products WHERE tenant_id = ? AND active = TRUE
+          AND variant_schema IS NULL AND id IN (${placeholders})) AS products,
         ${dto.branchId ? 'EXISTS(SELECT 1 FROM branches WHERE tenant_id = ? AND id = ? AND active = TRUE)' : '1'} AS branch_exists,
         ${dto.customerId ? 'EXISTS(SELECT 1 FROM customers WHERE tenant_id = ? AND id = ? AND active = TRUE)' : '1'} AS customer_exists`,
       [

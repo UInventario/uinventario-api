@@ -1006,7 +1006,7 @@ export class InventoryRepository {
     const scope = scopeRows[0];
     if (!scope) throw new InventoryTargetNotFoundError();
 
-    const filters = ['p.tenant_id = ?'];
+    const filters = ['p.tenant_id = ?', 'p.variant_schema IS NULL'];
     const parameters: unknown[] = [tenantId];
     if (query.productId) {
       filters.push('p.id = ?');
@@ -1268,7 +1268,8 @@ export class InventoryRepository {
          AND l.warehouse_id = ? AND l.active = TRUE
        LEFT JOIN inventory_balances ib ON ib.tenant_id = p.tenant_id
          AND ib.product_id = p.id AND ib.location_id = l.id
-       WHERE p.id = ? AND p.tenant_id = ? AND p.active = TRUE LIMIT 1`,
+       WHERE p.id = ? AND p.tenant_id = ? AND p.active = TRUE
+         AND p.variant_schema IS NULL LIMIT 1`,
       [locationId, warehouseId, productId, tenantId],
     );
     if (!rows[0]) throw new InventoryTargetNotFoundError();
@@ -1788,7 +1789,8 @@ export class InventoryRepository {
       `SELECT p.id AS product_id FROM products p
        INNER JOIN locations l ON l.id = ? AND l.tenant_id = p.tenant_id
          AND l.warehouse_id = ? AND l.active = TRUE
-       WHERE p.id = ? AND p.tenant_id = ? AND p.active = TRUE LIMIT 1`,
+       WHERE p.id = ? AND p.tenant_id = ? AND p.active = TRUE
+         AND p.variant_schema IS NULL LIMIT 1`,
       [locationId, warehouseId, productId, tenantId],
     );
     if (!rows[0]) throw new InventoryTargetNotFoundError();
