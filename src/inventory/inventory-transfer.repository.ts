@@ -476,8 +476,8 @@ export class InventoryTransferRepository {
       throw new InvalidInventoryTransferReceiptError();
     const [target] = await this.dataSource.query<Array<{ id: string }>>(
       `SELECT id FROM inventory_transfers
-       WHERE id = ? AND tenant_id = ? AND destination_warehouse_id = ? LIMIT 1`,
-      [input.transferId, input.tenantId, input.destinationWarehouseId],
+       WHERE id = ? AND tenant_id = ? LIMIT 1`,
+      [input.transferId, input.tenantId],
     );
     if (!target) throw new InventoryTransferNotFoundError();
     const policies = await this.transferLineQuantityPolicies(
