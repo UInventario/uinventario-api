@@ -35,6 +35,7 @@ import { PriceListModule } from './pricing/price-list.module';
 import { CustomerOrderModule } from './orders/customer-order.module';
 import { SalesQuotationModule } from './quotations/sales-quotation.module';
 import { NotificationModule } from './notifications/notification.module';
+import { ExternalAdapterModule } from './integrations/external-adapter.module';
 
 @Module({
   imports: [
@@ -88,6 +89,7 @@ import { NotificationModule } from './notifications/notification.module';
     CustomerOrderModule,
     SalesQuotationModule,
     NotificationModule,
+    ExternalAdapterModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: SecurityThrottlerGuard }],
 })
