@@ -56,7 +56,7 @@ export interface SaleReceiptData {
 }
 
 export interface SaleReceiptDeliveryData {
-  mode: 'SIMULATED';
+  mode: 'SIMULATED' | 'PROVIDER';
   channel: 'EMAIL';
   recipient: string;
   messageId: string;

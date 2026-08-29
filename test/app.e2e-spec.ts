@@ -30,7 +30,7 @@ describe('UInventario API (e2e)', () => {
       imports: [AppModule],
     }).compile();
 
-    app = moduleFixture.createNestApplication();
+    app = moduleFixture.createNestApplication({ rawBody: true });
     configureApp(app);
     await app.init();
     dataSource = app.get(DataSource);
@@ -41,6 +41,7 @@ describe('UInventario API (e2e)', () => {
   async function resetIdentityData(): Promise<void> {
     await dataSource.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const table of [
+      'external_email_events',
       'external_adapter_executions',
       'external_adapter_configs',
       'notification_deliveries',
@@ -443,6 +444,92 @@ describe('UInventario API (e2e)', () => {
         .get('/api/v1/integrations/adapters')
         .set('Cookie', cookie)
         .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'TENANT_MANAGE')`,
+        [identity.role_id, identity.tenant_id],
+      );
+    });
+
+    it('exposes Resend v1 but fails safely until its external secret is activated', async () => {
+      await registerAccount('resend-adapter-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Resend SA',
+          tradeName: 'Resend',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega',
+          locationName: 'General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/integrations/adapters')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { meta: { catalog: unknown[] } } }) =>
+          expect(body.meta.catalog).toEqual(
+            expect.arrayContaining([
+              {
+                capability: 'NOTIFICATION_EMAIL',
+                provider: 'RESEND',
+                version: '1',
+                mode: 'LIVE',
+              },
+            ]),
+          ),
+        );
+      await request(app.getHttpServer())
+        .put('/api/v1/integrations/adapters/NOTIFICATION_EMAIL')
+        .set('Cookie', cookie)
+        .send({
+          countryCode: 'MX',
+          provider: 'RESEND',
+          adapterVersion: '1',
+          enabled: true,
+          timeoutMs: 1000,
+          maxAttempts: 2,
+          secretReference: 'uinventario-local-resend-config',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post('/api/v1/integrations/adapters/NOTIFICATION_EMAIL/diagnostics')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'resend-not-configured-001')
+        .send({ scenario: 'SUCCESS' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: {
+              provider: 'RESEND',
+              status: 'REJECTED',
+              attemptCount: 1,
+              errorCode: 'EMAIL_PROVIDER_NOT_CONFIGURED',
+            },
+          }),
+        );
+      await request(app.getHttpServer())
+        .get('/api/v1/integrations/adapters/email-events')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({ data: [] }),
+        );
     });
   });
 

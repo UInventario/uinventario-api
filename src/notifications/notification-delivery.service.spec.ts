@@ -1,4 +1,5 @@
 import { ExternalAdapterExecutionService } from '../integrations/external-adapter-execution.service';
+import { TransactionalEmailTemplateService } from '../integrations/transactional-email-template.service';
 import { NotificationDeliveryService } from './notification-delivery.service';
 import { NotificationRepository } from './notification.repository';
 
@@ -41,6 +42,7 @@ describe('NotificationDeliveryService', () => {
     const service = new NotificationDeliveryService(
       repository as unknown as NotificationRepository,
       adapters as unknown as ExternalAdapterExecutionService,
+      new TransactionalEmailTemplateService(),
     );
 
     await expect(service.process('tenant-1')).resolves.toEqual({
@@ -65,7 +67,7 @@ describe('NotificationDeliveryService', () => {
       expect.objectContaining({
         tenantId: 'tenant-1',
         capability: 'NOTIFICATION_EMAIL',
-        idempotencyKey: 'delivery-1:2',
+        idempotencyKey: 'notification:delivery-1',
       }),
     );
   });

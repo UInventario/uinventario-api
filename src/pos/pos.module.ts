@@ -18,10 +18,6 @@ import { SalesCashReportService } from './sales-cash-report.service';
 import { SaleReceiptController } from './sale-receipt.controller';
 import { SaleReceiptRepository } from './sale-receipt.repository';
 import { SaleReceiptService } from './sale-receipt.service';
-import {
-  SALE_RECEIPT_EMAIL_ADAPTER,
-  SimulatorSaleReceiptEmailAdapter,
-} from './sale-receipt-email.adapter';
 import { SaleReturnController } from './sale-return.controller';
 import { SaleReturnRepository } from './sale-return.repository';
 import { SaleReturnService } from './sale-return.service';
@@ -44,9 +40,15 @@ import { CustomerCreditPaymentRepository } from './customer-credit-payment.repos
 import { CustomerCreditPaymentService } from './customer-credit-payment.service';
 import { PosProfitabilityReportRepository } from './pos-profitability-report.repository';
 import { PosProfitabilityReportService } from './pos-profitability-report.service';
+import { ExternalAdapterModule } from '../integrations/external-adapter.module';
 
 @Module({
-  imports: [SessionModule, PriceListModule, CustomerModule],
+  imports: [
+    SessionModule,
+    PriceListModule,
+    CustomerModule,
+    ExternalAdapterModule,
+  ],
   controllers: [
     PosController,
     SaleReceiptController,
@@ -86,11 +88,6 @@ import { PosProfitabilityReportService } from './pos-profitability-report.servic
     {
       provide: POS_PERIPHERAL_ADAPTER,
       useExisting: SimulatorPosPeripheralAdapter,
-    },
-    SimulatorSaleReceiptEmailAdapter,
-    {
-      provide: SALE_RECEIPT_EMAIL_ADAPTER,
-      useExisting: SimulatorSaleReceiptEmailAdapter,
     },
     PosService,
     PosAccessGuard,

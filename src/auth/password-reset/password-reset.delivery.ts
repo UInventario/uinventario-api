@@ -1,12 +1,17 @@
 import { Inject, Injectable, NotFoundException } from '@nestjs/common';
 import type { ConfigType } from '@nestjs/config';
 import { passwordResetConfig } from '../../config/password-reset.config';
+import { ExternalAdapterExecutionService } from '../../integrations/external-adapter-execution.service';
+import { TransactionalEmailTemplateService } from '../../integrations/transactional-email-template.service';
 
 export interface PasswordResetDelivery {
   deliver(input: {
+    tenantId: string;
     email: string;
     token: string;
     expiresAt: Date;
+    idempotencyKey: string;
+    correlationId: string;
   }): Promise<void>;
 }
 
@@ -22,21 +27,45 @@ export class ConfiguredPasswordResetDelivery implements PasswordResetDelivery {
   constructor(
     @Inject(passwordResetConfig.KEY)
     private readonly config: ConfigType<typeof passwordResetConfig>,
+    private readonly adapters: ExternalAdapterExecutionService,
+    private readonly templates: TransactionalEmailTemplateService,
   ) {}
 
-  deliver(input: {
+  async deliver(input: {
+    tenantId: string;
     email: string;
     token: string;
     expiresAt: Date;
+    idempotencyKey: string;
+    correlationId: string;
   }): Promise<void> {
-    if (this.config.delivery !== 'local') return Promise.resolve();
     const separator = this.config.publicUrl.includes('?') ? '&' : '?';
-    this.messages.set(input.email.toLowerCase(), {
-      token: input.token,
-      resetUrl: `${this.config.publicUrl}${separator}token=${encodeURIComponent(input.token)}`,
-      expiresAt: input.expiresAt.toISOString(),
+    const resetUrl = `${this.config.publicUrl}${separator}token=${encodeURIComponent(input.token)}`;
+    if (this.config.delivery === 'local') {
+      this.messages.set(input.email.toLowerCase(), {
+        token: input.token,
+        resetUrl,
+        expiresAt: input.expiresAt.toISOString(),
+      });
+      return;
+    }
+    if (this.config.delivery !== 'adapter') return;
+    const content = this.templates.passwordReset({
+      resetUrl,
+      expiresAt: input.expiresAt,
     });
-    return Promise.resolve();
+    await this.adapters.execute({
+      tenantId: input.tenantId,
+      capability: 'NOTIFICATION_EMAIL',
+      idempotencyKey: input.idempotencyKey,
+      correlationId: input.correlationId,
+      payload: {
+        recipient: input.email,
+        title: content.title,
+        body: content.body,
+        template: content.template,
+      },
+    });
   }
 
   localMessage(email: string) {

@@ -11,10 +11,14 @@ import {
   SimulatedEmailExternalAdapter,
   SimulatedPushExternalAdapter,
 } from './simulated-notification.adapter';
+import { ResendEmailExternalAdapter } from './resend-email.adapter';
+import { TransactionalEmailTemplateService } from './transactional-email-template.service';
+import { ResendWebhookController } from './resend-webhook.controller';
+import { ResendWebhookService } from './resend-webhook.service';
 
 @Module({
   imports: [SessionModule, AuditModule],
-  controllers: [ExternalAdapterController],
+  controllers: [ExternalAdapterController, ResendWebhookController],
   providers: [
     ExternalAdapterRepository,
     ExternalAdapterRegistry,
@@ -22,8 +26,15 @@ import {
     ExternalAdapterService,
     SimulatedEmailExternalAdapter,
     SimulatedPushExternalAdapter,
+    ResendEmailExternalAdapter,
+    TransactionalEmailTemplateService,
+    ResendWebhookService,
     PermissionGuard,
   ],
-  exports: [ExternalAdapterExecutionService],
+  exports: [
+    ExternalAdapterExecutionService,
+    ExternalAdapterRepository,
+    TransactionalEmailTemplateService,
+  ],
 })
 export class ExternalAdapterModule {}

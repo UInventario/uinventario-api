@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InventoryStockAlertRepository } from '../inventory/inventory-stock-alert.repository';
+import { ExternalAdapterRepository } from '../integrations/external-adapter.repository';
 import type { ListNotificationDeliveriesDto } from './dto/list-notification-deliveries.dto';
 import type { ListNotificationsDto } from './dto/list-notifications.dto';
 import type { ReplaceNotificationPreferencesDto } from './dto/replace-notification-preferences.dto';
@@ -17,6 +18,7 @@ export class NotificationService {
     private readonly notifications: NotificationRepository,
     private readonly stockAlerts: InventoryStockAlertRepository,
     private readonly deliveries: NotificationDeliveryService,
+    private readonly adapters: ExternalAdapterRepository,
   ) {}
 
   async refresh(tenantId: string) {
@@ -58,13 +60,20 @@ export class NotificationService {
   }
 
   async preferences(tenantId: string) {
-    const data = await this.notifications.listPreferences(tenantId);
+    const [data, email, push] = await Promise.all([
+      this.notifications.listPreferences(tenantId),
+      this.adapters.config(tenantId, 'NOTIFICATION_EMAIL'),
+      this.adapters.config(tenantId, 'NOTIFICATION_PUSH'),
+    ]);
     return {
       data,
       meta: {
         apiVersion: '1' as const,
         eventTypes: NOTIFICATION_EVENT_TYPES,
-        adapters: { email: 'SIMULATOR', push: 'SIMULATOR' },
+        adapters: {
+          email: email?.provider ?? 'UNCONFIGURED',
+          push: push?.provider ?? 'UNCONFIGURED',
+        },
       },
     };
   }
