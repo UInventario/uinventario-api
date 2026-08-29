@@ -13,5 +13,6 @@ import { ProductReservationService } from './product-reservation.service';
     ProductReservationService,
     PermissionGuard,
   ],
+  exports: [ProductReservationService],
 })
 export class ProductReservationModule {}

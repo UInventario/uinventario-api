@@ -74,6 +74,10 @@ describe('UInventario API (e2e)', () => {
       'sale_returns',
       'suspended_sale_lines',
       'suspended_sales',
+      'customer_order_transitions',
+      'customer_order_payments',
+      'customer_order_lines',
+      'customer_orders',
       'sale_payments',
       'sale_lines',
       'sales',
@@ -16278,6 +16282,361 @@ describe('UInventario API (e2e)', () => {
           serialNumbers: ['REC-SN-003'],
         })
         .expect(201);
+    });
+  });
+
+  describe('customer order lifecycle', () => {
+    beforeEach(resetIdentityData);
+
+    it('reserves, prepares and delivers once while cancellation compensates stock and tenants stay isolated', async () => {
+      await registerAccount('order-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Pedidos SA',
+          tradeName: 'Pedidos',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Principal',
+          locationName: 'General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Principal' })
+        .expect(200);
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      const product = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Pedido preparado',
+          sku: 'ORD-001',
+          cost: '40',
+          price: '100',
+        })
+        .expect(201);
+      const productId = (product.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-stock')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '5',
+          reason: 'Stock para pedidos',
+        })
+        .expect(201);
+      const customer = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({ name: 'Cliente de pedidos', dataProcessingConsent: false })
+        .expect(201);
+      const customerId = (customer.body as { data: { id: string } }).data.id;
+      await openCurrentCashRegister(cookie, 'order-open-shift', '200.00');
+
+      const orderPayload = {
+        channel: 'WEB',
+        customerId,
+        locationId: location.id,
+        priority: 'HIGH',
+        expiresInHours: 48,
+        lines: [{ productId, quantity: '2' }],
+        payments: [{ method: 'CASH', amountReceived: '500.00' }],
+      };
+      const created = await request(app.getHttpServer())
+        .post('/api/v1/orders')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-create-main')
+        .send(orderPayload)
+        .expect(201);
+      const createdData = created.body as {
+        data: { id: string; version: number; totals: { total: string } };
+      };
+      expect(created.body).toMatchObject({
+        data: {
+          channel: 'WEB',
+          priority: 'HIGH',
+          status: 'DRAFT',
+          customer: { id: customerId },
+          lines: [{ product: { id: productId }, quantity: '2.000' }],
+          payments: [{ method: 'CASH', status: 'PLANNED' }],
+          reservation: null,
+          sale: null,
+        },
+        meta: { idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .post('/api/v1/orders')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-create-main')
+        .send(orderPayload)
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: { id: string }; meta: { idempotentReplay: boolean } };
+          }) => {
+            expect(body.data.id).toBe(createdData.data.id);
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+
+      const confirmed = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${createdData.data.id}/confirm`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-confirm-main')
+        .send({ version: createdData.data.version })
+        .expect(201);
+      const confirmedData = confirmed.body as {
+        data: { version: number; reservation: { id: string; status: string } };
+      };
+      expect(confirmed.body).toMatchObject({
+        data: { status: 'CONFIRMED', reservation: { status: 'ACTIVE' } },
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${createdData.data.id}/confirm`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-confirm-main')
+        .send({ version: createdData.data.version })
+        .expect(201)
+        .expect(({ body }: { body: { meta: { idempotentReplay: boolean } } }) =>
+          expect(body.meta.idempotentReplay).toBe(true),
+        );
+
+      const prepareAttempts = await Promise.all(
+        ['order-prepare-a', 'order-prepare-b'].map((key) =>
+          request(app.getHttpServer())
+            .post(`/api/v1/orders/${createdData.data.id}/prepare`)
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', key)
+            .send({ version: confirmedData.data.version }),
+        ),
+      );
+      expect(prepareAttempts.map(({ status }) => status).sort()).toEqual([
+        201, 409,
+      ]);
+      const prepared = prepareAttempts.find(({ status }) => status === 201)!
+        .body as {
+        data: { version: number };
+      };
+      const ready = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${createdData.data.id}/ready`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-ready-main')
+        .send({ version: prepared.data.version })
+        .expect(201);
+      const readyData = ready.body as { data: { version: number } };
+      const delivered = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${createdData.data.id}/deliver`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-deliver-main')
+        .send({ version: readyData.data.version })
+        .expect(201);
+      expect(delivered.body).toMatchObject({
+        data: {
+          status: 'DELIVERED',
+          reservation: { status: 'CONSUMED' },
+          payments: [{ status: 'COMPLETED' }],
+        },
+      });
+      expect(
+        (delivered.body as { data: { sale: { receiptNumber: string } } }).data
+          .sale.receiptNumber,
+      ).toMatch(/^V-/);
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${createdData.data.id}/deliver`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-deliver-main')
+        .send({ version: readyData.data.version })
+        .expect(201)
+        .expect(({ body }: { body: { meta: { idempotentReplay: boolean } } }) =>
+          expect(body.meta.idempotentReplay).toBe(true),
+        );
+
+      const cancellable = await request(app.getHttpServer())
+        .post('/api/v1/orders')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-create-cancel')
+        .send({
+          ...orderPayload,
+          lines: [{ productId, quantity: '1' }],
+          payments: [{ method: 'CASH', amountReceived: '500.00' }],
+        })
+        .expect(201);
+      const cancellableData = cancellable.body as {
+        data: { id: string; version: number };
+      };
+      const cancellableConfirmed = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${cancellableData.data.id}/confirm`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-confirm-cancel')
+        .send({ version: cancellableData.data.version })
+        .expect(201);
+      const cancellableState = (
+        cancellableConfirmed.body as {
+          data: { version: number; reservation: { id: string } };
+        }
+      ).data;
+      await dataSource.query(
+        `UPDATE product_reservations
+         SET created_at = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 2 SECOND),
+             expires_at = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 1 SECOND)
+         WHERE id = ?`,
+        [cancellableState.reservation.id],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${cancellableData.data.id}/prepare`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-prepare-expired')
+        .send({ version: cancellableState.version })
+        .expect(409)
+        .expect(({ body }: { body: { code: string } }) =>
+          expect(body.code).toBe('CUSTOMER_ORDER_RESERVATION_UNAVAILABLE'),
+        );
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${cancellableData.data.id}/cancel`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-cancel-main')
+        .send({
+          version: cancellableState.version,
+          reason: 'Cliente desistió del pedido',
+        })
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: { status: string; reservation: { status: string } } };
+          }) => {
+            expect(body.data.status).toBe('CANCELLED');
+            expect(body.data.reservation.status).toBe('RELEASED');
+          },
+        );
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${cancellableData.data.id}/cancel`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-cancel-main')
+        .send({
+          version: cancellableState.version,
+          reason: 'Cliente desistió del pedido',
+        })
+        .expect(201)
+        .expect(({ body }: { body: { meta: { idempotentReplay: boolean } } }) =>
+          expect(body.meta.idempotentReplay).toBe(true),
+        );
+
+      const [balance] = await dataSource.query<
+        Array<{
+          quantity: string;
+          available_quantity: string;
+          reserved_quantity: string;
+        }>
+      >(
+        `SELECT quantity, available_quantity, reserved_quantity FROM inventory_balances
+         WHERE product_id = ? AND location_id = ?`,
+        [productId, location.id],
+      );
+      expect(balance).toMatchObject({
+        quantity: '3.000',
+        available_quantity: '3.000',
+        reserved_quantity: '0.000',
+      });
+      const [counts] = await dataSource.query<
+        Array<{ sales: number | string; transitions: number | string }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM sales) AS sales,
+           (SELECT COUNT(*) FROM customer_order_transitions) AS transitions`,
+      );
+      expect(Number(counts.sales)).toBe(1);
+      expect(Number(counts.transitions)).toBe(6);
+      const auditActions = await dataSource.query<Array<{ action: string }>>(
+        `SELECT action FROM audit_events
+         WHERE action LIKE 'CUSTOMER_ORDER_%' OR action IN (
+           'PRODUCT_RESERVATION_CREATED', 'PRODUCT_RESERVATION_RELEASED',
+           'PRODUCT_RESERVATION_CONSUMED', 'SALE_COMPLETED'
+         )`,
+      );
+      expect(auditActions.map(({ action }) => action)).toEqual(
+        expect.arrayContaining([
+          'CUSTOMER_ORDER_CREATED',
+          'CUSTOMER_ORDER_CONFIRMED',
+          'CUSTOMER_ORDER_PREPARED',
+          'CUSTOMER_ORDER_READY',
+          'CUSTOMER_ORDER_DELIVERED',
+          'CUSTOMER_ORDER_CANCELLED',
+          'PRODUCT_RESERVATION_CREATED',
+          'PRODUCT_RESERVATION_RELEASED',
+          'PRODUCT_RESERVATION_CONSUMED',
+          'SALE_COMPLETED',
+        ]),
+      );
+
+      const other = {
+        organizationName: 'Otro tenant pedidos',
+        email: 'other-orders@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'order-other-registration')
+        .send(other)
+        .expect(201);
+      const otherCookie = await createPersistedSession(other.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Otro Pedidos',
+          tradeName: 'Otro',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Otra Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Otra Bodega',
+          locationName: 'Otra General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Otra Caja' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/orders/${createdData.data.id}`)
+        .set('Cookie', otherCookie)
+        .expect(404);
+      await request(app.getHttpServer())
+        .get('/api/v1/orders')
+        .set('Cookie', otherCookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) =>
+          expect(body.data).toEqual([]),
+        );
     });
   });
 
