@@ -5,7 +5,11 @@ import { ListCustomersDto } from './dto/list-customers.dto';
 import { ListCustomerHistoryDto } from './dto/list-customer-history.dto';
 import { SaveCustomerDto, UpdateCustomerDto } from './dto/save-customer.dto';
 import { ConfigureCustomerCreditDto } from './dto/configure-customer-credit.dto';
-import { CustomerData, CustomerHistoryData } from './customer.types';
+import {
+  CustomerCreditStatementData,
+  CustomerData,
+  CustomerHistoryData,
+} from './customer.types';
 
 interface CustomerRow {
   id: string;
@@ -28,6 +32,58 @@ interface CustomerRow {
   credit_max_installments: number | string | null;
   credit_balance: string;
   credit_overdue_amount: string;
+}
+
+interface CreditAccountRow {
+  id: string;
+  sale_id: string;
+  receipt_number: string;
+  original_amount: string;
+  due_date: Date | string;
+  canceled_at: Date | string | null;
+  balance: string;
+}
+
+interface CreditInstallmentRow {
+  id: string;
+  account_id: string;
+  installment_number: number | string;
+  due_date: Date | string;
+  amount: string;
+  paid_amount: string;
+}
+
+interface CreditPaymentRow {
+  id: string;
+  receipt_number: string;
+  currency: string;
+  amount: string;
+  method: 'CASH' | 'CARD' | 'TRANSFER';
+  status: 'COMPLETED' | 'REVERSED';
+  external_reference: string | null;
+  provider: string;
+  provider_reference: string | null;
+  created_by_user_id: string;
+  created_by_email: string;
+  branch_id: string;
+  branch_name: string;
+  cash_register_id: string;
+  cash_register_name: string;
+  cash_register_code: string;
+  reversal_reason: string | null;
+  reversal_provider_reference: string | null;
+  reversed_by_user_id: string | null;
+  reversed_by_email: string | null;
+  reversed_at: Date | string | null;
+  created_at: Date | string;
+}
+
+interface CreditPaymentAllocationRow {
+  payment_id: string;
+  account_id: string;
+  installment_id: string;
+  installment_number: number | string;
+  amount: string;
 }
 
 @Injectable()
@@ -277,10 +333,12 @@ export class CustomerRepository {
         )
       : [];
     const total = Number(summary?.total ?? 0);
+    const credit = await this.creditStatement(tenantId, customer.id);
     return {
       total,
       history: {
         customer,
+        credit,
         summary: {
           currency: summary?.currency ?? null,
           salesCount: total,
@@ -320,6 +378,210 @@ export class CustomerRepository {
               : null,
         })),
       },
+    };
+  }
+
+  async creditStatement(
+    tenantId: string,
+    customerId: string,
+  ): Promise<CustomerCreditStatementData | null> {
+    const customer = await this.findById(tenantId, customerId);
+    if (!customer?.credit) return null;
+    const [accounts, installments, payments, allocations] = await Promise.all([
+      this.dataSource.query<CreditAccountRow[]>(
+        `SELECT account.id, account.sale_id, sale.receipt_number,
+                account.original_amount, account.due_date, account.canceled_at,
+                COALESCE(SUM(CASE WHEN ledger.entry_type = 'DEBIT'
+                  THEN ledger.amount ELSE -ledger.amount END), 0) AS balance
+         FROM customer_credit_accounts account
+         INNER JOIN sales sale
+           ON sale.id = account.sale_id AND sale.tenant_id = account.tenant_id
+         LEFT JOIN customer_debt_ledger ledger
+           ON ledger.account_id = account.id AND ledger.tenant_id = account.tenant_id
+         WHERE account.tenant_id = ? AND account.customer_id = ?
+         GROUP BY account.id, account.sale_id, sale.receipt_number,
+                  account.original_amount, account.due_date, account.canceled_at,
+                  account.created_at
+         ORDER BY account.created_at DESC, account.id DESC`,
+        [tenantId, customerId],
+      ),
+      this.dataSource.query<CreditInstallmentRow[]>(
+        `SELECT installment.id, installment.account_id,
+                installment.installment_number, installment.due_date,
+                installment.amount,
+                COALESCE(SUM(CASE WHEN payment.status = 'COMPLETED'
+                  THEN allocation.amount ELSE 0 END), 0) AS paid_amount
+         FROM customer_credit_installments installment
+         INNER JOIN customer_credit_accounts account
+           ON account.id = installment.account_id
+          AND account.tenant_id = installment.tenant_id
+         LEFT JOIN customer_credit_payment_allocations allocation
+           ON allocation.installment_id = installment.id
+          AND allocation.tenant_id = installment.tenant_id
+         LEFT JOIN customer_credit_payments payment
+           ON payment.id = allocation.payment_id
+          AND payment.tenant_id = allocation.tenant_id
+         WHERE installment.tenant_id = ? AND account.customer_id = ?
+         GROUP BY installment.id, installment.account_id,
+                  installment.installment_number, installment.due_date,
+                  installment.amount
+         ORDER BY installment.due_date, installment.installment_number`,
+        [tenantId, customerId],
+      ),
+      this.dataSource.query<CreditPaymentRow[]>(
+        `SELECT payment.id, payment.receipt_number, payment.currency,
+                payment.amount, payment.method, payment.status,
+                payment.external_reference, payment.provider,
+                payment.provider_reference, payment.created_by_user_id,
+                creator.email AS created_by_email,
+                branch.id AS branch_id, branch.name AS branch_name,
+                cash_register.id AS cash_register_id,
+                cash_register.name AS cash_register_name,
+                cash_register.code AS cash_register_code,
+                payment.reversal_reason, payment.reversal_provider_reference,
+                payment.reversed_by_user_id,
+                reversal_user.email AS reversed_by_email,
+                payment.reversed_at, payment.created_at
+         FROM customer_credit_payments payment
+         INNER JOIN users creator
+           ON creator.id = payment.created_by_user_id
+          AND creator.tenant_id = payment.tenant_id
+         LEFT JOIN users reversal_user
+           ON reversal_user.id = payment.reversed_by_user_id
+          AND reversal_user.tenant_id = payment.tenant_id
+         INNER JOIN cash_register_shifts shift
+           ON shift.id = payment.cash_register_shift_id
+          AND shift.tenant_id = payment.tenant_id
+         INNER JOIN branches branch
+           ON branch.id = shift.branch_id AND branch.tenant_id = shift.tenant_id
+         INNER JOIN cash_registers cash_register
+           ON cash_register.id = shift.cash_register_id
+          AND cash_register.tenant_id = shift.tenant_id
+         WHERE payment.tenant_id = ? AND payment.customer_id = ?
+         ORDER BY payment.created_at DESC, payment.id DESC`,
+        [tenantId, customerId],
+      ),
+      this.dataSource.query<CreditPaymentAllocationRow[]>(
+        `SELECT allocation.payment_id, allocation.account_id,
+                allocation.installment_id, installment.installment_number,
+                allocation.amount
+         FROM customer_credit_payment_allocations allocation
+         INNER JOIN customer_credit_installments installment
+           ON installment.id = allocation.installment_id
+          AND installment.tenant_id = allocation.tenant_id
+         INNER JOIN customer_credit_payments payment
+           ON payment.id = allocation.payment_id
+          AND payment.tenant_id = allocation.tenant_id
+         WHERE allocation.tenant_id = ? AND payment.customer_id = ?
+         ORDER BY installment.due_date, installment.installment_number`,
+        [tenantId, customerId],
+      ),
+    ]);
+    const today = new Date().toISOString().slice(0, 10);
+    const accountData = accounts.map((account) => {
+      const canceled = account.canceled_at !== null;
+      const accountInstallments = installments
+        .filter(({ account_id }) => account_id === account.id)
+        .map((installment) => {
+          const amount = this.toMoneyCents(installment.amount);
+          const paid = this.toMoneyCents(installment.paid_amount);
+          const balance = amount > paid ? amount - paid : 0n;
+          const dueDate = this.date(installment.due_date);
+          return {
+            id: installment.id,
+            number: Number(installment.installment_number),
+            dueDate,
+            amount: this.fromMoneyCents(amount),
+            paidAmount: this.fromMoneyCents(paid > amount ? amount : paid),
+            balance: this.fromMoneyCents(balance),
+            status: canceled
+              ? ('CANCELLED' as const)
+              : balance === 0n
+                ? ('PAID' as const)
+                : paid > 0n
+                  ? dueDate < today
+                    ? ('OVERDUE' as const)
+                    : ('PARTIAL' as const)
+                  : dueDate < today
+                    ? ('OVERDUE' as const)
+                    : ('OPEN' as const),
+          };
+        });
+      const original = this.toMoneyCents(account.original_amount);
+      const rawBalance = this.toMoneyCents(account.balance);
+      const balance = rawBalance > 0n ? rawBalance : 0n;
+      return {
+        id: account.id,
+        sale: { id: account.sale_id, receiptNumber: account.receipt_number },
+        originalAmount: this.fromMoneyCents(original),
+        balance: this.fromMoneyCents(balance),
+        dueDate: this.date(account.due_date),
+        status: canceled
+          ? ('CANCELLED' as const)
+          : balance === 0n
+            ? ('PAID' as const)
+            : accountInstallments.some(({ status }) => status === 'OVERDUE')
+              ? ('OVERDUE' as const)
+              : balance < original
+                ? ('PARTIAL' as const)
+                : ('OPEN' as const),
+        installments: accountInstallments,
+      };
+    });
+    return {
+      currency: customer.credit.currency,
+      balance: customer.credit.balance,
+      overdueAmount: customer.credit.overdueAmount,
+      status: customer.credit.status,
+      accounts: accountData,
+      payments: payments.map((payment) => ({
+        id: payment.id,
+        receiptNumber: payment.receipt_number,
+        currency: payment.currency,
+        amount: this.money(payment.amount),
+        method: payment.method,
+        status: payment.status,
+        reference: payment.external_reference,
+        provider: payment.provider,
+        providerReference: payment.provider_reference,
+        responsible: {
+          id: payment.created_by_user_id,
+          email: payment.created_by_email,
+        },
+        context: {
+          branch: { id: payment.branch_id, name: payment.branch_name },
+          cashRegister: {
+            id: payment.cash_register_id,
+            name: payment.cash_register_name,
+            code: payment.cash_register_code,
+          },
+        },
+        allocations: allocations
+          .filter(({ payment_id }) => payment_id === payment.id)
+          .map((allocation) => ({
+            accountId: allocation.account_id,
+            installmentId: allocation.installment_id,
+            installmentNumber: Number(allocation.installment_number),
+            amount: this.money(allocation.amount),
+          })),
+        reversal:
+          payment.status === 'REVERSED' &&
+          payment.reversal_reason &&
+          payment.reversed_by_user_id &&
+          payment.reversed_by_email &&
+          payment.reversed_at
+            ? {
+                reason: payment.reversal_reason,
+                user: {
+                  id: payment.reversed_by_user_id,
+                  email: payment.reversed_by_email,
+                },
+                providerReference: payment.reversal_provider_reference,
+                reversedAt: new Date(payment.reversed_at).toISOString(),
+              }
+            : null,
+        createdAt: new Date(payment.created_at).toISOString(),
+      })),
     };
   }
 
@@ -453,5 +715,10 @@ export class CustomerRepository {
   private money(value: string): string {
     const [whole, fraction = ''] = value.split('.');
     return `${whole}.${fraction.padEnd(2, '0').slice(0, 2)}`;
+  }
+
+  private date(value: Date | string): string {
+    if (value instanceof Date) return value.toISOString().slice(0, 10);
+    return String(value).slice(0, 10);
   }
 }

@@ -58,6 +58,14 @@ export class CustomerController {
     );
   }
 
+  @Get(':id/credit')
+  creditStatement(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+  ) {
+    return this.customers.creditStatement(request.principal.tenant.id, id);
+  }
+
   @Post()
   async create(
     @Req() request: AuthenticatedRequest,
