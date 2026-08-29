@@ -35,6 +35,11 @@ import {
   PreviewInventoryValuationPolicyDto,
 } from './dto/change-inventory-valuation-policy.dto';
 import { InventoryReconciliationService } from './inventory-reconciliation.service';
+import {
+  InventoryActivityMovementsDto,
+  InventoryActivityReportDto,
+} from './dto/inventory-activity-report.dto';
+import { InventoryActivityReportService } from './inventory-activity-report.service';
 
 @Controller('inventory')
 @UseGuards(SessionGuard, PermissionGuard)
@@ -45,7 +50,40 @@ export class InventoryController {
     private readonly inventoryImports: InventoryImportService,
     private readonly valuationPolicy: InventoryValuationPolicyService,
     private readonly reconciliation: InventoryReconciliationService,
+    private readonly activityReports: InventoryActivityReportService,
   ) {}
+
+  @Get('reports/activity')
+  @RequirePermissions('INVENTORY_VIEW')
+  activityReport(
+    @Req() request: AuthenticatedRequest,
+    @Query() query: InventoryActivityReportDto,
+  ) {
+    const { principal } = request;
+    return this.activityReports.report({
+      tenantId: principal.tenant.id,
+      userId: principal.user.id,
+      administrator: principal.user.permissions.includes('TENANT_MANAGE'),
+      query,
+    });
+  }
+
+  @Get('reports/activity/:productId/movements')
+  @RequirePermissions('INVENTORY_VIEW')
+  activityMovements(
+    @Req() request: AuthenticatedRequest,
+    @Param('productId', new ParseUUIDPipe()) productId: string,
+    @Query() query: InventoryActivityMovementsDto,
+  ) {
+    const { principal } = request;
+    return this.activityReports.movements({
+      tenantId: principal.tenant.id,
+      userId: principal.user.id,
+      administrator: principal.user.permissions.includes('TENANT_MANAGE'),
+      productId,
+      query,
+    });
+  }
 
   @Get('reconciliations/latest')
   @RequirePermissions('INVENTORY_VIEW')

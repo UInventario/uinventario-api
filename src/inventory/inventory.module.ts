@@ -17,6 +17,8 @@ import { InventoryReconciliationService } from './inventory-reconciliation.servi
 import { InventoryStockAlertController } from './inventory-stock-alert.controller';
 import { InventoryStockAlertRepository } from './inventory-stock-alert.repository';
 import { InventoryStockAlertService } from './inventory-stock-alert.service';
+import { InventoryActivityReportRepository } from './inventory-activity-report.repository';
+import { InventoryActivityReportService } from './inventory-activity-report.service';
 
 @Module({
   imports: [SessionModule],
@@ -39,6 +41,8 @@ import { InventoryStockAlertService } from './inventory-stock-alert.service';
     InventoryReconciliationService,
     InventoryStockAlertRepository,
     InventoryStockAlertService,
+    InventoryActivityReportRepository,
+    InventoryActivityReportService,
     PermissionGuard,
   ],
   exports: [
