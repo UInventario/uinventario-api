@@ -41,6 +41,9 @@ describe('UInventario API (e2e)', () => {
   async function resetIdentityData(): Promise<void> {
     await dataSource.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const table of [
+      'notification_deliveries',
+      'notifications',
+      'notification_preferences',
       'audit_events',
       'audit_chain_heads',
       'privacy_requests',
@@ -1064,6 +1067,8 @@ describe('UInventario API (e2e)', () => {
                   'INVENTORY_TRANSFER',
                   'INVENTORY_VALUATION_MANAGE',
                   'INVENTORY_VIEW',
+                  'NOTIFICATIONS_MANAGE',
+                  'NOTIFICATIONS_VIEW',
                   'PRIVACY_MANAGE',
                   'PRODUCTS_MANAGE',
                   'PURCHASE_ORDERS_APPROVE',
@@ -5347,6 +5352,184 @@ describe('UInventario API (e2e)', () => {
         .expect(({ body }: { body: { data: unknown[] } }) => {
           expect(body.data).toEqual([]);
         });
+    });
+
+    it('configures, deduplicates and authorizes tenant notification delivery', async () => {
+      await registerAccount('notification-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeInventoryOnboarding(registrationPayload.email, cookie);
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto notificable',
+          sku: 'NOTIFY-1',
+          cost: '5.00',
+          price: '9.00',
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      const [identity] = await dataSource.query<
+        Array<{
+          user_id: string;
+          tenant_id: string;
+          role_id: string;
+          location_id: string;
+        }>
+      >(
+        `SELECT user.id AS user_id, user.tenant_id, role.id AS role_id,
+                location.id AS location_id
+         FROM users user
+         INNER JOIN user_roles user_role ON user_role.user_id = user.id
+         INNER JOIN roles role ON role.id = user_role.role_id
+         INNER JOIN locations location ON location.tenant_id = user.tenant_id
+         WHERE user.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'notification-stock')
+        .send({
+          productId,
+          locationId: identity.location_id,
+          type: 'INITIAL',
+          quantity: '2',
+          reason: 'Stock para notificación',
+          reference: 'NOTIFY-STOCK',
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .put(
+          `/api/v1/inventory/stock-alerts/products/${productId}/locations/${identity.location_id}/threshold`,
+        )
+        .set('Cookie', cookie)
+        .send({ threshold: '5' })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/notifications/refresh')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { reconciliation: { created: 1 } },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/notifications/refresh')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { reconciliation: { deduplicated: 1 } },
+          });
+        });
+      const inbox = await request(app.getHttpServer())
+        .get('/api/v1/notifications')
+        .set('Cookie', cookie)
+        .expect(200);
+      expect(inbox.body).toMatchObject({
+        data: [{ eventType: 'STOCK_LOW', title: 'Stock bajo', readAt: null }],
+        meta: { unread: 1, pagination: { total: 1 } },
+      });
+
+      const settings = await request(app.getHttpServer())
+        .get('/api/v1/notifications/preferences')
+        .set('Cookie', cookie)
+        .expect(200);
+      const preferences = (
+        settings.body as {
+          data: { preferences: Array<Record<string, unknown>> };
+        }
+      ).data.preferences;
+      expect(preferences).toHaveLength(6);
+      await request(app.getHttpServer())
+        .put('/api/v1/notifications/preferences')
+        .set('Cookie', cookie)
+        .send({
+          preferences: preferences.map((preference) => ({
+            recipientUserId: (preference.recipient as { id: string }).id,
+            eventType: preference.eventType,
+            enabled: preference.enabled,
+            inApp: (preference.channels as { inApp: boolean }).inApp,
+            email:
+              preference.eventType === 'STOCK_LOW' ||
+              (preference.channels as { email: boolean }).email,
+            push: (preference.channels as { push: boolean }).push,
+            frequency: preference.frequency,
+          })),
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post('/api/v1/notifications/refresh')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { delivery: { sent: 1, failed: 0 } },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/notifications/deliveries')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              {
+                channel: 'EMAIL',
+                adapter: 'SIMULATOR',
+                status: 'SENT',
+                attemptCount: 1,
+              },
+            ],
+          });
+        });
+
+      const notificationId = (inbox.body as { data: Array<{ id: string }> })
+        .data[0].id;
+      await request(app.getHttpServer())
+        .post(`/api/v1/notifications/${notificationId}/read`)
+        .set('Cookie', cookie)
+        .expect(200);
+      await request(app.getHttpServer())
+        .post('/api/v1/notifications/read-all')
+        .set('Cookie', cookie)
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/notifications')
+        .query({ unreadOnly: true })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: [], meta: { unread: 0 } });
+        });
+
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'NOTIFICATIONS_VIEW'`,
+        [identity.role_id, identity.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/notifications')
+        .set('Cookie', cookie)
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'NOTIFICATIONS_VIEW')`,
+        [identity.role_id, identity.tenant_id],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'NOTIFICATIONS_MANAGE'`,
+        [identity.role_id, identity.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/notifications/preferences')
+        .set('Cookie', cookie)
+        .expect(403);
     });
 
     it('applies operational movement directions and rolls back invalid exits', async () => {

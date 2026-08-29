@@ -49,6 +49,7 @@ import { InventoryActivityReportService } from './inventory-activity-report.serv
     InventoryService,
     InventoryValuationPolicyService,
     InventoryReconciliationService,
+    InventoryStockAlertRepository,
   ],
 })
 export class InventoryModule {}
