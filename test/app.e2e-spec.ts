@@ -7472,6 +7472,278 @@ describe('UInventario API (e2e)', () => {
         });
     });
 
+    it('applies authorized line and sale discounts with exact snapshots, limits and returns', async () => {
+      const { cookie, productId } = await preparePos();
+      const discountedLines = [
+        {
+          productId,
+          quantity: '1',
+          discount: {
+            type: 'PERCENT',
+            value: '10',
+            reason: 'Empaque deteriorado',
+          },
+        },
+      ];
+      const discount = {
+        type: 'AMOUNT',
+        value: '7.91',
+        reason: 'Cortesía autorizada',
+      };
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: discountedLines, discount })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              discount: { ...discount, value: '7.91', amount: '7.91' },
+              lines: [
+                {
+                  grossTotal: '119.90',
+                  discount: {
+                    line: {
+                      type: 'PERCENT',
+                      value: '10.00',
+                      reason: 'Empaque deteriorado',
+                      amount: '11.99',
+                    },
+                    sale: { ...discount, value: '7.91', amount: '7.91' },
+                    total: '19.90',
+                  },
+                  subtotal: '86.21',
+                  tax: '13.79',
+                  total: '100.00',
+                },
+              ],
+              totals: {
+                gross: '119.90',
+                lineDiscount: '11.99',
+                saleDiscount: '7.91',
+                discount: '19.90',
+                subtotal: '86.21',
+                tax: '13.79',
+                total: '100.00',
+              },
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          discount: {
+            type: 'PERCENT',
+            value: '50.01',
+            reason: 'Fuera del límite',
+          },
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SALE_DISCOUNT_LIMIT_EXCEEDED');
+        });
+
+      const createSale = () =>
+        request(app.getHttpServer())
+          .post('/api/v1/pos/sales')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', 'sale-sale-sale')
+          .send({
+            lines: discountedLines,
+            discount,
+            payments: [
+              {
+                method: 'CASH',
+                amount: '100.00',
+                amountReceived: '100.00',
+              },
+            ],
+          });
+      const saleResponse = await createSale()
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              discount: { reason: 'Cortesía autorizada', amount: '7.91' },
+              lines: [
+                {
+                  grossTotal: '119.90',
+                  discount: { total: '19.90' },
+                  grossProfit: '6.21',
+                  total: '100.00',
+                },
+              ],
+              totals: {
+                discount: '19.90',
+                total: '100.00',
+                grossProfit: '6.21',
+              },
+            },
+            meta: { idempotentReplay: false },
+          });
+        });
+      await createSale()
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { idempotentReplay: true } });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-sale-sale')
+        .send({
+          lines: [
+            {
+              productId,
+              quantity: '0.5',
+              discount: {
+                type: 'PERCENT',
+                value: '5',
+                reason: 'Descuento contradictorio',
+              },
+            },
+            { ...discountedLines[0], quantity: '0.5' },
+          ],
+          discount,
+          payments: [
+            {
+              method: 'CASH',
+              amount: '100.00',
+              amountReceived: '100.00',
+            },
+          ],
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('MIXED_PRODUCT_DISCOUNTS');
+        });
+      const sale = saleResponse.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${sale.data.id}/receipt/reprints`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  grossTotal: '119.90',
+                  discountTotal: '19.90',
+                  lineDiscountReason: 'Empaque deteriorado',
+                  saleDiscountReason: 'Cortesía autorizada',
+                  total: '100.00',
+                },
+              ],
+              totals: { gross: '119.90', discount: '19.90', total: '100.00' },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${sale.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'return-return-return')
+        .send({
+          reason: 'Devolución total con descuento',
+          lines: [
+            {
+              saleLineId: sale.data.lines[0].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              totals: { subtotal: '86.21', tax: '13.79', total: '100.00' },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/audit-events')
+        .query({ entityType: 'SALE', q: sale.data.id, page: 1, pageSize: 10 })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: Array<{ action: string; after: unknown }> };
+          }) => {
+            const completed = body.data.find(
+              ({ action }) => action === 'SALE_COMPLETED',
+            );
+            expect(completed).toBeDefined();
+            const after = completed?.after as {
+              discountTotal?: unknown;
+              discountReasons?: unknown;
+            };
+            expect(after.discountTotal).toBe('19.90');
+            expect(after.discountReasons).toEqual(
+              expect.arrayContaining([
+                'Cortesía autorizada',
+                'Empaque deteriorado',
+              ]),
+            );
+          },
+        );
+
+      const [principal] = await dataSource.query<
+        Array<{ tenant_id: string; role_id: string }>
+      >(
+        `SELECT user.tenant_id, user_role.role_id FROM users user
+         INNER JOIN user_roles user_role
+           ON user_role.user_id = user.id AND user_role.tenant_id = user.tenant_id
+         WHERE user.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'INVENTORY_VALUATION_MANAGE'`,
+        [principal.role_id, principal.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${sale.data.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [{ grossProfit: null }],
+              totals: { grossProfit: null },
+            },
+          });
+        });
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'SALES_DISCOUNT'`,
+        [principal.role_id, principal.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          discount: {
+            type: 'PERCENT',
+            value: '5',
+            reason: 'Sin autorización',
+          },
+        })
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SALE_DISCOUNT_PERMISSION_REQUIRED');
+        });
+    });
+
     it('suspends, isolates, recalculates and transactionally consumes a pending sale', async () => {
       const { cookie, productId, locationId } = await preparePos();
       const suspendedResponse = await request(app.getHttpServer())

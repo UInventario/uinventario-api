@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Inject,
   Injectable,
   NotFoundException,
@@ -11,7 +12,7 @@ import { posConfig } from '../config/pos.config';
 import { CreateCashSaleDto } from './dto/create-cash-sale.dto';
 import { CreateSaleDto, SalePaymentDto } from './dto/create-sale.dto';
 import { ListSalesDto } from './dto/list-sales.dto';
-import { QuoteCartDto } from './dto/quote-cart.dto';
+import { QuoteCartDto, SaleDiscountDto } from './dto/quote-cart.dto';
 import { VoidSaleDto } from './dto/void-sale.dto';
 import {
   PosContextNotFoundError,
@@ -88,10 +89,18 @@ export class PosService {
     };
   }
 
-  async getSale(tenantId: string, branchId: string, saleId: string) {
+  async getSale(
+    tenantId: string,
+    branchId: string,
+    saleId: string,
+    canViewMargin = false,
+  ) {
     const sale = await this.sales.getSaleDetail(tenantId, branchId, saleId);
     if (!sale) throw new NotFoundException();
-    return { data: sale, meta: { apiVersion: '1' as const } };
+    return {
+      data: this.applyMarginAccess(sale, canViewMargin),
+      meta: { apiVersion: '1' as const },
+    };
   }
 
   async voidSale(input: {
@@ -166,6 +175,8 @@ export class PosService {
     idempotencyKey: string | undefined;
     dto: CreateCashSaleDto;
     expectedSnapshot?: OfflineCashSaleSnapshot;
+    canDiscount?: boolean;
+    canViewMargin?: boolean;
   }): Promise<CashSaleResponse> {
     return this.createSale({
       ...input,
@@ -174,6 +185,7 @@ export class PosService {
         customerId: input.dto.customerId,
         reservationId: input.dto.reservationId,
         lines: input.dto.lines,
+        discount: input.dto.discount,
         payment: { method: 'CASH', amountReceived: input.dto.cashReceived },
       },
     });
@@ -188,6 +200,8 @@ export class PosService {
     idempotencyKey: string | undefined;
     dto: CreateSaleDto;
     expectedSnapshot?: OfflineCashSaleSnapshot;
+    canDiscount?: boolean;
+    canViewMargin?: boolean;
   }): Promise<CashSaleResponse> {
     this.assertIdempotencyKey(input.idempotencyKey);
     const fingerprint = this.saleFingerprint(input.dto);
@@ -200,7 +214,7 @@ export class PosService {
         if (replay.fingerprint !== fingerprint)
           throw new PosIdempotencyConflictError();
         return {
-          data: replay.sale,
+          data: this.applyMarginAccess(replay.sale, input.canViewMargin),
           meta: { apiVersion: '1', idempotentReplay: true },
         };
       }
@@ -215,7 +229,9 @@ export class PosService {
           reservationId: input.dto.reservationId,
           customerId: input.dto.customerId,
           channel: input.dto.channel,
+          discount: input.dto.discount,
         },
+        canDiscount: input.canDiscount,
       });
       if (input.expectedSnapshot) {
         this.assertOfflineSnapshot(input.expectedSnapshot, quote.data);
@@ -246,7 +262,7 @@ export class PosService {
         payments,
       });
       return {
-        data: result.sale,
+        data: this.applyMarginAccess(result.sale, input.canViewMargin),
         meta: { apiVersion: '1', idempotentReplay: result.replay },
       };
     } catch (error) {
@@ -388,6 +404,7 @@ export class PosService {
     cashRegisterId: string;
     userId: string;
     dto: QuoteCartDto;
+    canDiscount?: boolean;
   }): Promise<PosCartQuoteResponse> {
     try {
       await this.shifts.requireCurrent({
@@ -400,6 +417,16 @@ export class PosService {
       const requested = new Map<string, bigint>();
       const requestedLots = new Map<string, string | null>();
       const requestedSerials = new Map<string, string[]>();
+      const requestedDiscounts = new Map<string, SaleDiscountDto | null>();
+      const hasDiscount =
+        Boolean(input.dto.discount) ||
+        input.dto.lines.some((line) => Boolean(line.discount));
+      if (hasDiscount && !input.canDiscount) {
+        throw new ForbiddenException({
+          code: 'SALE_DISCOUNT_PERMISSION_REQUIRED',
+          message: 'No tienes permiso para aplicar descuentos.',
+        });
+      }
       for (const line of input.dto.lines) {
         const quantity = this.toQuantityUnits(line.quantity);
         if (quantity <= 0n) {
@@ -422,6 +449,18 @@ export class PosService {
           ...(requestedSerials.get(line.productId) ?? []),
           ...(line.serialNumbers ?? []),
         ]);
+        const previousDiscount = requestedDiscounts.get(line.productId);
+        const discount = line.discount ?? null;
+        if (
+          previousDiscount !== undefined &&
+          JSON.stringify(previousDiscount) !== JSON.stringify(discount)
+        ) {
+          throw new BadRequestException({
+            code: 'MIXED_PRODUCT_DISCOUNTS',
+            message: 'Un producto repetido debe usar el mismo descuento.',
+          });
+        }
+        requestedDiscounts.set(line.productId, discount);
       }
       const products = await this.pos.getProducts(
         input.tenantId,
@@ -461,10 +500,7 @@ export class PosService {
         currency,
         productIds: [...requested.keys()],
       });
-      let subtotalCents = 0n;
-      let taxCents = 0n;
-      let totalCents = 0n;
-      const lines = [...requested.entries()].map(
+      const preparedLines = [...requested.entries()].map(
         ([productId, quantityUnits]) => {
           const product = productMap.get(productId);
           if (!product)
@@ -492,21 +528,15 @@ export class PosService {
           }
           const resolvedPrice = resolvedPrices.get(productId);
           const effectivePrice = resolvedPrice?.price ?? product.price;
-          const lineTotal = this.roundDivide(
+          const grossCents = this.roundDivide(
             this.toMoneyCents(effectivePrice) * quantityUnits,
             1000n,
           );
-          const lineTax =
-            taxBasisPoints === 0n
-              ? 0n
-              : this.roundDivide(
-                  lineTotal * taxBasisPoints,
-                  10_000n + taxBasisPoints,
-                );
-          const lineSubtotal = lineTotal - lineTax;
-          subtotalCents += lineSubtotal;
-          taxCents += lineTax;
-          totalCents += lineTotal;
+          const requestedDiscount = requestedDiscounts.get(productId) ?? null;
+          const lineDiscountCents = this.discountAmount(
+            requestedDiscount,
+            grossCents,
+          );
           return {
             product: { id: product.id, name: product.name, sku: product.sku },
             quantity: this.fromQuantityUnits(quantityUnits),
@@ -516,12 +546,77 @@ export class PosService {
             unitPrice: this.fromMoneyCents(this.toMoneyCents(effectivePrice)),
             priceSource: resolvedPrice?.source ?? ('BASE' as const),
             priceList: resolvedPrice?.priceList ?? null,
-            subtotal: this.fromMoneyCents(lineSubtotal),
-            tax: this.fromMoneyCents(lineTax),
-            total: this.fromMoneyCents(lineTotal),
+            grossCents,
+            lineDiscountCents,
+            requestedDiscount,
           };
         },
       );
+      const grossCents = preparedLines.reduce(
+        (sum, line) => sum + line.grossCents,
+        0n,
+      );
+      const lineDiscountCents = preparedLines.reduce(
+        (sum, line) => sum + line.lineDiscountCents,
+        0n,
+      );
+      const saleDiscountBase = grossCents - lineDiscountCents;
+      const saleDiscountCents = this.discountAmount(
+        input.dto.discount ?? null,
+        saleDiscountBase,
+      );
+      const totalDiscountCents = lineDiscountCents + saleDiscountCents;
+      if (totalDiscountCents * 2n > grossCents) {
+        throw new BadRequestException({
+          code: 'SALE_DISCOUNT_LIMIT_EXCEEDED',
+          message: 'El descuento combinado no puede superar 50% de la venta.',
+        });
+      }
+      const saleAllocations = this.allocateDiscount(
+        preparedLines.map((line) => line.grossCents - line.lineDiscountCents),
+        saleDiscountCents,
+      );
+      let subtotalCents = 0n;
+      let taxCents = 0n;
+      let totalCents = 0n;
+      const lines = preparedLines.map((line, index) => {
+        const saleAllocation = saleAllocations[index] ?? 0n;
+        const totalDiscount = line.lineDiscountCents + saleAllocation;
+        const lineTotal = line.grossCents - totalDiscount;
+        const lineTax =
+          taxBasisPoints === 0n
+            ? 0n
+            : this.roundDivide(
+                lineTotal * taxBasisPoints,
+                10_000n + taxBasisPoints,
+              );
+        const lineSubtotal = lineTotal - lineTax;
+        subtotalCents += lineSubtotal;
+        taxCents += lineTax;
+        totalCents += lineTotal;
+        return {
+          product: line.product,
+          quantity: line.quantity,
+          lotId: line.lotId,
+          serialNumbers: line.serialNumbers,
+          availableQuantity: line.availableQuantity,
+          unitPrice: line.unitPrice,
+          priceSource: line.priceSource,
+          priceList: line.priceList,
+          grossTotal: this.fromMoneyCents(line.grossCents),
+          discount: {
+            line: this.appliedDiscount(
+              line.requestedDiscount,
+              line.lineDiscountCents,
+            ),
+            sale: this.appliedDiscount(input.dto.discount, saleAllocation),
+            total: this.fromMoneyCents(totalDiscount),
+          },
+          subtotal: this.fromMoneyCents(lineSubtotal),
+          tax: this.fromMoneyCents(lineTax),
+          total: this.fromMoneyCents(lineTotal),
+        };
+      });
       return {
         data: {
           context: {
@@ -531,8 +626,13 @@ export class PosService {
           },
           currency,
           taxRate: this.normalizeTaxRate(taxRate),
+          discount: this.appliedDiscount(input.dto.discount, saleDiscountCents),
           lines,
           totals: {
+            gross: this.fromMoneyCents(grossCents),
+            lineDiscount: this.fromMoneyCents(lineDiscountCents),
+            saleDiscount: this.fromMoneyCents(saleDiscountCents),
+            discount: this.fromMoneyCents(totalDiscountCents),
             subtotal: this.fromMoneyCents(subtotalCents),
             tax: this.fromMoneyCents(taxCents),
             total: this.fromMoneyCents(totalCents),
@@ -576,6 +676,20 @@ export class PosService {
           'Idempotency-Key es obligatorio y debe tener entre 8 y 128 caracteres.',
       });
     }
+  }
+
+  private applyMarginAccess<
+    T extends {
+      lines: Array<{ grossProfit: string | null }>;
+      totals: { grossProfit: string | null };
+    },
+  >(sale: T, canViewMargin = false): T {
+    if (canViewMargin) return sale;
+    return {
+      ...sale,
+      lines: sale.lines.map((line) => ({ ...line, grossProfit: null })),
+      totals: { ...sale.totals, grossProfit: null },
+    };
   }
 
   private preparePayments(
@@ -664,6 +778,7 @@ export class PosService {
     const quantities = new Map<string, bigint>();
     const lots = new Map<string, string | null>();
     const serials = new Map<string, string[]>();
+    const discounts = new Map<string, SaleDiscountDto | null>();
     for (const line of dto.lines) {
       quantities.set(
         line.productId,
@@ -680,6 +795,18 @@ export class PosService {
         ...(serials.get(line.productId) ?? []),
         ...(line.serialNumbers ?? []),
       ]);
+      const previousDiscount = discounts.get(line.productId);
+      const discount = line.discount ?? null;
+      if (
+        previousDiscount !== undefined &&
+        JSON.stringify(previousDiscount) !== JSON.stringify(discount)
+      ) {
+        throw new BadRequestException({
+          code: 'MIXED_PRODUCT_DISCOUNTS',
+          message: 'Un producto repetido debe usar el mismo descuento.',
+        });
+      }
+      discounts.set(line.productId, discount);
     }
     const canonical = {
       lines: [...quantities.entries()]
@@ -691,6 +818,12 @@ export class PosService {
           serialNumbers: (serials.get(productId) ?? [])
             .map((value) => value.trim().toUpperCase())
             .sort(),
+          discount: discounts.get(productId)
+            ? {
+                ...discounts.get(productId),
+                reason: discounts.get(productId)!.reason.trim(),
+              }
+            : null,
         })),
       payments: (dto.payments ?? (dto.payment ? [dto.payment] : [])).map(
         (payment) => ({
@@ -707,6 +840,12 @@ export class PosService {
       customerId: dto.customerId ?? null,
       reservationId: dto.reservationId ?? null,
       suspendedSaleId: dto.suspendedSaleId ?? null,
+      discount: dto.discount
+        ? {
+            ...dto.discount,
+            reason: dto.discount.reason.trim(),
+          }
+        : null,
     };
     return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
   }
@@ -726,7 +865,11 @@ export class PosService {
       lines: [...expected.lines].sort((left, right) =>
         left.productId.localeCompare(right.productId),
       ),
-      totals: expected.totals,
+      totals: {
+        subtotal: expected.totals.subtotal,
+        tax: expected.totals.tax,
+        total: expected.totals.total,
+      },
     };
     const currentValue = {
       branchId: current.context.branch.id,
@@ -748,7 +891,11 @@ export class PosService {
           total: line.total,
         }))
         .sort((left, right) => left.productId.localeCompare(right.productId)),
-      totals: current.totals,
+      totals: {
+        subtotal: current.totals.subtotal,
+        tax: current.totals.tax,
+        total: current.totals.total,
+      },
     };
     if (JSON.stringify(expectedValue) !== JSON.stringify(currentValue)) {
       throw new ConflictException({
@@ -762,6 +909,95 @@ export class PosService {
   private toQuantityUnits(value: string): bigint {
     const [whole, fraction = ''] = value.split('.');
     return BigInt(whole) * 1000n + BigInt(fraction.padEnd(3, '0'));
+  }
+
+  private discountAmount(
+    discount: SaleDiscountDto | null | undefined,
+    baseCents: bigint,
+  ): bigint {
+    if (!discount) return 0n;
+    if (discount.reason.trim().length < 3) {
+      throw new BadRequestException({
+        code: 'SALE_DISCOUNT_REASON_REQUIRED',
+        message: 'Indica un motivo de al menos tres caracteres.',
+      });
+    }
+    const amount =
+      discount.type === 'PERCENT'
+        ? this.roundDivide(
+            baseCents * this.toPercentageBasisPoints(discount.value),
+            10_000n,
+          )
+        : this.toMoneyCents(discount.value);
+    if (amount <= 0n || amount >= baseCents || amount * 2n > baseCents) {
+      throw new BadRequestException({
+        code: 'SALE_DISCOUNT_LIMIT_EXCEEDED',
+        message:
+          'El descuento debe ser mayor que cero, menor al importe y no superar 50%.',
+      });
+    }
+    return amount;
+  }
+
+  private toPercentageBasisPoints(value: string): bigint {
+    const [whole, fraction = ''] = value.split('.');
+    const basisPoints =
+      BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0').slice(0, 2));
+    if (basisPoints > 5_000n) {
+      throw new BadRequestException({
+        code: 'SALE_DISCOUNT_LIMIT_EXCEEDED',
+        message: 'El porcentaje de descuento no puede superar 50%.',
+      });
+    }
+    return basisPoints;
+  }
+
+  private appliedDiscount(
+    discount: SaleDiscountDto | null | undefined,
+    amountCents: bigint,
+  ) {
+    if (!discount) return null;
+    return {
+      type: discount.type,
+      value:
+        discount.type === 'PERCENT'
+          ? this.fromPercentageBasisPoints(
+              this.toPercentageBasisPoints(discount.value),
+            )
+          : this.fromMoneyCents(this.toMoneyCents(discount.value)),
+      reason: discount.reason.trim(),
+      amount: this.fromMoneyCents(amountCents),
+    };
+  }
+
+  private allocateDiscount(weights: bigint[], amount: bigint): bigint[] {
+    if (amount === 0n) return weights.map(() => 0n);
+    const total = weights.reduce((sum, weight) => sum + weight, 0n);
+    const allocations = weights.map((weight) => (amount * weight) / total);
+    let remainder =
+      amount - allocations.reduce((sum, value) => sum + value, 0n);
+    const order = weights
+      .map((weight, index) => ({
+        index,
+        remainder: (amount * weight) % total,
+      }))
+      .sort((left, right) =>
+        left.remainder === right.remainder
+          ? left.index - right.index
+          : left.remainder > right.remainder
+            ? -1
+            : 1,
+      );
+    for (const entry of order) {
+      if (remainder === 0n) break;
+      allocations[entry.index] += 1n;
+      remainder -= 1n;
+    }
+    return allocations;
+  }
+
+  private fromPercentageBasisPoints(value: bigint): string {
+    return `${value / 100n}.${String(value % 100n).padStart(2, '0')}`;
   }
 
   private fromQuantityUnits(value: bigint): string {

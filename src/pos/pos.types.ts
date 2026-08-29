@@ -9,6 +9,13 @@ export interface PosProductSnapshot {
   availableQuantity: string;
 }
 
+export interface PosAppliedDiscount {
+  type: 'PERCENT' | 'AMOUNT';
+  value: string;
+  reason: string;
+  amount: string;
+}
+
 export interface PosCartQuoteResponse {
   data: {
     context: {
@@ -18,6 +25,7 @@ export interface PosCartQuoteResponse {
     };
     currency: string;
     taxRate: string;
+    discount: PosAppliedDiscount | null;
     lines: Array<{
       product: { id: string; name: string; sku: string };
       quantity: string;
@@ -27,11 +35,25 @@ export interface PosCartQuoteResponse {
       unitPrice: string;
       priceSource: 'BASE' | 'PRICE_LIST';
       priceList: { id: string; name: string } | null;
+      grossTotal: string;
+      discount: {
+        line: PosAppliedDiscount | null;
+        sale: PosAppliedDiscount | null;
+        total: string;
+      };
       subtotal: string;
       tax: string;
       total: string;
     }>;
-    totals: { subtotal: string; tax: string; total: string };
+    totals: {
+      gross: string;
+      lineDiscount: string;
+      saleDiscount: string;
+      discount: string;
+      subtotal: string;
+      tax: string;
+      total: string;
+    };
   };
   meta: { apiVersion: '1'; recalculatedAt: string };
 }
@@ -55,7 +77,15 @@ export interface OfflineCashSaleSnapshot {
     tax: string;
     total: string;
   }>;
-  totals: { subtotal: string; tax: string; total: string };
+  totals: {
+    gross?: string;
+    lineDiscount?: '0.00';
+    saleDiscount?: '0.00';
+    discount?: '0.00';
+    subtotal: string;
+    tax: string;
+    total: string;
+  };
 }
 
 export type PaymentMethod = 'CASH' | 'CARD' | 'TRANSFER' | 'VOUCHER';
@@ -81,6 +111,7 @@ export interface CashSaleData {
   customer: { id: string; name: string; identifier: string | null } | null;
   currency: string;
   taxRate: string;
+  discount: PosAppliedDiscount | null;
   lines: Array<{
     id: string;
     product: { id: string; name: string; sku: string };
@@ -88,11 +119,20 @@ export interface CashSaleData {
     unitPrice: string;
     priceSource: 'BASE' | 'PRICE_LIST';
     priceList: { id: string; name: string } | null;
+    grossTotal: string;
+    discount: {
+      line: PosAppliedDiscount | null;
+      sale: PosAppliedDiscount | null;
+      total: string;
+    };
     subtotal: string;
     tax: string;
     total: string;
+    grossProfit: string | null;
   }>;
-  totals: PosCartQuoteResponse['data']['totals'];
+  totals: PosCartQuoteResponse['data']['totals'] & {
+    grossProfit: string | null;
+  };
   payment: SalePaymentData;
   payments: SalePaymentData[];
   createdAt: string;

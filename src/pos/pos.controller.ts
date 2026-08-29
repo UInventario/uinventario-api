@@ -210,6 +210,7 @@ export class PosController {
       principal.tenant.id,
       principal.context.branch!.id,
       saleId,
+      principal.user.permissions.includes('INVENTORY_VALUATION_MANAGE'),
     );
   }
 
@@ -247,6 +248,7 @@ export class PosController {
       cashRegisterId: principal.context.cashRegister!.id,
       userId: principal.user.id,
       dto,
+      canDiscount: principal.user.permissions.includes('SALES_DISCOUNT'),
     });
   }
 
@@ -265,6 +267,10 @@ export class PosController {
       userId: principal.user.id,
       idempotencyKey,
       dto,
+      canDiscount: principal.user.permissions.includes('SALES_DISCOUNT'),
+      canViewMargin: principal.user.permissions.includes(
+        'INVENTORY_VALUATION_MANAGE',
+      ),
     });
     await this.audit.record({
       tenantId: principal.tenant.id,
@@ -274,6 +280,10 @@ export class PosController {
       entityId: result.data.id,
       correlationId: request.requestId!,
       deduplicate: true,
+      after: {
+        discountTotal: result.data.totals.discount,
+        discountReasons: this.discountReasons(result.data),
+      },
     });
     if (dto.reservationId) {
       await this.audit.record({
@@ -305,6 +315,10 @@ export class PosController {
       userId: principal.user.id,
       idempotencyKey,
       dto,
+      canDiscount: principal.user.permissions.includes('SALES_DISCOUNT'),
+      canViewMargin: principal.user.permissions.includes(
+        'INVENTORY_VALUATION_MANAGE',
+      ),
     });
     await this.audit.record({
       tenantId: principal.tenant.id,
@@ -316,6 +330,8 @@ export class PosController {
       deduplicate: true,
       after: {
         paymentMethods: result.data.payments.map((payment) => payment.method),
+        discountTotal: result.data.totals.discount,
+        discountReasons: this.discountReasons(result.data),
       },
     });
     if (dto.reservationId) {
@@ -340,6 +356,15 @@ export class PosController {
       cashRegisterId: principal.context.cashRegister!.id,
       userId: principal.user.id,
     };
+  }
+
+  private discountReasons(
+    sale: Awaited<ReturnType<PosService['createSale']>>['data'],
+  ): string[] {
+    return [
+      sale.discount?.reason,
+      ...sale.lines.map((line) => line.discount.line?.reason),
+    ].filter((reason): reason is string => Boolean(reason));
   }
 
   private async auditCashMovement(

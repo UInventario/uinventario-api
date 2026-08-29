@@ -44,8 +44,8 @@ el usuario, sus roles y el tenant de esa sesión.
 - `GET /api/v1/inventory/movements`: lista el historial inmutable de la sucursal con filtros y paginación.
 - `GET /api/v1/inventory/products/:productId/balance?locationId=...`: consulta el saldo persistido.
 - `POST /api/v1/inventory/movements`: registra stock inicial, entrada o ajuste con `Idempotency-Key`.
-- `POST /api/v1/pos/cart/quote`: valida productos, stock y cantidades, y recalcula precios/impuesto/totales del carrito.
-- `POST /api/v1/pos/sales/cash`: persiste venta, pago y descuento trazable de inventario en una sola transacción idempotente.
+- `POST /api/v1/pos/cart/quote`: valida productos, stock, cantidades y descuentos autorizados por línea o venta, y recalcula importes e impuesto incluido.
+- `POST /api/v1/pos/sales/cash`: persiste venta, pago, descuentos y salida trazable de inventario en una sola transacción idempotente.
 - `GET /api/v1/pos/sales`: lista ventas de la sucursal activa con filtros y paginación.
 - `GET /api/v1/pos/sales/:id`: consulta líneas, pago, operador y movimientos de una venta autorizada.
 - `GET /api/v1/audit-events`: lista para administradores los eventos críticos del tenant activo.

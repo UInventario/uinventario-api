@@ -58,6 +58,10 @@ export class SaleReceiptRepository {
                   'productSku', line.product_sku,
                   'quantity', line.quantity,
                   'unitPrice', line.unit_price,
+                  'grossTotal', line.gross_total,
+                  'discountTotal', line.discount_total,
+                  'lineDiscountReason', line.discount_reason,
+                  'saleDiscountReason', sale.discount_reason,
                   'subtotal', line.subtotal,
                   'tax', line.tax,
                   'total', line.total
@@ -121,6 +125,14 @@ export class SaleReceiptRepository {
     const lines = this.json<SaleReceiptLine[]>(row.receipt_lines).sort(
       (left, right) => left.lineNumber - right.lineNumber,
     );
+    const gross = lines.reduce(
+      (sum, line) => sum + this.toMoney(String(line.grossTotal ?? line.total)),
+      0n,
+    );
+    const discount = lines.reduce(
+      (sum, line) => sum + this.toMoney(String(line.discountTotal ?? '0')),
+      0n,
+    );
     return {
       saleId: row.sale_id,
       receiptNumber: row.receipt_number,
@@ -146,6 +158,10 @@ export class SaleReceiptRepository {
         ...line,
         quantity: this.decimal(String(line.quantity), 3),
         unitPrice: this.decimal(String(line.unitPrice), 2),
+        grossTotal: this.decimal(String(line.grossTotal ?? line.total), 2),
+        discountTotal: this.decimal(String(line.discountTotal ?? '0'), 2),
+        lineDiscountReason: line.lineDiscountReason ?? null,
+        saleDiscountReason: line.saleDiscountReason ?? null,
         subtotal: this.decimal(String(line.subtotal), 2),
         tax: this.decimal(String(line.tax), 2),
         total: this.decimal(String(line.total), 2),
@@ -159,6 +175,8 @@ export class SaleReceiptRepository {
         }),
       ),
       totals: {
+        gross: this.money(gross),
+        discount: this.money(discount),
         subtotal: this.decimal(row.subtotal, 2),
         tax: this.decimal(row.tax_total, 2),
         total: this.decimal(row.total, 2),
@@ -182,5 +200,14 @@ export class SaleReceiptRepository {
   private decimal(value: string, scale: number): string {
     const [whole, fraction = ''] = value.split('.');
     return `${whole}.${fraction.padEnd(scale, '0').slice(0, scale)}`;
+  }
+
+  private toMoney(value: string): bigint {
+    const [whole, fraction = ''] = value.split('.');
+    return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0').slice(0, 2));
+  }
+
+  private money(value: bigint): string {
+    return `${value / 100n}.${String(value % 100n).padStart(2, '0')}`;
   }
 }
