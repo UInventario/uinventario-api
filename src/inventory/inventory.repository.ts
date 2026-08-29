@@ -1452,7 +1452,7 @@ export class InventoryRepository {
       input.dto.quantity,
       policy,
       {
-        allowNegative: input.dto.type === 'ADJUSTMENT',
+        allowNegative: true,
       },
     );
     const quantityChange = this.quantityChange(input.dto, normalizedInput);
@@ -2042,7 +2042,7 @@ export class InventoryRepository {
       }>
     >(
       `SELECT base_unit, quantity_precision, quantity_rounding, minimum_quantity
-       FROM products WHERE id = ? AND tenant_id = ? AND active = TRUE LIMIT 1`,
+       FROM products WHERE id = ? AND tenant_id = ? LIMIT 1`,
       [productId, tenantId],
     );
     if (!row) throw new InventoryTargetNotFoundError();

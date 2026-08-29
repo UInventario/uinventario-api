@@ -474,6 +474,12 @@ export class InventoryTransferRepository {
     const lineIds = input.dto.lines.map(({ transferLineId }) => transferLineId);
     if (new Set(lineIds).size !== lineIds.length)
       throw new InvalidInventoryTransferReceiptError();
+    const [target] = await this.dataSource.query<Array<{ id: string }>>(
+      `SELECT id FROM inventory_transfers
+       WHERE id = ? AND tenant_id = ? AND destination_warehouse_id = ? LIMIT 1`,
+      [input.transferId, input.tenantId, input.destinationWarehouseId],
+    );
+    if (!target) throw new InventoryTransferNotFoundError();
     const policies = await this.transferLineQuantityPolicies(
       input.tenantId,
       input.transferId,
