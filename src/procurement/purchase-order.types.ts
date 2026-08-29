@@ -55,6 +55,8 @@ export interface PurchaseReceiptData {
     purchaseOrderLineId: string;
     receivedQuantity: string;
     lotCode: string | null;
+    manufacturedOn: string | null;
+    expiresOn: string | null;
     overageQuantity: string;
     unitCost: string;
     totalCost: string;

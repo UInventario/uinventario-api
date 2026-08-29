@@ -1,12 +1,23 @@
-import { Transform } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import {
   IsBoolean,
+  IsIn,
+  IsInt,
   IsOptional,
   IsString,
   Matches,
   MaxLength,
+  Max,
+  Min,
   MinLength,
 } from 'class-validator';
+
+export const LOT_EXPIRATION_POLICIES = [
+  'NONE',
+  'OPTIONAL',
+  'REQUIRED',
+] as const;
+export type LotExpirationPolicy = (typeof LOT_EXPIRATION_POLICIES)[number];
 
 const trim = ({ value }: { value: unknown }) =>
   typeof value === 'string' ? value.trim() : value;
@@ -36,6 +47,21 @@ export class CreateProductDto {
   @IsOptional()
   @IsBoolean()
   trackLots?: boolean;
+
+  @IsOptional()
+  @IsIn(LOT_EXPIRATION_POLICIES)
+  lotExpirationPolicy?: LotExpirationPolicy;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(365)
+  lotExpirationAlertDays?: number;
+
+  @IsOptional()
+  @IsBoolean()
+  allowExpiredStockOverride?: boolean;
 
   @IsOptional()
   @IsBoolean()

@@ -270,6 +270,15 @@ export class InventoryController {
     );
   }
 
+  @Get('lot-expiration-alerts')
+  @RequirePermissions('INVENTORY_VIEW')
+  listLotExpirationAlerts(@Req() request: AuthenticatedRequest) {
+    return this.inventory.listLotExpirationAlerts(
+      request.principal.tenant.id,
+      request.principal.context.warehouse!.id,
+    );
+  }
+
   @Get('products/:productId/serials')
   @RequirePermissions('INVENTORY_VIEW')
   listSerials(

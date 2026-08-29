@@ -26,6 +26,7 @@ import {
   InventoryMovementData,
   InventoryStockItem,
   InventoryLotData,
+  InventoryLotExpirationAlertData,
   InventoryLotAllocation,
   InventoryFifoLayerData,
   InventoryFifoAllocation,
@@ -291,23 +292,34 @@ export class InventoryRepository {
     currency: string | null;
     inventoryValue: string;
   }> {
+    const [scope] = await this.dataSource.query<Array<{ timezone: string }>>(
+      `SELECT b.timezone FROM warehouses w
+       INNER JOIN branches b ON b.id = w.branch_id AND b.tenant_id = w.tenant_id
+       WHERE w.id = ? AND w.tenant_id = ? LIMIT 1`,
+      [warehouseId, tenantId],
+    );
+    if (!scope) throw new InventoryTargetNotFoundError();
+    const businessDate = this.localDate(scope.timezone);
     const [product] = await this.dataSource.query<
       Array<{
         id: string;
         name: string;
         sku: string;
         track_lots: number | boolean;
+        lot_expiration_alert_days: number;
         total_quantity: string;
       }>
     >(
       `SELECT p.id, p.name, p.sku, p.track_lots,
+              p.lot_expiration_alert_days,
               COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.quantity ELSE 0 END), 0) AS total_quantity
        FROM products p
        LEFT JOIN inventory_balances ib
          ON ib.product_id = p.id AND ib.tenant_id = p.tenant_id
        LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
        WHERE p.id = ? AND p.tenant_id = ?
-       GROUP BY p.id, p.name, p.sku, p.track_lots`,
+       GROUP BY p.id, p.name, p.sku, p.track_lots,
+                p.lot_expiration_alert_days`,
       [warehouseId, productId, tenantId],
     );
     if (!product) throw new InventoryTargetNotFoundError();
@@ -317,6 +329,8 @@ export class InventoryRepository {
         code: string;
         unit_cost: string;
         currency: string;
+        manufactured_on: string | Date | null;
+        expires_on: string | Date | null;
         created_at: Date | string;
         location_id: string | null;
         location_name: string | null;
@@ -324,7 +338,8 @@ export class InventoryRepository {
         quantity: string | null;
       }>
     >(
-      `SELECT il.id, il.code, il.unit_cost, il.currency, il.created_at,
+      `SELECT il.id, il.code, il.unit_cost, il.currency,
+              il.manufactured_on, il.expires_on, il.created_at,
               l.id AS location_id, l.name AS location_name, l.code AS location_code,
               ilb.quantity
        FROM inventory_lots il
@@ -334,7 +349,8 @@ export class InventoryRepository {
          AND l.warehouse_id = ?
        WHERE il.tenant_id = ? AND il.product_id = ?
          AND (ilb.location_id IS NULL OR l.id IS NOT NULL)
-       ORDER BY il.created_at, il.id, l.created_at, l.id`,
+       ORDER BY il.expires_on IS NULL, il.expires_on, il.created_at, il.id,
+                l.created_at, l.id`,
       [warehouseId, tenantId, productId],
     );
     const lots = new Map<string, InventoryLotData>();
@@ -349,6 +365,10 @@ export class InventoryRepository {
           unitCost: this.normalizeCost(row.unit_cost),
           currency: row.currency,
           inventoryValue: '0.0000',
+          manufacturedOn: this.dateOnly(row.manufactured_on),
+          expiresOn: this.dateOnly(row.expires_on),
+          expirationStatus: 'NO_EXPIRATION',
+          daysUntilExpiration: null,
           createdAt: new Date(row.created_at).toISOString(),
           origins: [],
           balances: [],
@@ -418,6 +438,19 @@ export class InventoryRepository {
     }
     for (const item of items) {
       item.inventoryValue = this.valuationValue(item.quantity, item.unitCost);
+      item.daysUntilExpiration = item.expiresOn
+        ? this.daysBetween(businessDate, item.expiresOn)
+        : null;
+      item.expirationStatus =
+        this.toUnits(item.quantity) === 0n
+          ? 'EXHAUSTED'
+          : item.daysUntilExpiration === null
+            ? 'NO_EXPIRATION'
+            : item.daysUntilExpiration < 0
+              ? 'EXPIRED'
+              : item.daysUntilExpiration <= product.lot_expiration_alert_days
+                ? 'EXPIRING'
+                : 'ACTIVE';
     }
     const lotQuantity = this.fromUnits(
       items.reduce((sum, lot) => sum + this.toUnits(lot.quantity), 0n),
@@ -436,6 +469,77 @@ export class InventoryRepository {
       lotQuantity,
       currency: currencies.size === 1 ? items[0].currency : null,
       inventoryValue,
+    };
+  }
+
+  async listLotExpirationAlerts(
+    tenantId: string,
+    warehouseId: string,
+  ): Promise<{
+    items: InventoryLotExpirationAlertData[];
+    businessDate: string;
+  }> {
+    const [scope] = await this.dataSource.query<Array<{ timezone: string }>>(
+      `SELECT b.timezone FROM warehouses w
+       INNER JOIN branches b ON b.id = w.branch_id AND b.tenant_id = w.tenant_id
+       WHERE w.id = ? AND w.tenant_id = ? LIMIT 1`,
+      [warehouseId, tenantId],
+    );
+    if (!scope) throw new InventoryTargetNotFoundError();
+    const businessDate = this.localDate(scope.timezone);
+    const rows = await this.dataSource.query<
+      Array<{
+        lot_id: string;
+        lot_code: string;
+        expires_on: string | Date;
+        product_id: string;
+        product_name: string;
+        product_sku: string;
+        location_id: string;
+        location_name: string;
+        location_code: string;
+        quantity: string;
+      }>
+    >(
+      `SELECT il.id AS lot_id, il.code AS lot_code, il.expires_on,
+              p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
+              l.id AS location_id, l.name AS location_name, l.code AS location_code,
+              ilb.quantity
+       FROM inventory_lots il
+       INNER JOIN products p ON p.id = il.product_id AND p.tenant_id = il.tenant_id
+       INNER JOIN inventory_lot_balances ilb
+         ON ilb.lot_id = il.id AND ilb.tenant_id = il.tenant_id
+       INNER JOIN locations l
+         ON l.id = ilb.location_id AND l.tenant_id = ilb.tenant_id
+       WHERE il.tenant_id = ? AND l.warehouse_id = ? AND ilb.quantity > 0
+         AND p.lot_expiration_policy <> 'NONE' AND il.expires_on IS NOT NULL
+         AND il.expires_on <= DATE_ADD(?, INTERVAL p.lot_expiration_alert_days DAY)
+       ORDER BY il.expires_on, p.name, il.code, l.name`,
+      [tenantId, warehouseId, businessDate],
+    );
+    return {
+      businessDate,
+      items: rows.map((row) => {
+        const expiresOn = this.dateOnly(row.expires_on)!;
+        const daysUntilExpiration = this.daysBetween(businessDate, expiresOn);
+        return {
+          id: `${row.lot_id}:${row.location_id}`,
+          status: daysUntilExpiration < 0 ? 'EXPIRED' : 'EXPIRING',
+          product: {
+            id: row.product_id,
+            name: row.product_name,
+            sku: row.product_sku,
+          },
+          lot: { id: row.lot_id, code: row.lot_code, expiresOn },
+          location: {
+            id: row.location_id,
+            name: row.location_name,
+            code: row.location_code,
+          },
+          quantity: this.normalizeDecimal(row.quantity),
+          daysUntilExpiration,
+        };
+      }),
     };
   }
 
@@ -985,12 +1089,13 @@ export class InventoryRepository {
         warehouse_id: string;
         warehouse_name: string;
         country_code: string;
+        timezone: string;
         valuation_method: InventoryValuationMethod;
         valuation_version: number | string;
         valuation_effective_at: Date | string;
       }>
     >(
-      `SELECT b.id AS branch_id, b.name AS branch_name,
+      `SELECT b.id AS branch_id, b.name AS branch_name, b.timezone,
               w.id AS warehouse_id, w.name AS warehouse_name,
               t.country_code, ivp.method AS valuation_method,
               ivp.version AS valuation_version,
@@ -1047,7 +1152,21 @@ export class InventoryRepository {
         }>
       >(
         `SELECT p.id AS product_id, p.name AS product_name, p.sku AS product_sku, p.active, p.track_lots,
-                COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.available_quantity ELSE 0 END), 0) AS available_quantity,
+                CASE WHEN p.track_lots THEN LEAST(
+                  COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.available_quantity ELSE 0 END), 0),
+                  (SELECT COALESCE(SUM(ilb.quantity), 0)
+                   FROM inventory_lots il
+                   INNER JOIN inventory_lot_balances ilb
+                     ON ilb.lot_id = il.id AND ilb.tenant_id = il.tenant_id
+                   INNER JOIN locations usable_location
+                     ON usable_location.id = ilb.location_id
+                    AND usable_location.tenant_id = ilb.tenant_id
+                   WHERE il.tenant_id = p.tenant_id AND il.product_id = p.id
+                     AND usable_location.warehouse_id = ?
+                     AND (il.expires_on IS NULL OR il.expires_on >= ?))
+                ) ELSE
+                  COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.available_quantity ELSE 0 END), 0)
+                END AS available_quantity,
                 COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.reserved_quantity ELSE 0 END), 0) AS reserved_quantity,
                 COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.damaged_quantity ELSE 0 END), 0) AS damaged_quantity,
                 COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.in_transit_quantity ELSE 0 END), 0) AS in_transit_quantity,
@@ -1111,6 +1230,9 @@ export class InventoryRepository {
                   iv.quantity, iv.average_unit_cost, iv.inventory_value
          ORDER BY p.created_at DESC, p.id DESC LIMIT ? OFFSET ?`,
         [
+          warehouseId,
+          warehouseId,
+          this.localDate(scope.timezone),
           warehouseId,
           warehouseId,
           warehouseId,
@@ -1428,6 +1550,8 @@ export class InventoryRepository {
           await applyInventoryValuation(manager, movementId);
           await applyInventoryLotTracking(manager, movementId, {
             lotCode: input.dto.lotCode,
+            manufacturedOn: input.dto.manufacturedOn,
+            expiresOn: input.dto.expiresOn,
           });
           await applyInventorySerialTracking(manager, movementId, {
             serialNumbers: input.dto.serialNumbers,
@@ -2018,6 +2142,28 @@ export class InventoryRepository {
         code: row.location_code,
       },
     };
+  }
+
+  private localDate(timezone: string, now = new Date()): string {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(now);
+  }
+
+  private dateOnly(value: string | Date | null): string | null {
+    if (!value) return null;
+    return value instanceof Date
+      ? value.toISOString().slice(0, 10)
+      : value.slice(0, 10);
+  }
+
+  private daysBetween(from: string, to: string): number {
+    const fromTime = Date.parse(`${from}T00:00:00.000Z`);
+    const toTime = Date.parse(`${to}T00:00:00.000Z`);
+    return Math.round((toTime - fromTime) / 86_400_000);
   }
 
   private isDuplicate(error: unknown): boolean {

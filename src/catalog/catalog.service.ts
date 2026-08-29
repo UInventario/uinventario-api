@@ -37,6 +37,7 @@ export class CatalogService {
     tenantId: string,
     dto: CreateProductDto,
   ): Promise<ProductResponse> {
+    this.assertLotExpirationPolicy(dto, true);
     try {
       return {
         data: await this.catalog.createProduct(tenantId, dto),
@@ -72,6 +73,7 @@ export class CatalogService {
     id: string,
     dto: UpdateProductDto,
   ): Promise<ProductResponse> {
+    this.assertLotExpirationPolicy(dto);
     try {
       const product = await this.catalog.updateProduct(tenantId, id, dto);
       if (!product) throw new NotFoundException();
@@ -284,6 +286,35 @@ export class CatalogService {
       throw new BadRequestException({
         code: 'CATEGORY_NAME_TOO_LONG',
         message: 'La categoría admite hasta 80 caracteres.',
+      });
+    }
+  }
+
+  private assertLotExpirationPolicy(
+    dto: CreateProductDto,
+    creating = false,
+  ): void {
+    const policy = dto.lotExpirationPolicy ?? 'NONE';
+    if (
+      policy !== 'NONE' &&
+      (dto.trackLots === false || (creating && dto.trackLots !== true))
+    ) {
+      throw new BadRequestException({
+        code: 'LOT_EXPIRATION_REQUIRES_TRACKING',
+        message: 'La política de caducidad requiere control por lotes.',
+      });
+    }
+    const days = dto.lotExpirationAlertDays ?? 30;
+    if (days < 1 || days > 365) {
+      throw new BadRequestException({
+        code: 'INVALID_LOT_EXPIRATION_ALERT_DAYS',
+        message: 'El horizonte de alertas debe estar entre 1 y 365 días.',
+      });
+    }
+    if (dto.allowExpiredStockOverride && policy === 'NONE') {
+      throw new BadRequestException({
+        code: 'LOT_EXPIRATION_OVERRIDE_REQUIRES_POLICY',
+        message: 'La excepción de caducidad requiere una política de lotes.',
       });
     }
   }

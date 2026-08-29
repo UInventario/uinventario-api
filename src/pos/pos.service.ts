@@ -46,6 +46,7 @@ import {
   InventoryFifoCurrencyMismatchError,
   InventoryFifoLayerShortageError,
   InventoryLotNotFoundError,
+  ExpiredInventoryLotError,
 } from '../inventory/inventory.errors';
 import {
   InventorySerialDuplicateError,
@@ -178,6 +179,7 @@ export class PosService {
     dto: CreateCashSaleDto;
     expectedSnapshot?: OfflineCashSaleSnapshot;
     canDiscount?: boolean;
+    canOverrideExpired?: boolean;
     canViewMargin?: boolean;
   }): Promise<CashSaleResponse> {
     return this.createSale({
@@ -203,6 +205,7 @@ export class PosService {
     dto: CreateSaleDto;
     expectedSnapshot?: OfflineCashSaleSnapshot;
     canDiscount?: boolean;
+    canOverrideExpired?: boolean;
     canCredit?: boolean;
     canViewMargin?: boolean;
     sourceQuotationId?: string;
@@ -248,6 +251,7 @@ export class PosService {
           discount: input.dto.discount,
         },
         canDiscount: input.canDiscount,
+        canOverrideExpired: input.canOverrideExpired,
       });
       if (input.expectedSnapshot) {
         this.assertOfflineSnapshot(input.expectedSnapshot, quote.data);
@@ -362,6 +366,9 @@ export class PosService {
       if (error instanceof InventoryLotNotFoundError) {
         throw new NotFoundException({ code: 'INVENTORY_LOT_NOT_FOUND' });
       }
+      if (error instanceof ExpiredInventoryLotError) {
+        throw new ConflictException({ code: 'EXPIRED_INVENTORY_LOT' });
+      }
       if (error instanceof InsufficientInventoryLotStockError) {
         throw new ConflictException({
           code: 'INSUFFICIENT_INVENTORY_LOT_STOCK',
@@ -439,6 +446,7 @@ export class PosService {
     userId: string;
     dto: QuoteCartDto;
     canDiscount?: boolean;
+    canOverrideExpired?: boolean;
   }): Promise<PosCartQuoteResponse> {
     try {
       await this.shifts.requireCurrent({
@@ -450,6 +458,7 @@ export class PosService {
       const context = await this.pos.getContext(input);
       const requested = new Map<string, bigint>();
       const requestedLots = new Map<string, string | null>();
+      const requestedExpiredReasons = new Map<string, string | null>();
       const requestedSerials = new Map<string, string[]>();
       const requestedDiscounts = new Map<string, SaleDiscountDto | null>();
       const hasDiscount =
@@ -479,6 +488,17 @@ export class PosService {
           throw new BadRequestException({ code: 'MIXED_PRODUCT_LOTS' });
         }
         requestedLots.set(line.productId, selectedLot);
+        const previousExpiredReason = requestedExpiredReasons.get(
+          line.productId,
+        );
+        const expiredReason = line.expiredLotOverrideReason ?? null;
+        if (
+          previousExpiredReason !== undefined &&
+          previousExpiredReason !== expiredReason
+        ) {
+          throw new BadRequestException({ code: 'MIXED_EXPIRED_LOT_REASONS' });
+        }
+        requestedExpiredReasons.set(line.productId, expiredReason);
         requestedSerials.set(line.productId, [
           ...(requestedSerials.get(line.productId) ?? []),
           ...(line.serialNumbers ?? []),
@@ -501,6 +521,7 @@ export class PosService {
         input.warehouseId,
         [...requested.keys()],
         input.dto.reservationId,
+        this.localDate(context.timezone ?? 'UTC'),
       );
       const selectedLots = [...requestedLots]
         .filter((entry): entry is [string, string] => entry[1] !== null)
@@ -551,11 +572,38 @@ export class PosService {
             });
           }
           const selectedLotId = requestedLots.get(productId) ?? null;
-          const availableQuantity = selectedLotId
+          const selectedLot = selectedLotId
             ? lotAvailability.get(`${productId}:${selectedLotId}`)
+            : undefined;
+          const availableQuantity = selectedLotId
+            ? selectedLot?.quantity
             : product.availableQuantity;
           if (selectedLotId && availableQuantity === undefined) {
             throw new InventoryLotNotFoundError();
+          }
+          const expired = Boolean(
+            selectedLot?.expiresOn &&
+            selectedLot.expiresOn < this.localDate(context.timezone ?? 'UTC'),
+          );
+          const expiredReason = requestedExpiredReasons.get(productId) ?? null;
+          if (expired && !selectedLot?.allowExpiredStockOverride) {
+            throw new ConflictException({
+              code: 'EXPIRED_INVENTORY_LOT',
+              message:
+                'El lote seleccionado está caducado y no puede venderse.',
+            });
+          }
+          if (expired && !input.canOverrideExpired) {
+            throw new ForbiddenException({
+              code: 'EXPIRED_INVENTORY_LOT_PERMISSION_REQUIRED',
+              message: 'No tienes permiso para autorizar stock caducado.',
+            });
+          }
+          if (expired && !expiredReason) {
+            throw new BadRequestException({
+              code: 'EXPIRED_INVENTORY_LOT_REASON_REQUIRED',
+              message: 'Captura el motivo de la excepción de caducidad.',
+            });
           }
           if (quantityUnits > this.toQuantityUnits(availableQuantity!)) {
             throw new PosInsufficientStockError(productId);
@@ -575,6 +623,7 @@ export class PosService {
             product: { id: product.id, name: product.name, sku: product.sku },
             quantity: this.fromQuantityUnits(quantityUnits),
             lotId: requestedLots.get(productId) ?? null,
+            expiredLotOverrideReason: expired ? expiredReason : null,
             serialNumbers,
             availableQuantity: availableQuantity!,
             unitPrice: this.fromMoneyCents(this.toMoneyCents(effectivePrice)),
@@ -632,6 +681,7 @@ export class PosService {
           product: line.product,
           quantity: line.quantity,
           lotId: line.lotId,
+          expiredLotOverrideReason: line.expiredLotOverrideReason,
           serialNumbers: line.serialNumbers,
           availableQuantity: line.availableQuantity,
           unitPrice: line.unitPrice,
@@ -657,6 +707,7 @@ export class PosService {
             branch: context.branch,
             warehouse: context.warehouse,
             cashRegister: context.cashRegister,
+            businessDate: this.localDate(context.timezone ?? 'UTC'),
           },
           currency,
           taxRate: this.normalizeTaxRate(taxRate),
@@ -1071,6 +1122,15 @@ export class PosService {
   private normalizeTaxRate(value: string): string {
     const [whole, fraction = ''] = value.split('.');
     return `${whole}.${fraction.padEnd(4, '0')}`;
+  }
+
+  private localDate(timezone: string, now = new Date()): string {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(now);
   }
 
   private currencyFor(countryCode: string): string {
