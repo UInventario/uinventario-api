@@ -97,7 +97,7 @@ export class PosRepository {
            AND p.id IN (${placeholders})`,
         [reservationId, tenantId, warehouseId, ...productIds],
       );
-      return this.capExpiredLotAvailability(
+      const products = await this.capExpiredLotAvailability(
         tenantId,
         warehouseId,
         currentDate,
@@ -117,6 +117,7 @@ export class PosRepository {
           availableQuantity: this.normalizeQuantity(row.available_quantity),
         })),
       );
+      return this.attachKits(tenantId, warehouseId, currentDate, products);
     }
     const rows = await this.dataSource.query<
       Array<{
@@ -149,7 +150,7 @@ export class PosRepository {
                 p.quantity_precision, p.quantity_rounding, p.minimum_quantity`,
       [warehouseId, tenantId, ...productIds],
     );
-    return this.capExpiredLotAvailability(
+    const products = await this.capExpiredLotAvailability(
       tenantId,
       warehouseId,
       currentDate,
@@ -169,6 +170,115 @@ export class PosRepository {
         availableQuantity: this.normalizeQuantity(row.available_quantity),
       })),
     );
+    return this.attachKits(tenantId, warehouseId, currentDate, products);
+  }
+
+  private async attachKits(
+    tenantId: string,
+    warehouseId: string,
+    currentDate: string | undefined,
+    products: PosProductSnapshot[],
+  ): Promise<PosProductSnapshot[]> {
+    if (products.length === 0) return products;
+    const rows = await this.dataSource.query<
+      Array<{
+        kit_product_id: string;
+        stock_mode: 'DERIVED' | 'ASSEMBLED';
+        price_rule: 'FIXED' | 'COMPONENT_SUM';
+        component_product_id: string;
+        component_name: string;
+        component_sku: string;
+        component_quantity: string;
+        component_price: string;
+        component_cost: string;
+        component_available: string;
+      }>
+    >(
+      `SELECT pk.product_id AS kit_product_id, pk.stock_mode, pk.price_rule,
+              c.component_product_id, cp.name AS component_name,
+              cp.sku AS component_sku, c.quantity AS component_quantity,
+              cp.price AS component_price, cp.cost AS component_cost,
+              COALESCE(SUM(CASE WHEN l.warehouse_id = ?
+                THEN ib.available_quantity ELSE 0 END), 0) AS component_available
+       FROM product_kits pk
+       INNER JOIN product_kit_components c
+         ON c.kit_product_id = pk.product_id AND c.tenant_id = pk.tenant_id
+       INNER JOIN products cp
+         ON cp.id = c.component_product_id AND cp.tenant_id = c.tenant_id
+       LEFT JOIN inventory_balances ib
+         ON ib.product_id = cp.id AND ib.tenant_id = cp.tenant_id
+       LEFT JOIN locations l
+         ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
+       WHERE pk.tenant_id = ?
+         AND pk.product_id IN (${products.map(() => '?').join(',')})
+         AND (pk.effective_from IS NULL OR pk.effective_from <= ?)
+         AND (pk.effective_to IS NULL OR pk.effective_to >= ?)
+       GROUP BY pk.product_id, pk.stock_mode, pk.price_rule,
+                c.component_product_id, cp.name, cp.sku, c.quantity,
+                cp.price, cp.cost, c.position
+       ORDER BY pk.product_id, c.position, c.id`,
+      [
+        warehouseId,
+        tenantId,
+        ...products.map(({ id }) => id),
+        currentDate ?? new Date().toISOString().slice(0, 10),
+        currentDate ?? new Date().toISOString().slice(0, 10),
+      ],
+    );
+    const byKit = new Map<string, typeof rows>();
+    for (const row of rows) {
+      byKit.set(row.kit_product_id, [
+        ...(byKit.get(row.kit_product_id) ?? []),
+        row,
+      ]);
+    }
+    return products.map((product) => {
+      const components = byKit.get(product.id);
+      if (!components?.length) return product;
+      let availableKitUnits: bigint | null = null;
+      let componentPriceCents = 0n;
+      for (const component of components) {
+        const perKit = this.toUnits(component.component_quantity);
+        const available = this.toUnits(component.component_available);
+        const supported = (available / perKit) * 1000n;
+        availableKitUnits =
+          availableKitUnits === null || supported < availableKitUnits
+            ? supported
+            : availableKitUnits;
+        componentPriceCents += this.roundDivide(
+          this.toMoneyCents(component.component_price) * perKit,
+          1000n,
+        );
+      }
+      const definition = components[0];
+      return {
+        ...product,
+        price:
+          definition.price_rule === 'COMPONENT_SUM'
+            ? this.fromMoneyCents(componentPriceCents)
+            : product.price,
+        availableQuantity:
+          definition.stock_mode === 'DERIVED'
+            ? this.fromUnits(availableKitUnits ?? 0n)
+            : product.availableQuantity,
+        kit: {
+          stockMode: definition.stock_mode,
+          priceRule: definition.price_rule,
+          components: components.map((component) => ({
+            product: {
+              id: component.component_product_id,
+              name: component.component_name,
+              sku: component.component_sku,
+            },
+            quantity: this.normalizeQuantity(component.component_quantity),
+            availableQuantity: this.normalizeQuantity(
+              component.component_available,
+            ),
+            unitCost: this.normalizeCost(component.component_cost),
+          })),
+        },
+      };
+    });
   }
 
   async getSelectedLotAvailability(
@@ -288,5 +398,23 @@ export class PosRepository {
   private normalizeQuantity(value: string): string {
     const [whole, fraction = ''] = value.split('.');
     return `${whole}.${fraction.padEnd(3, '0').slice(0, 3)}`;
+  }
+
+  private toMoneyCents(value: string): bigint {
+    const [whole, fraction = ''] = value.split('.');
+    return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0').slice(0, 2));
+  }
+
+  private fromMoneyCents(value: bigint): string {
+    return `${value / 100n}.${String(value % 100n).padStart(2, '0')}`;
+  }
+
+  private roundDivide(value: bigint, divisor: bigint): bigint {
+    return (value + divisor / 2n) / divisor;
+  }
+
+  private normalizeCost(value: string): string {
+    const [whole, fraction = ''] = value.split('.');
+    return `${whole}.${fraction.padEnd(4, '0').slice(0, 4)}`;
   }
 }

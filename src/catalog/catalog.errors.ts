@@ -45,3 +45,9 @@ export class ProductVariantsRequireZeroStockError extends Error {
     super('PRODUCT_VARIANTS_REQUIRE_ZERO_STOCK');
   }
 }
+
+export class ProductKitConfigurationError extends Error {
+  constructor(readonly reason: string) {
+    super('PRODUCT_KIT_CONFIGURATION_INVALID');
+  }
+}

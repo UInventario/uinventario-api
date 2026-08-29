@@ -574,6 +574,50 @@ export class PosService {
           ] as const;
         }),
       );
+      const inventoryDemand = new Map<
+        string,
+        { quantity: bigint; available: bigint; requestedProductId: string }
+      >();
+      for (const [productId, quantity] of normalizedRequested) {
+        const product = productMap.get(productId)!;
+        if (product.kit?.stockMode === 'DERIVED') {
+          if (
+            input.dto.reservationId ||
+            requestedLots.get(productId) ||
+            (requestedSerials.get(productId)?.length ?? 0) > 0
+          ) {
+            throw new BadRequestException({
+              code: 'DERIVED_KIT_TRACKING_NOT_SUPPORTED',
+              message:
+                'Los kits derivados no admiten reserva, lote ni serie seleccionada.',
+            });
+          }
+          for (const component of product.kit.components) {
+            const required = this.roundDivide(
+              quantity * this.toQuantityUnits(component.quantity),
+              1000n,
+            );
+            const current = inventoryDemand.get(component.product.id);
+            inventoryDemand.set(component.product.id, {
+              quantity: (current?.quantity ?? 0n) + required,
+              available: this.toQuantityUnits(component.availableQuantity),
+              requestedProductId: current?.requestedProductId ?? productId,
+            });
+          }
+        } else {
+          const current = inventoryDemand.get(productId);
+          inventoryDemand.set(productId, {
+            quantity: (current?.quantity ?? 0n) + quantity,
+            available: this.toQuantityUnits(product.availableQuantity),
+            requestedProductId: current?.requestedProductId ?? productId,
+          });
+        }
+      }
+      for (const demand of inventoryDemand.values()) {
+        if (demand.quantity > demand.available) {
+          throw new PosInsufficientStockError(demand.requestedProductId);
+        }
+      }
       const preparedLines = [...normalizedRequested.entries()].map(
         ([productId, quantityUnits]) => {
           const product = productMap.get(productId);
@@ -638,6 +682,34 @@ export class PosService {
             requestedDiscount,
             grossCents,
           );
+          const kit = product.kit
+            ? {
+                stockMode: product.kit.stockMode,
+                components: product.kit.components.map((component) => ({
+                  product: component.product,
+                  quantityPerKit: component.quantity,
+                  totalQuantity: this.fromQuantityUnits(
+                    this.roundDivide(
+                      quantityUnits * this.toQuantityUnits(component.quantity),
+                      1000n,
+                    ),
+                  ),
+                  unitCost: component.unitCost,
+                })),
+                unitCost: this.fromCostUnits(
+                  product.kit.components.reduce(
+                    (sum, component) =>
+                      sum +
+                      this.roundDivide(
+                        this.toCostUnits(component.unitCost) *
+                          this.toQuantityUnits(component.quantity),
+                        1000n,
+                      ),
+                    0n,
+                  ),
+                ),
+              }
+            : null;
           return {
             product: {
               id: product.id,
@@ -652,6 +724,7 @@ export class PosService {
             expiredLotOverrideReason: expired ? expiredReason : null,
             serialNumbers,
             availableQuantity: availableQuantity!,
+            kit,
             unitPrice: this.fromMoneyCents(this.toMoneyCents(effectivePrice)),
             priceSource: resolvedPrice?.source ?? ('BASE' as const),
             priceList: resolvedPrice?.priceList ?? null,
@@ -710,6 +783,7 @@ export class PosService {
           expiredLotOverrideReason: line.expiredLotOverrideReason,
           serialNumbers: line.serialNumbers,
           availableQuantity: line.availableQuantity,
+          kit: line.kit,
           unitPrice: line.unitPrice,
           priceSource: line.priceSource,
           priceList: line.priceList,
@@ -1125,6 +1199,15 @@ export class PosService {
 
   private fromQuantityUnits(value: bigint): string {
     return `${value / 1000n}.${String(value % 1000n).padStart(3, '0')}`;
+  }
+
+  private toCostUnits(value: string): bigint {
+    const [whole, fraction = ''] = value.split('.');
+    return BigInt(whole) * 10_000n + BigInt(fraction.padEnd(4, '0'));
+  }
+
+  private fromCostUnits(value: bigint): string {
+    return `${value / 10_000n}.${String(value % 10_000n).padStart(4, '0')}`;
   }
 
   private toMoneyCents(value: string): bigint {

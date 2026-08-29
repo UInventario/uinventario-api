@@ -12,6 +12,7 @@ import {
   ProductVersionConflictError,
   ProductLotTrackingLockedError,
   ProductQuantityPolicyLockedError,
+  ProductKitConfigurationError,
   ProductVariantConfigurationError,
   ProductVariantsRequireZeroStockError,
 } from './catalog.errors';
@@ -29,6 +30,7 @@ import {
   UpdateCatalogClassificationDto,
 } from './dto/catalog-classification.dto';
 import { UpdateProductVariantsDto } from './dto/update-product-variants.dto';
+import { UpdateProductKitDto } from './dto/update-product-kit.dto';
 import { assertProductQuantityPolicy } from '../common/quantity-policy';
 
 @Injectable()
@@ -183,6 +185,44 @@ export class CatalogService {
       if (error instanceof ProductVariantConfigurationError) {
         throw new BadRequestException({
           code: 'PRODUCT_VARIANT_CONFIGURATION_INVALID',
+          message: error.reason,
+        });
+      }
+      throw error;
+    }
+  }
+
+  async updateProductKit(
+    tenantId: string,
+    id: string,
+    dto: UpdateProductKitDto,
+  ): Promise<ProductResponse> {
+    if (
+      dto.enabled &&
+      dto.effectiveFrom &&
+      dto.effectiveTo &&
+      dto.effectiveFrom > dto.effectiveTo
+    ) {
+      throw new BadRequestException({
+        code: 'PRODUCT_KIT_CONFIGURATION_INVALID',
+        message: 'La vigencia final no puede ser anterior a la inicial.',
+      });
+    }
+    try {
+      const product = await this.catalog.updateProductKit(tenantId, id, dto);
+      if (!product) throw new NotFoundException();
+      return { data: product, meta: { apiVersion: '1' } };
+    } catch (error) {
+      if (error instanceof ProductVersionConflictError) {
+        throw new ConflictException({
+          code: 'PRODUCT_VERSION_CONFLICT',
+          currentVersion: error.currentVersion,
+          message: 'El producto cambió. Recarga antes de guardar el kit.',
+        });
+      }
+      if (error instanceof ProductKitConfigurationError) {
+        throw new BadRequestException({
+          code: 'PRODUCT_KIT_CONFIGURATION_INVALID',
           message: error.reason,
         });
       }

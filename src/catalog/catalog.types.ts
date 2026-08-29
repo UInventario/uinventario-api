@@ -23,6 +23,18 @@ export interface ProductData {
   variantValues: Array<{ attribute: string; value: string }>;
   sellable: boolean;
   variants: ProductData[];
+  kit: ProductKitData | null;
+}
+
+export interface ProductKitData {
+  stockMode: 'DERIVED' | 'ASSEMBLED';
+  priceRule: 'FIXED' | 'COMPONENT_SUM';
+  effectiveFrom: string | null;
+  effectiveTo: string | null;
+  components: Array<{
+    product: { id: string; name: string; sku: string };
+    quantity: string;
+  }>;
 }
 
 export interface ProductResponse {

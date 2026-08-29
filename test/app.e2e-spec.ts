@@ -7826,6 +7826,282 @@ describe('UInventario API (e2e)', () => {
         });
     });
 
+    it('derives kit availability, sells components atomically and restores them on return', async () => {
+      const { cookie, productId: coffeeId, locationId } = await preparePos();
+      const cupResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Vaso',
+          sku: 'VASO-KIT',
+          cost: '2.00',
+          price: '10.00',
+          quantityPrecision: 0,
+          minimumQuantity: '1.000',
+        })
+        .expect(201);
+      const cupId = (cupResponse.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'kit-cups-initial')
+        .send({
+          productId: cupId,
+          locationId,
+          type: 'INITIAL',
+          quantity: '10',
+          reason: 'Vasos para kits',
+        })
+        .expect(201);
+      const kitResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Combo café',
+          sku: 'COMBO-CAFE',
+          cost: '42.00',
+          price: '79.00',
+          quantityPrecision: 0,
+          minimumQuantity: '1.000',
+        })
+        .expect(201);
+      const kitId = (kitResponse.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .put(`/api/v1/products/${kitId}/kit`)
+        .set('Cookie', cookie)
+        .send({
+          version: 1,
+          enabled: true,
+          stockMode: 'DERIVED',
+          priceRule: 'COMPONENT_SUM',
+          components: [
+            { productId: coffeeId, quantity: '0.5' },
+            { productId: cupId, quantity: '1' },
+          ],
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              version: 2,
+              kit: {
+                stockMode: 'DERIVED',
+                priceRule: 'COMPONENT_SUM',
+                components: [
+                  { product: { id: coffeeId }, quantity: '0.500' },
+                  { product: { id: cupId }, quantity: '1.000' },
+                ],
+              },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [{ productId: kitId, quantity: '2' }] })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  product: { id: kitId },
+                  quantity: '2.000',
+                  availableQuantity: '10.000',
+                  unitPrice: '69.95',
+                  kit: { stockMode: 'DERIVED' },
+                },
+              ],
+              totals: { total: '139.90' },
+            },
+          });
+        });
+      const sale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'derived-kit-sale')
+        .send({
+          lines: [
+            { productId: cupId, quantity: '1' },
+            { productId: kitId, quantity: '2' },
+          ],
+          cashReceived: '200.00',
+        })
+        .expect(201);
+      const saleData = sale.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+      const balancesAfterSale = await dataSource.query<
+        Array<{ product_id: string; quantity: string }>
+      >(
+        `SELECT product_id, quantity FROM inventory_balances
+         WHERE location_id = ? AND product_id IN (?, ?) ORDER BY product_id`,
+        [locationId, coffeeId, cupId],
+      );
+      expect(
+        new Map(balancesAfterSale.map((row) => [row.product_id, row.quantity])),
+      ).toEqual(
+        new Map([
+          [coffeeId, '4.000'],
+          [cupId, '7.000'],
+        ]),
+      );
+      const [trace] = await dataSource.query<
+        Array<{ components: number | string; movements: number | string }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM sale_kit_components WHERE sale_id = ?) AS components,
+           (SELECT COUNT(*) FROM inventory_movements
+             WHERE sale_id = ? AND sale_line_id = ? AND type = 'SALE') AS movements`,
+        [saleData.data.id, saleData.data.id, saleData.data.lines[1].id],
+      );
+      expect({
+        components: Number(trace.components),
+        movements: Number(trace.movements),
+      }).toEqual({
+        components: 2,
+        movements: 2,
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleData.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'derived-kit-return')
+        .send({
+          reason: 'Combo devuelto completo',
+          lines: [
+            {
+              saleLineId: saleData.data.lines[1].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201);
+      const balancesAfterReturn = await dataSource.query<
+        Array<{ product_id: string; quantity: string }>
+      >(
+        `SELECT product_id, quantity FROM inventory_balances
+         WHERE location_id = ? AND product_id IN (?, ?) ORDER BY product_id`,
+        [locationId, coffeeId, cupId],
+      );
+      expect(
+        new Map(
+          balancesAfterReturn.map((row) => [row.product_id, row.quantity]),
+        ),
+      ).toEqual(
+        new Map([
+          [coffeeId, '4.500'],
+          [cupId, '8.000'],
+        ]),
+      );
+    });
+
+    it('assembles and disassembles configured kit stock idempotently', async () => {
+      const { cookie, productId: componentId, locationId } = await preparePos();
+      const kitResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Paquete armado',
+          sku: 'KIT-ARMADO',
+          cost: '40.00',
+          price: '70.00',
+          quantityPrecision: 0,
+          minimumQuantity: '1.000',
+        })
+        .expect(201);
+      const kitId = (kitResponse.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .put(`/api/v1/products/${kitId}/kit`)
+        .set('Cookie', cookie)
+        .send({
+          version: 1,
+          enabled: true,
+          stockMode: 'ASSEMBLED',
+          priceRule: 'FIXED',
+          components: [{ productId: componentId, quantity: '0.5' }],
+        })
+        .expect(200);
+      const payload = {
+        operationType: 'ASSEMBLE',
+        locationId,
+        quantity: '2',
+      };
+      const assembled = await request(app.getHttpServer())
+        .post(`/api/v1/inventory/kits/${kitId}/operations`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'kit-assemble-once')
+        .send(payload)
+        .expect(201);
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/kits/${kitId}/operations`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'kit-assemble-once')
+        .send(payload)
+        .expect(201)
+        .expect(
+          ({ body }: { body: { meta: { idempotentReplay: boolean } } }) => {
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+      expect(assembled.body).toMatchObject({
+        data: { operationType: 'ASSEMBLE', quantity: '2.000' },
+        meta: { idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .put(`/api/v1/products/${kitId}/kit`)
+        .set('Cookie', cookie)
+        .send({
+          version: 2,
+          enabled: true,
+          stockMode: 'ASSEMBLED',
+          priceRule: 'FIXED',
+          components: [{ productId: componentId, quantity: '1' }],
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PRODUCT_KIT_CONFIGURATION_INVALID');
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/kits/${kitId}/operations`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'kit-disassemble-once')
+        .send({ operationType: 'DISASSEMBLE', locationId, quantity: '1' })
+        .expect(201);
+      const balances = await dataSource.query<
+        Array<{ product_id: string; quantity: string }>
+      >(
+        `SELECT product_id, quantity FROM inventory_balances
+         WHERE location_id = ? AND product_id IN (?, ?) ORDER BY product_id`,
+        [locationId, componentId, kitId],
+      );
+      expect(
+        new Map(balances.map((row) => [row.product_id, row.quantity])),
+      ).toEqual(
+        new Map([
+          [componentId, '4.500'],
+          [kitId, '1.000'],
+        ]),
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/kits/${kitId}/operations`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'kit-assemble-insufficient')
+        .send({ operationType: 'ASSEMBLE', locationId, quantity: '100' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INSUFFICIENT_STOCK');
+        });
+      const afterRollback = await dataSource.query<
+        Array<{ product_id: string; quantity: string }>
+      >(
+        `SELECT product_id, quantity FROM inventory_balances
+         WHERE location_id = ? AND product_id IN (?, ?) ORDER BY product_id`,
+        [locationId, componentId, kitId],
+      );
+      expect(afterRollback).toEqual(balances);
+    });
+
     it('resolves scoped price lists deterministically and snapshots the sale price', async () => {
       const { cookie, productId } = await preparePos();
       const [branch] = await dataSource.query<Array<{ id: string }>>(

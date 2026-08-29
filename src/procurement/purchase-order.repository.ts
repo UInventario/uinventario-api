@@ -409,6 +409,11 @@ export class PurchaseOrderRepository {
        INNER JOIN products p ON p.id = sp.product_id AND p.tenant_id = sp.tenant_id
        WHERE sp.tenant_id = ? AND sp.supplier_id = ? AND sp.active = TRUE
          AND p.active = TRUE AND p.variant_schema IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM product_kits pk
+           WHERE pk.tenant_id = p.tenant_id AND pk.product_id = p.id
+             AND pk.stock_mode = 'DERIVED'
+         )
          AND sp.id IN (${ids.map(() => '?').join(',')})`,
       [tenantId, dto.supplierId, ...ids],
     );

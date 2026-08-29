@@ -35,6 +35,7 @@ interface SaleLineRow {
 
 interface SourceMovementRow {
   id: string;
+  product_id: string;
   location_id: string;
   quantity_change: string;
   returned_quantity: string;
@@ -201,6 +202,7 @@ export class SaleReturnRepository {
             total: bigint;
             allocations: Array<{
               movementId: string;
+              productId: string;
               locationId: string;
               quantity: bigint;
               serialNumbers: string[];
@@ -255,21 +257,45 @@ export class SaleReturnRepository {
               throw new SaleReturnSerialError();
             }
 
-            const sourceMovements = await manager.query<SourceMovementRow[]>(
-              `SELECT source.id, source.location_id, source.quantity_change,
-                      COALESCE(SUM(restored.quantity_change), 0) AS returned_quantity
-               FROM inventory_movements source
-               LEFT JOIN inventory_movements restored
-                 ON restored.tenant_id = source.tenant_id
-                AND restored.source_sale_movement_id = source.id
-                AND restored.type = 'SALE_RETURN'
-               WHERE source.tenant_id = ? AND source.sale_id = ?
-                 AND source.sale_line_id = ? AND source.type = 'SALE'
-               GROUP BY source.id, source.location_id, source.quantity_change,
-                        source.created_at
-               ORDER BY source.created_at, source.id FOR UPDATE`,
+            const kitComponents = await manager.query<
+              Array<{ component_product_id: string; quantity_per_kit: string }>
+            >(
+              `SELECT component_product_id, quantity_per_kit
+               FROM sale_kit_components
+               WHERE tenant_id = ? AND sale_id = ? AND sale_line_id = ?
+               ORDER BY component_product_id`,
               [input.tenantId, sale.id, source.id],
             );
+            const returnTargets = kitComponents.length
+              ? kitComponents.map((component) => ({
+                  productId: component.component_product_id,
+                  quantity:
+                    (quantity * this.toQuantity(component.quantity_per_kit)) /
+                    1000n,
+                }))
+              : [{ productId: source.product_id, quantity }];
+            const sourceMovements: SourceMovementRow[] = [];
+            for (const target of returnTargets) {
+              sourceMovements.push(
+                ...(await manager.query<SourceMovementRow[]>(
+                  `SELECT source.id, source.product_id, source.location_id,
+                          source.quantity_change,
+                          COALESCE(SUM(restored.quantity_change), 0) AS returned_quantity
+                   FROM inventory_movements source
+                   LEFT JOIN inventory_movements restored
+                     ON restored.tenant_id = source.tenant_id
+                    AND restored.source_sale_movement_id = source.id
+                    AND restored.type = 'SALE_RETURN'
+                   WHERE source.tenant_id = ? AND source.sale_id = ?
+                     AND source.sale_line_id = ? AND source.product_id = ?
+                     AND source.type = 'SALE'
+                   GROUP BY source.id, source.product_id, source.location_id,
+                            source.quantity_change, source.created_at
+                   ORDER BY source.created_at, source.id FOR UPDATE`,
+                  [input.tenantId, sale.id, source.id, target.productId],
+                )),
+              );
+            }
             const serialSource = await this.serialSources(
               manager,
               input.tenantId,
@@ -278,37 +304,45 @@ export class SaleReturnRepository {
             );
             const allocations = [] as Array<{
               movementId: string;
+              productId: string;
               locationId: string;
               quantity: bigint;
               serialNumbers: string[];
             }>;
-            let remaining = quantity;
-            for (const movement of sourceMovements) {
-              if (remaining === 0n) break;
-              const soldAtLocation = -this.toQuantity(movement.quantity_change);
-              const available =
-                soldAtLocation - this.toQuantity(movement.returned_quantity);
-              const movementSerials = serialNumbers.filter(
-                (serial) =>
-                  serialSource.get(serial.toUpperCase()) === movement.id,
-              );
-              const selected = source.track_serials
-                ? BigInt(movementSerials.length) * 1000n
-                : available < remaining
-                  ? available
-                  : remaining;
-              if (selected <= 0n) continue;
-              if (selected > available || selected > remaining)
-                throw new SaleReturnSerialError();
-              allocations.push({
-                movementId: movement.id,
-                locationId: movement.location_id,
-                quantity: selected,
-                serialNumbers: movementSerials,
-              });
-              remaining -= selected;
+            for (const target of returnTargets) {
+              let remaining = target.quantity;
+              for (const movement of sourceMovements.filter(
+                (item) => item.product_id === target.productId,
+              )) {
+                if (remaining === 0n) break;
+                const soldAtLocation = -this.toQuantity(
+                  movement.quantity_change,
+                );
+                const available =
+                  soldAtLocation - this.toQuantity(movement.returned_quantity);
+                const movementSerials = serialNumbers.filter(
+                  (serial) =>
+                    serialSource.get(serial.toUpperCase()) === movement.id,
+                );
+                const selected = source.track_serials
+                  ? BigInt(movementSerials.length) * 1000n
+                  : available < remaining
+                    ? available
+                    : remaining;
+                if (selected <= 0n) continue;
+                if (selected > available || selected > remaining)
+                  throw new SaleReturnSerialError();
+                allocations.push({
+                  movementId: movement.id,
+                  productId: movement.product_id,
+                  locationId: movement.location_id,
+                  quantity: selected,
+                  serialNumbers: movementSerials,
+                });
+                remaining -= selected;
+              }
+              if (remaining !== 0n) throw new SaleReturnQuantityError();
             }
-            if (remaining !== 0n) throw new SaleReturnQuantityError();
 
             const completesLine = returned + quantity === sold;
             const subtotal = this.prorate(
@@ -400,7 +434,7 @@ export class SaleReturnRepository {
                  FROM inventory_balances
                  WHERE tenant_id = ? AND product_id = ? AND location_id = ?
                  LIMIT 1 FOR UPDATE`,
-                [input.tenantId, line.source.product_id, allocation.locationId],
+                [input.tenantId, allocation.productId, allocation.locationId],
               );
               if (!balance) throw new Error('SALE_RETURN_BALANCE_NOT_FOUND');
               const nextQuantity =
@@ -420,7 +454,7 @@ export class SaleReturnRepository {
                   this.quantity(nextAvailable),
                   this.quantity(nextDamaged),
                   input.tenantId,
-                  line.source.product_id,
+                  allocation.productId,
                   allocation.locationId,
                 ],
               );
@@ -447,7 +481,7 @@ export class SaleReturnRepository {
                 [
                   movementId,
                   input.tenantId,
-                  line.source.product_id,
+                  allocation.productId,
                   allocation.locationId,
                   line.condition === 'SELLABLE' ? 'AVAILABLE' : 'DAMAGED',
                   this.quantity(allocation.quantity),

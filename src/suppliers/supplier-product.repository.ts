@@ -211,7 +211,12 @@ export class SupplierProductRepository {
       `SELECT
          EXISTS(SELECT 1 FROM suppliers WHERE id = ? AND tenant_id = ? AND active = TRUE) AS supplier_exists,
          EXISTS(SELECT 1 FROM products WHERE id = ? AND tenant_id = ? AND active = TRUE
-           AND variant_schema IS NULL) AS product_exists`,
+           AND variant_schema IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM product_kits pk
+             WHERE pk.tenant_id = products.tenant_id AND pk.product_id = products.id
+               AND pk.stock_mode = 'DERIVED'
+           )) AS product_exists`,
       [supplierId, tenantId, productId, tenantId],
     );
     if (!Number(state.supplier_exists))

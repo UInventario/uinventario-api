@@ -12,6 +12,16 @@ export interface PosProductSnapshot {
   quantityRounding?: import('../common/quantity-policy').QuantityRoundingMode;
   minimumQuantity?: string;
   availableQuantity: string;
+  kit?: {
+    stockMode: 'DERIVED' | 'ASSEMBLED';
+    priceRule: 'FIXED' | 'COMPONENT_SUM';
+    components: Array<{
+      product: { id: string; name: string; sku: string };
+      quantity: string;
+      availableQuantity: string;
+      unitCost: string;
+    }>;
+  };
 }
 
 export interface PosAppliedDiscount {
@@ -46,6 +56,16 @@ export interface PosCartQuoteResponse {
       expiredLotOverrideReason?: string | null;
       serialNumbers: string[];
       availableQuantity: string;
+      kit?: null | {
+        stockMode: 'DERIVED' | 'ASSEMBLED';
+        components: Array<{
+          product: { id: string; name: string; sku: string };
+          quantityPerKit: string;
+          totalQuantity: string;
+          unitCost: string;
+        }>;
+        unitCost: string;
+      };
       unitPrice: string;
       priceSource: 'BASE' | 'PRICE_LIST';
       priceList: { id: string; name: string } | null;
