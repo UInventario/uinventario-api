@@ -33,6 +33,7 @@ import { ObservabilityModule } from './observability/observability.module';
 import { PrivacyModule } from './privacy/privacy.module';
 import { PriceListModule } from './pricing/price-list.module';
 import { CustomerOrderModule } from './orders/customer-order.module';
+import { SalesQuotationModule } from './quotations/sales-quotation.module';
 
 @Module({
   imports: [
@@ -84,6 +85,7 @@ import { CustomerOrderModule } from './orders/customer-order.module';
     PrivacyModule,
     PriceListModule,
     CustomerOrderModule,
+    SalesQuotationModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: SecurityThrottlerGuard }],
 })

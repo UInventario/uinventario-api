@@ -38,6 +38,8 @@ interface SaleRow {
   customer_id: string | null;
   customer_name: string | null;
   customer_identifier: string | null;
+  quotation_id: string | null;
+  quotation_number: string | null;
   currency: string;
   tax_rate: string;
   gross_total: string;
@@ -552,6 +554,7 @@ export class SalesRepository {
     customerId?: string | null;
     reservationId?: string | null;
     suspendedSaleId?: string | null;
+    quotationId?: string | null;
     quote: PosCartQuoteResponse['data'];
     payments: Array<{
       method: PaymentMethod;
@@ -904,12 +907,12 @@ export class SalesRepository {
           await manager.query(
             `INSERT INTO sales
             (id, tenant_id, branch_id, warehouse_id, cash_register_id,
-             cash_register_shift_id, created_by_user_id, customer_id, reservation_id,
+             cash_register_shift_id, created_by_user_id, customer_id, reservation_id, quotation_id,
              receipt_number, currency, tax_rate, gross_total, line_discount_total,
              sale_discount_total, discount_total, discount_type, discount_value,
              discount_reason, subtotal, tax_total, total, status, idempotency_key,
              request_fingerprint)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
             [
               saleId,
               input.tenantId,
@@ -920,6 +923,7 @@ export class SalesRepository {
               input.userId,
               effectiveCustomerId,
               input.reservationId ?? null,
+              input.quotationId ?? null,
               receiptNumber,
               input.quote.currency,
               input.quote.taxRate,
@@ -1208,6 +1212,7 @@ export class SalesRepository {
       `SELECT s.id, s.receipt_number, s.status, s.created_by_user_id,
               c.id AS customer_id, c.name AS customer_name,
               c.identifier AS customer_identifier,
+              q.id AS quotation_id, q.quotation_number,
               s.currency, s.tax_rate, s.gross_total, s.line_discount_total,
               s.sale_discount_total, s.discount_total, s.discount_type,
               s.discount_value, s.discount_reason, s.subtotal, s.tax_total, s.total,
@@ -1223,6 +1228,7 @@ export class SalesRepository {
        INNER JOIN cash_registers cr ON cr.id = s.cash_register_id AND cr.tenant_id = s.tenant_id
        LEFT JOIN users vu ON vu.id = s.voided_by_user_id AND vu.tenant_id = s.tenant_id
        LEFT JOIN customers c ON c.id = s.customer_id AND c.tenant_id = s.tenant_id
+       LEFT JOIN sales_quotations q ON q.id = s.quotation_id AND q.tenant_id = s.tenant_id
        WHERE s.tenant_id = ? AND s.idempotency_key = ? LIMIT 1`,
       [tenantId, idempotencyKey],
     );
@@ -1394,6 +1400,9 @@ export class SalesRepository {
               name: row.customer_name!,
               identifier: row.customer_identifier,
             }
+          : null,
+        quotation: row.quotation_id
+          ? { id: row.quotation_id, quotationNumber: row.quotation_number! }
           : null,
         currency: row.currency,
         taxRate: this.decimal(row.tax_rate, 4),

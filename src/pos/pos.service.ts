@@ -205,6 +205,7 @@ export class PosService {
     canDiscount?: boolean;
     canCredit?: boolean;
     canViewMargin?: boolean;
+    sourceQuotationId?: string;
   }): Promise<CashSaleResponse> {
     this.assertIdempotencyKey(input.idempotencyKey);
     if (input.dto.credit && !input.canCredit) {
@@ -274,6 +275,7 @@ export class PosService {
         customerId: input.dto.customerId ?? null,
         reservationId: input.dto.reservationId ?? null,
         suspendedSaleId: input.dto.suspendedSaleId ?? null,
+        quotationId: input.sourceQuotationId ?? null,
         payments,
         credit: input.dto.credit ?? null,
       });

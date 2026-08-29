@@ -109,6 +109,7 @@ export interface CashSaleData {
   context: PosCartQuoteResponse['data']['context'];
   userId: string;
   customer: { id: string; name: string; identifier: string | null } | null;
+  quotation: { id: string; quotationNumber: string } | null;
   currency: string;
   taxRate: string;
   discount: PosAppliedDiscount | null;
