@@ -32,6 +32,7 @@ import { SecurityThrottlerGuard } from './security/security-throttler.guard';
 import { ObservabilityModule } from './observability/observability.module';
 import { PrivacyModule } from './privacy/privacy.module';
 import { PriceListModule } from './pricing/price-list.module';
+import { CustomerOrderModule } from './orders/customer-order.module';
 
 @Module({
   imports: [
@@ -82,6 +83,7 @@ import { PriceListModule } from './pricing/price-list.module';
     DataExportModule,
     PrivacyModule,
     PriceListModule,
+    CustomerOrderModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: SecurityThrottlerGuard }],
 })
