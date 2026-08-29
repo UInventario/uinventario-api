@@ -8,6 +8,7 @@ import { CustomerRepository } from './customer.repository';
 import { ListCustomersDto } from './dto/list-customers.dto';
 import { ListCustomerHistoryDto } from './dto/list-customer-history.dto';
 import { SaveCustomerDto, UpdateCustomerDto } from './dto/save-customer.dto';
+import { ConfigureCustomerCreditDto } from './dto/configure-customer-credit.dto';
 
 @Injectable()
 export class CustomerService {
@@ -104,6 +105,27 @@ export class CustomerService {
     const customer = await this.customers.deactivate(tenantId, id);
     if (!customer) throw new NotFoundException();
     return { data: customer, meta: { apiVersion: '1' as const } };
+  }
+
+  async configureCredit(
+    tenantId: string,
+    customerId: string,
+    userId: string,
+    dto: ConfigureCustomerCreditDto,
+  ) {
+    const result = await this.customers.configureCredit(
+      tenantId,
+      customerId,
+      userId,
+      dto,
+    );
+    if (!result) throw new NotFoundException();
+    if (result === 'CONFLICT')
+      throw new ConflictException({
+        code: 'CUSTOMER_VERSION_CONFLICT',
+        message: 'El cliente cambiÃ³; recarga antes de guardar.',
+      });
+    return { data: result, meta: { apiVersion: '1' as const } };
   }
 
   private consent(dto: SaveCustomerDto): void {

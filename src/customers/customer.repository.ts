@@ -4,6 +4,7 @@ import { DataSource, QueryFailedError } from 'typeorm';
 import { ListCustomersDto } from './dto/list-customers.dto';
 import { ListCustomerHistoryDto } from './dto/list-customer-history.dto';
 import { SaveCustomerDto, UpdateCustomerDto } from './dto/save-customer.dto';
+import { ConfigureCustomerCreditDto } from './dto/configure-customer-credit.dto';
 import { CustomerData, CustomerHistoryData } from './customer.types';
 
 interface CustomerRow {
@@ -20,6 +21,13 @@ interface CustomerRow {
   version: number | string;
   created_at: Date | string;
   updated_at: Date | string;
+  credit_enabled: number | boolean | null;
+  credit_limit: string | null;
+  credit_currency: string | null;
+  credit_term_days: number | string | null;
+  credit_max_installments: number | string | null;
+  credit_balance: string;
+  credit_overdue_amount: string;
 }
 
 @Injectable()
@@ -79,6 +87,56 @@ export class CustomerRepository {
     if (Number(result.affectedRows ?? 0) === 0)
       return this.findById(tenantId, id);
     return this.findById(tenantId, id);
+  }
+
+  async configureCredit(
+    tenantId: string,
+    customerId: string,
+    userId: string,
+    dto: ConfigureCustomerCreditDto,
+  ): Promise<CustomerData | 'CONFLICT' | null> {
+    return this.dataSource.transaction('READ COMMITTED', async (manager) => {
+      const [customer] = await manager.query<
+        Array<{ version: number | string }>
+      >(
+        `SELECT version FROM customers
+         WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE`,
+        [customerId, tenantId],
+      );
+      if (!customer) return null;
+      if (Number(customer.version) !== dto.version) return 'CONFLICT';
+      await manager.query(
+        `INSERT INTO customer_credit_profiles
+          (customer_id, tenant_id, enabled, credit_limit, currency, term_days,
+           max_installments, configured_by_user_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE enabled = VALUES(enabled),
+           credit_limit = VALUES(credit_limit), currency = VALUES(currency),
+           term_days = VALUES(term_days),
+           max_installments = VALUES(max_installments),
+           configured_by_user_id = VALUES(configured_by_user_id)`,
+        [
+          customerId,
+          tenantId,
+          dto.enabled,
+          dto.creditLimit,
+          dto.currency,
+          dto.termDays,
+          dto.maxInstallments,
+          userId,
+        ],
+      );
+      await manager.query(
+        `UPDATE customers SET version = version + 1
+         WHERE id = ? AND tenant_id = ?`,
+        [customerId, tenantId],
+      );
+      const [row] = await manager.query<CustomerRow[]>(
+        `${this.select()} WHERE id = ? AND tenant_id = ? LIMIT 1`,
+        [customerId, tenantId],
+      );
+      return this.data(row);
+    });
   }
 
   async findById(tenantId: string, id: string): Promise<CustomerData | null> {
@@ -292,10 +350,48 @@ export class CustomerRepository {
   private select() {
     return `SELECT id, name, identifier, email, phone, data_processing_consent,
                    privacy_status, anonymized_at, privacy_retention_until,
-                   active, version, created_at, updated_at FROM customers`;
+                   active, version, created_at, updated_at,
+                   (SELECT enabled FROM customer_credit_profiles ccp
+                    WHERE ccp.customer_id = customers.id
+                      AND ccp.tenant_id = customers.tenant_id) AS credit_enabled,
+                   (SELECT credit_limit FROM customer_credit_profiles ccp
+                    WHERE ccp.customer_id = customers.id
+                      AND ccp.tenant_id = customers.tenant_id) AS credit_limit,
+                   (SELECT currency FROM customer_credit_profiles ccp
+                    WHERE ccp.customer_id = customers.id
+                      AND ccp.tenant_id = customers.tenant_id) AS credit_currency,
+                   (SELECT term_days FROM customer_credit_profiles ccp
+                    WHERE ccp.customer_id = customers.id
+                      AND ccp.tenant_id = customers.tenant_id) AS credit_term_days,
+                   (SELECT max_installments FROM customer_credit_profiles ccp
+                    WHERE ccp.customer_id = customers.id
+                      AND ccp.tenant_id = customers.tenant_id) AS credit_max_installments,
+                   COALESCE((SELECT SUM(CASE WHEN entry_type = 'DEBIT' THEN amount ELSE -amount END)
+                    FROM customer_debt_ledger cdl WHERE cdl.customer_id = customers.id
+                      AND cdl.tenant_id = customers.tenant_id), 0) AS credit_balance,
+                   COALESCE((SELECT SUM(GREATEST(
+                     COALESCE((SELECT SUM(cci.amount)
+                       FROM customer_credit_installments cci
+                       WHERE cci.account_id = cca.id AND cci.tenant_id = cca.tenant_id
+                         AND cci.due_date < CURRENT_DATE()), 0)
+                     - GREATEST(cca.original_amount - COALESCE((
+                       SELECT SUM(CASE WHEN entry_type = 'DEBIT' THEN amount ELSE -amount END)
+                       FROM customer_debt_ledger cdl
+                       WHERE cdl.account_id = cca.id AND cdl.tenant_id = cca.tenant_id
+                     ), 0), 0), 0)) FROM customer_credit_accounts cca
+                    WHERE cca.customer_id = customers.id
+                      AND cca.tenant_id = customers.tenant_id
+                      AND cca.canceled_at IS NULL), 0)
+                    AS credit_overdue_amount
+            FROM customers`;
   }
 
   private data(row: CustomerRow): CustomerData {
+    const balance = this.toMoneyCents(row.credit_balance ?? '0');
+    const limit = this.toMoneyCents(row.credit_limit ?? '0');
+    const overdue = this.toMoneyCents(row.credit_overdue_amount ?? '0');
+    const available = limit > balance ? limit - balance : 0n;
+    const enabled = Boolean(row.credit_enabled);
     return {
       id: row.id,
       name: row.name,
@@ -314,7 +410,36 @@ export class CustomerRepository {
       version: Number(row.version),
       createdAt: new Date(row.created_at).toISOString(),
       updatedAt: new Date(row.updated_at).toISOString(),
+      credit:
+        row.credit_limit === null || row.credit_currency === null
+          ? null
+          : {
+              enabled,
+              limit: this.money(row.credit_limit),
+              currency: row.credit_currency,
+              termDays: Number(row.credit_term_days),
+              maxInstallments: Number(row.credit_max_installments),
+              balance: this.fromMoneyCents(balance),
+              available: this.fromMoneyCents(available),
+              overdueAmount: this.fromMoneyCents(overdue),
+              status: !enabled
+                ? 'DISABLED'
+                : overdue > 0n
+                  ? 'OVERDUE'
+                  : available === 0n
+                    ? 'LIMIT_REACHED'
+                    : 'AVAILABLE',
+            },
     };
+  }
+
+  private toMoneyCents(value: string): bigint {
+    const [whole, fraction = ''] = value.split('.');
+    return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0').slice(0, 2));
+  }
+
+  private fromMoneyCents(value: bigint): string {
+    return `${value / 100n}.${(value % 100n).toString().padStart(2, '0')}`;
   }
 
   private normalize(value: string): string {

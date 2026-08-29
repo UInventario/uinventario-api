@@ -88,12 +88,12 @@ export interface OfflineCashSaleSnapshot {
   };
 }
 
-export type PaymentMethod = 'CASH' | 'CARD' | 'TRANSFER' | 'VOUCHER';
+export type PaymentMethod = 'CASH' | 'CARD' | 'TRANSFER' | 'VOUCHER' | 'CREDIT';
 
 export interface SalePaymentData {
   id: string;
   method: PaymentMethod;
-  status: 'COMPLETED' | 'REVERSED';
+  status: 'COMPLETED' | 'PENDING' | 'REVERSED';
   amountReceived: string;
   amountApplied: string;
   change: string;
@@ -135,12 +135,28 @@ export interface CashSaleData {
   };
   payment: SalePaymentData;
   payments: SalePaymentData[];
+  credit: SaleCreditPlanData | null;
   createdAt: string;
   void: {
     reason: string;
     user: { id: string; email: string };
     voidedAt: string;
   } | null;
+}
+
+export interface SaleCreditPlanData {
+  accountId: string;
+  originalAmount: string;
+  balance: string;
+  currency: string;
+  termDays: number;
+  status: 'OPEN' | 'OVERDUE' | 'PAID' | 'CANCELLED';
+  dueDate: string;
+  installments: Array<{
+    number: number;
+    dueDate: string;
+    amount: string;
+  }>;
 }
 
 export interface CashSaleResponse {

@@ -5,12 +5,15 @@ import {
   ArrayUnique,
   IsArray,
   IsIn,
+  IsInt,
   IsOptional,
   IsString,
   IsUUID,
   Matches,
   MaxLength,
   MinLength,
+  Max,
+  Min,
   ValidateNested,
 } from 'class-validator';
 import { QuoteCartLineDto, SaleDiscountDto } from './quote-cart.dto';
@@ -40,6 +43,14 @@ export class SalePaymentDto {
   @MaxLength(120)
   @Matches(/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/)
   reference?: string;
+}
+
+export class SaleCreditDto {
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(36)
+  installmentCount!: number;
 }
 
 export class CreateSaleDto {
@@ -84,4 +95,9 @@ export class CreateSaleDto {
   @ValidateNested({ each: true })
   @Type(() => SalePaymentDto)
   payments?: SalePaymentDto[];
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => SaleCreditDto)
+  credit?: SaleCreditDto;
 }

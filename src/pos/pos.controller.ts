@@ -316,6 +316,7 @@ export class PosController {
       idempotencyKey,
       dto,
       canDiscount: principal.user.permissions.includes('SALES_DISCOUNT'),
+      canCredit: principal.user.permissions.includes('SALES_CREDIT'),
       canViewMargin: principal.user.permissions.includes(
         'INVENTORY_VALUATION_MANAGE',
       ),

@@ -63,6 +63,10 @@ describe('UInventario API (e2e)', () => {
       'price_list_items',
       'sale_receipt_snapshots',
       'customer_credit_ledger',
+      'customer_debt_ledger',
+      'customer_credit_installments',
+      'customer_credit_accounts',
+      'customer_credit_profiles',
       'sale_return_settlements',
       'sale_return_lines',
       'sale_returns',
@@ -8924,6 +8928,315 @@ describe('UInventario API (e2e)', () => {
       await request(app.getHttpServer())
         .get(`/api/v1/customers/${customer.id}/history`)
         .set('Cookie', otherCookie)
+        .expect(404);
+    });
+
+    it('sells on customer credit within the locked limit and reverses debt on void', async () => {
+      const { cookie, productId, locationId } = await preparePos();
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Cliente crédito',
+          identifier: 'CREDIT-001',
+          dataProcessingConsent: false,
+        })
+        .expect(201);
+      const customer = (
+        customerResponse.body as {
+          data: { id: string; version: number };
+        }
+      ).data;
+      await request(app.getHttpServer())
+        .patch(`/api/v1/customers/${customer.id}/credit`)
+        .set('Cookie', cookie)
+        .send({
+          enabled: true,
+          creditLimit: '150.00',
+          currency: 'MXN',
+          termDays: 30,
+          maxInstallments: 3,
+          version: customer.version,
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              version: 2,
+              credit: {
+                enabled: true,
+                limit: '150.00',
+                balance: '0.00',
+                available: '150.00',
+                status: 'AVAILABLE',
+              },
+            },
+          });
+        });
+
+      const [creditRole] = await dataSource.query<
+        Array<{ role_id: string; tenant_id: string }>
+      >(
+        `SELECT r.id AS role_id, r.tenant_id FROM roles r
+         INNER JOIN users u ON u.tenant_id = r.tenant_id
+         WHERE r.code = 'ADMIN' AND u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'SALES_CREDIT'`,
+        [creditRole.role_id, creditRole.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'credit-forbidden')
+        .send({
+          customerId: customer.id,
+          lines: [{ productId, quantity: '1' }],
+          credit: { installmentCount: 1 },
+        })
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'SALES_CREDIT')`,
+        [creditRole.role_id, creditRole.tenant_id],
+      );
+
+      const payload = {
+        customerId: customer.id,
+        lines: [{ productId, quantity: '1' }],
+        credit: { installmentCount: 3 },
+      };
+      const attempts = await Promise.all(
+        ['credit-concurrent-a', 'credit-concurrent-b'].map((key) =>
+          request(app.getHttpServer())
+            .post('/api/v1/pos/sales')
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', key)
+            .send(payload),
+        ),
+      );
+      expect(attempts.map(({ status }) => status).sort()).toEqual([201, 409]);
+      expect(attempts.find(({ status }) => status === 409)?.body).toMatchObject(
+        {
+          code: 'CUSTOMER_CREDIT_LIMIT_EXCEEDED',
+          balance: '119.90',
+          limit: '150.00',
+        },
+      );
+      const completed = attempts.find(({ status }) => status === 201)!;
+      expect(completed.body).toMatchObject({
+        data: {
+          customer: { id: customer.id },
+          payment: {
+            method: 'CREDIT',
+            status: 'PENDING',
+            amountReceived: '0.00',
+            amountApplied: '119.90',
+          },
+          credit: {
+            originalAmount: '119.90',
+            balance: '119.90',
+            currency: 'MXN',
+            termDays: 30,
+            status: 'OPEN',
+            installments: [
+              { number: 1, amount: '39.97' },
+              { number: 2, amount: '39.97' },
+              { number: 3, amount: '39.96' },
+            ],
+          },
+        },
+      });
+      const successfulKey =
+        attempts[0].status === 201
+          ? 'credit-concurrent-a'
+          : 'credit-concurrent-b';
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', successfulKey)
+        .send(payload)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { idempotentReplay: true } });
+        });
+      await request(app.getHttpServer())
+        .get(`/api/v1/customers/${customer.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              credit: {
+                balance: '119.90',
+                available: '30.10',
+                overdueAmount: '0.00',
+              },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { expectedCash: '250.00' } });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/reports/sales-cash')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              summary: {
+                payments: [
+                  {
+                    method: 'CREDIT',
+                    status: 'PENDING',
+                    count: 1,
+                    amount: '119.90',
+                  },
+                ],
+                cash: { expected: '250.00' },
+                reconciliation: {
+                  salesNet: '119.90',
+                  paymentsApplied: '119.90',
+                  matches: true,
+                },
+              },
+            },
+          });
+        });
+      const saleId = (completed.body as { data: { id: string } }).data.id;
+      await dataSource.query(
+        `UPDATE customer_credit_installments
+         SET due_date = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+         WHERE tenant_id = ? AND account_id = (
+           SELECT id FROM customer_credit_accounts WHERE tenant_id = ? AND sale_id = ?
+         ) AND installment_number = 1`,
+        [creditRole.tenant_id, creditRole.tenant_id, saleId],
+      );
+      await request(app.getHttpServer())
+        .get(`/api/v1/customers/${customer.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              credit: {
+                balance: '119.90',
+                overdueAmount: '39.97',
+                status: 'OVERDUE',
+              },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'credit-sale-void')
+        .send({ reason: 'Crédito capturado por error' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              status: 'VOIDED',
+              payment: { method: 'CREDIT', status: 'REVERSED' },
+              credit: { balance: '0.00', status: 'CANCELLED' },
+            },
+          });
+        });
+      const [state] = await dataSource.query<
+        Array<{
+          balance: string;
+          stock: string;
+          sales: number | string;
+          debits: number | string;
+          credits: number | string;
+        }>
+      >(
+        `SELECT
+          (SELECT COALESCE(SUM(CASE WHEN entry_type = 'DEBIT' THEN amount ELSE -amount END), 0)
+           FROM customer_debt_ledger WHERE customer_id = ?) AS balance,
+          (SELECT quantity FROM inventory_balances
+           WHERE product_id = ? AND location_id = ?) AS stock,
+          (SELECT COUNT(*) FROM sales WHERE customer_id = ?) AS sales,
+          (SELECT COUNT(*) FROM customer_debt_ledger
+           WHERE customer_id = ? AND entry_type = 'DEBIT') AS debits,
+          (SELECT COUNT(*) FROM customer_debt_ledger
+           WHERE customer_id = ? AND entry_type = 'CREDIT') AS credits`,
+        [
+          customer.id,
+          productId,
+          locationId,
+          customer.id,
+          customer.id,
+          customer.id,
+        ],
+      );
+      expect({
+        balance: state.balance,
+        stock: state.stock,
+        sales: Number(state.sales),
+        debits: Number(state.debits),
+        credits: Number(state.credits),
+      }).toEqual({
+        balance: '0.00',
+        stock: '5.000',
+        sales: 1,
+        debits: 1,
+        credits: 1,
+      });
+
+      const other = {
+        organizationName: 'Otro tenant crédito',
+        email: 'other-credit@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'other-credit-registration')
+        .send(other)
+        .expect(201);
+      const otherCookie = await createPersistedSession(other.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Otro tenant crédito Legal',
+          tradeName: 'Otro tenant crédito',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Sucursal crédito',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega crédito',
+          locationName: 'General crédito',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Caja crédito' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .patch(`/api/v1/customers/${customer.id}/credit`)
+        .set('Cookie', otherCookie)
+        .send({
+          enabled: true,
+          creditLimit: '999.00',
+          currency: 'MXN',
+          termDays: 30,
+          maxInstallments: 3,
+          version: 2,
+        })
         .expect(404);
     });
 
