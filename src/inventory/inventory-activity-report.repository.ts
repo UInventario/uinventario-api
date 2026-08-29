@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { quantityFromUnits, quantityToUnits } from '../common/quantity-policy';
 import { DataSource } from 'typeorm';
 import type {
   InventoryActivityMovementsDto,
@@ -313,10 +314,12 @@ export class InventoryActivityReportRepository {
   }
 
   private mapRow(row: ActivityRow) {
-    const opening = Number(row.opening_quantity);
-    const closing = Number(row.closing_quantity);
-    const netSold = Number(row.net_sold_quantity);
-    const average = (opening + closing) / 2;
+    const opening = quantityToUnits(row.opening_quantity);
+    const closing = quantityToUnits(row.closing_quantity);
+    const netSold = quantityToUnits(row.net_sold_quantity);
+    const average = (opening + closing + 1n) / 2n;
+    const rotationUnits =
+      average > 0n ? (netSold * 10_000n + average / 2n) / average : null;
     return {
       product: {
         id: row.product_id,
@@ -328,14 +331,13 @@ export class InventoryActivityReportRepository {
       },
       openingQuantity: this.quantity(row.opening_quantity),
       closingQuantity: this.quantity(row.closing_quantity),
-      averageQuantity: this.quantity(String(average)),
+      averageQuantity: quantityFromUnits(average),
       netSoldQuantity: this.quantity(row.net_sold_quantity),
       lossQuantity: this.quantity(row.loss_quantity),
       activityQuantity: this.quantity(row.activity_quantity),
-      rotation:
-        average > 0 ? Math.round((netSold / average) * 10000) / 10000 : null,
+      rotation: rotationUnits === null ? null : Number(rotationUnits) / 10_000,
       status:
-        closing > 0 && netSold <= 0 ? ('SLOW' as const) : ('ACTIVE' as const),
+        closing > 0n && netSold <= 0n ? ('SLOW' as const) : ('ACTIVE' as const),
       lastMovementAt: row.last_movement_at
         ? new Date(row.last_movement_at).toISOString()
         : null,

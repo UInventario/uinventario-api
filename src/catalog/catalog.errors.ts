@@ -28,6 +28,12 @@ export class ProductLotTrackingLockedError extends Error {
   }
 }
 
+export class ProductQuantityPolicyLockedError extends Error {
+  constructor() {
+    super('PRODUCT_QUANTITY_POLICY_LOCKED');
+  }
+}
+
 export class ProductVariantConfigurationError extends Error {
   constructor(readonly reason: string) {
     super('PRODUCT_VARIANT_CONFIGURATION_INVALID');

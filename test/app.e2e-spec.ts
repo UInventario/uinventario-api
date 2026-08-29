@@ -2877,6 +2877,9 @@ describe('UInventario API (e2e)', () => {
                     sku: 'RECEIPTS-1',
                     active: true,
                     trackLots: false,
+                    baseUnit: 'UNIT',
+                    quantityPrecision: 3,
+                    minimumQuantity: '0.001',
                   },
                   totalQuantity: '7.000',
                   averageUnitCost: '80.7714',
@@ -4263,6 +4266,10 @@ describe('UInventario API (e2e)', () => {
         brandName: 'Casa',
         cost: '85.40',
         price: '119.90',
+        baseUnit: 'KILOGRAM',
+        quantityPrecision: 3,
+        quantityRounding: 'HALF_UP',
+        minimumQuantity: '0.050',
       };
       await request(app.getHttpServer())
         .post('/api/v1/products')
@@ -4284,6 +4291,10 @@ describe('UInventario API (e2e)', () => {
               brand: { name: product.brandName },
               cost: product.cost,
               price: product.price,
+              baseUnit: product.baseUnit,
+              quantityPrecision: product.quantityPrecision,
+              quantityRounding: product.quantityRounding,
+              minimumQuantity: product.minimumQuantity,
               active: true,
             },
           });
@@ -7756,6 +7767,10 @@ describe('UInventario API (e2e)', () => {
           barcode: '7501234500000',
           cost: '80.00',
           price: '119.90',
+          baseUnit: 'KILOGRAM',
+          quantityPrecision: 2,
+          quantityRounding: 'HALF_UP',
+          minimumQuantity: '0.250',
         })
         .expect(201);
       const productId = (productResponse.body as { data: { id: string } }).data
@@ -7783,6 +7798,33 @@ describe('UInventario API (e2e)', () => {
       }
       return { cookie, productId, locationId: location.id };
     }
+
+    it('normalizes weighed quantities before calculating money', async () => {
+      const { cookie, productId } = await preparePos();
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [{ productId, quantity: '1.235' }] })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  quantity: '1.240',
+                  product: {
+                    baseUnit: 'KILOGRAM',
+                    quantityPrecision: 2,
+                    minimumQuantity: '0.250',
+                  },
+                  total: '148.68',
+                },
+              ],
+            },
+          });
+        });
+    });
 
     it('resolves scoped price lists deterministically and snapshots the sale price', async () => {
       const { cookie, productId } = await preparePos();

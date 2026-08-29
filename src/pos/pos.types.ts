@@ -7,6 +7,10 @@ export interface PosProductSnapshot {
   trackLots: boolean;
   allowExpiredStockOverride?: boolean;
   trackSerials: boolean;
+  baseUnit?: import('../common/quantity-policy').ProductBaseUnit;
+  quantityPrecision?: number;
+  quantityRounding?: import('../common/quantity-policy').QuantityRoundingMode;
+  minimumQuantity?: string;
   availableQuantity: string;
 }
 
@@ -29,7 +33,14 @@ export interface PosCartQuoteResponse {
     taxRate: string;
     discount: PosAppliedDiscount | null;
     lines: Array<{
-      product: { id: string; name: string; sku: string };
+      product: {
+        id: string;
+        name: string;
+        sku: string;
+        baseUnit?: import('../common/quantity-policy').ProductBaseUnit;
+        quantityPrecision?: number;
+        minimumQuantity?: string;
+      };
       quantity: string;
       lotId: string | null;
       expiredLotOverrideReason?: string | null;

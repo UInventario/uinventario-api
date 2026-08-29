@@ -77,11 +77,16 @@ export class PosRepository {
           track_lots: number | boolean;
           allow_expired_stock_override: number | boolean;
           track_serials: number | boolean;
+          base_unit: PosProductSnapshot['baseUnit'];
+          quantity_precision: number;
+          quantity_rounding: PosProductSnapshot['quantityRounding'];
+          minimum_quantity: string;
           available_quantity: string;
         }>
       >(
         `SELECT p.id, p.name, p.sku, p.price, p.active, p.track_lots,
                 p.allow_expired_stock_override, p.track_serials,
+                p.base_unit, p.quantity_precision, p.quantity_rounding, p.minimum_quantity,
                 rl.quantity AS available_quantity
          FROM product_reservations r
          INNER JOIN product_reservation_lines rl
@@ -105,6 +110,10 @@ export class PosRepository {
           trackLots: Boolean(row.track_lots),
           allowExpiredStockOverride: Boolean(row.allow_expired_stock_override),
           trackSerials: Boolean(row.track_serials),
+          baseUnit: row.base_unit,
+          quantityPrecision: Number(row.quantity_precision),
+          quantityRounding: row.quantity_rounding,
+          minimumQuantity: row.minimum_quantity,
           availableQuantity: this.normalizeQuantity(row.available_quantity),
         })),
       );
@@ -119,11 +128,16 @@ export class PosRepository {
         track_lots: number | boolean;
         allow_expired_stock_override: number | boolean;
         track_serials: number | boolean;
+        base_unit: PosProductSnapshot['baseUnit'];
+        quantity_precision: number;
+        quantity_rounding: PosProductSnapshot['quantityRounding'];
+        minimum_quantity: string;
         available_quantity: string;
       }>
     >(
       `SELECT p.id, p.name, p.sku, p.price, p.active, p.track_lots,
               p.allow_expired_stock_override, p.track_serials,
+              p.base_unit, p.quantity_precision, p.quantity_rounding, p.minimum_quantity,
               COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.available_quantity ELSE 0 END), 0) AS available_quantity
        FROM products p
        LEFT JOIN inventory_balances ib ON ib.product_id = p.id AND ib.tenant_id = p.tenant_id
@@ -131,7 +145,8 @@ export class PosRepository {
        WHERE p.tenant_id = ? AND p.variant_schema IS NULL
          AND p.id IN (${placeholders})
        GROUP BY p.id, p.name, p.sku, p.price, p.active, p.track_lots,
-                p.allow_expired_stock_override, p.track_serials`,
+                p.allow_expired_stock_override, p.track_serials, p.base_unit,
+                p.quantity_precision, p.quantity_rounding, p.minimum_quantity`,
       [warehouseId, tenantId, ...productIds],
     );
     return this.capExpiredLotAvailability(
@@ -147,6 +162,10 @@ export class PosRepository {
         trackLots: Boolean(row.track_lots),
         allowExpiredStockOverride: Boolean(row.allow_expired_stock_override),
         trackSerials: Boolean(row.track_serials),
+        baseUnit: row.base_unit,
+        quantityPrecision: Number(row.quantity_precision),
+        quantityRounding: row.quantity_rounding,
+        minimumQuantity: row.minimum_quantity,
         availableQuantity: this.normalizeQuantity(row.available_quantity),
       })),
     );

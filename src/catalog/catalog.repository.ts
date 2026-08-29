@@ -9,6 +9,7 @@ import {
   ProductIdentifierConflictError,
   ProductVersionConflictError,
   ProductLotTrackingLockedError,
+  ProductQuantityPolicyLockedError,
   ProductVariantConfigurationError,
   ProductVariantsRequireZeroStockError,
 } from './catalog.errors';
@@ -24,12 +25,22 @@ import {
   UpdateCatalogClassificationDto,
 } from './dto/catalog-classification.dto';
 import { UpdateProductVariantsDto } from './dto/update-product-variants.dto';
+import {
+  assertProductQuantityPolicy,
+  quantityToUnits,
+  ProductBaseUnit,
+  QuantityRoundingMode,
+} from '../common/quantity-policy';
 
 interface ProductRow {
   id: string;
   name: string;
   sku: string;
   barcode: string | null;
+  base_unit: ProductBaseUnit;
+  quantity_precision: number;
+  quantity_rounding: QuantityRoundingMode;
+  minimum_quantity: string;
   track_lots: number | boolean;
   lot_expiration_policy: 'NONE' | 'OPTIONAL' | 'REQUIRED';
   lot_expiration_alert_days: number;
@@ -81,11 +92,12 @@ export class CatalogRepository {
         const id = randomUUID();
         await manager.query(
           `INSERT INTO products
-            (id, tenant_id, name, sku, normalized_sku, barcode, track_lots,
+            (id, tenant_id, name, sku, normalized_sku, barcode, base_unit,
+             quantity_precision, quantity_rounding, minimum_quantity, track_lots,
              lot_expiration_policy, lot_expiration_alert_days,
              allow_expired_stock_override, track_serials, category_id, brand_id,
              cost, price)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             id,
             tenantId,
@@ -93,6 +105,10 @@ export class CatalogRepository {
             dto.sku,
             this.normalize(dto.sku),
             dto.barcode ?? null,
+            dto.baseUnit ?? 'UNIT',
+            dto.quantityPrecision ?? (dto.trackSerials ? 0 : 3),
+            dto.quantityRounding ?? 'HALF_UP',
+            dto.minimumQuantity ?? (dto.trackSerials ? '1.000' : '0.001'),
             specificLotPolicy || (dto.trackLots ?? false),
             dto.lotExpirationPolicy ?? 'NONE',
             dto.lotExpirationAlertDays ?? 30,
@@ -148,11 +164,16 @@ export class CatalogRepository {
             lot_expiration_alert_days: number;
             allow_expired_stock_override: number | boolean;
             track_serials: number | boolean;
+            base_unit: ProductBaseUnit;
+            quantity_precision: number;
+            quantity_rounding: QuantityRoundingMode;
+            minimum_quantity: string;
             has_movements: number | string;
             specific_lot_policy: number | string;
           }>
         >(
-          `SELECT p.track_lots, p.track_serials,
+          `SELECT p.track_lots, p.track_serials, p.base_unit,
+                  p.quantity_precision, p.quantity_rounding, p.minimum_quantity,
                   EXISTS(SELECT 1 FROM inventory_movements im
                          WHERE im.tenant_id = p.tenant_id
                            AND (im.product_id = p.id OR im.product_id IN (
@@ -182,6 +203,39 @@ export class CatalogRepository {
         ) {
           throw new ProductLotTrackingLockedError();
         }
+        const nextQuantityPolicy = {
+          baseUnit:
+            dto.baseUnit ??
+            (dto.trackSerials === true ? 'UNIT' : currentTracking.base_unit),
+          precision:
+            dto.quantityPrecision ??
+            (dto.trackSerials === true
+              ? 0
+              : Number(currentTracking.quantity_precision)),
+          rounding: dto.quantityRounding ?? currentTracking.quantity_rounding,
+          minimumQuantity:
+            dto.minimumQuantity ??
+            (dto.trackSerials === true
+              ? '1.000'
+              : currentTracking.minimum_quantity),
+        };
+        assertProductQuantityPolicy(
+          nextQuantityPolicy,
+          dto.trackSerials ?? Boolean(currentTracking.track_serials),
+        );
+        const quantityPolicyChanged =
+          nextQuantityPolicy.baseUnit !== currentTracking.base_unit ||
+          nextQuantityPolicy.precision !==
+            Number(currentTracking.quantity_precision) ||
+          nextQuantityPolicy.rounding !== currentTracking.quantity_rounding ||
+          quantityToUnits(nextQuantityPolicy.minimumQuantity) !==
+            quantityToUnits(currentTracking.minimum_quantity);
+        if (
+          quantityPolicyChanged &&
+          Number(currentTracking.has_movements) === 1
+        ) {
+          throw new ProductQuantityPolicyLockedError();
+        }
         const categoryId = dto.categoryName
           ? await this.findOrCreateClassification(
               manager,
@@ -206,6 +260,10 @@ export class CatalogRepository {
                lot_expiration_alert_days = COALESCE(?, lot_expiration_alert_days),
                allow_expired_stock_override = COALESCE(?, allow_expired_stock_override),
                track_serials = COALESCE(?, track_serials),
+               base_unit = COALESCE(?, base_unit),
+               quantity_precision = COALESCE(?, quantity_precision),
+               quantity_rounding = COALESCE(?, quantity_rounding),
+               minimum_quantity = COALESCE(?, minimum_quantity),
                category_id = ?, brand_id = ?, cost = ?, price = ?, version = version + 1
            WHERE id = ? AND tenant_id = ? AND version = ?`,
           [
@@ -218,6 +276,10 @@ export class CatalogRepository {
             dto.lotExpirationAlertDays ?? null,
             dto.allowExpiredStockOverride ?? null,
             dto.trackSerials ?? null,
+            dto.baseUnit ?? (dto.trackSerials === true ? 'UNIT' : null),
+            dto.quantityPrecision ?? (dto.trackSerials === true ? 0 : null),
+            dto.quantityRounding ?? null,
+            dto.minimumQuantity ?? (dto.trackSerials === true ? '1.000' : null),
             categoryId,
             brandId,
             dto.cost,
@@ -241,6 +303,10 @@ export class CatalogRepository {
                child.lot_expiration_policy = parent.lot_expiration_policy,
                child.lot_expiration_alert_days = parent.lot_expiration_alert_days,
                child.allow_expired_stock_override = parent.allow_expired_stock_override,
+               child.base_unit = parent.base_unit,
+               child.quantity_precision = parent.quantity_precision,
+               child.quantity_rounding = parent.quantity_rounding,
+               child.minimum_quantity = parent.minimum_quantity,
                child.version = child.version + 1
            WHERE child.tenant_id = ? AND parent.id = ?`,
           [tenantId, id],
@@ -355,13 +421,18 @@ export class CatalogRepository {
             lot_expiration_alert_days: number;
             allow_expired_stock_override: number | boolean;
             track_serials: number | boolean;
+            base_unit: ProductBaseUnit;
+            quantity_precision: number;
+            quantity_rounding: QuantityRoundingMode;
+            minimum_quantity: string;
             active: number | boolean;
             version: number;
             parent_product_id: string | null;
             variant_schema: unknown;
           }>
         >(
-          `SELECT id, name, category_id, brand_id, track_lots,
+          `SELECT id, name, category_id, brand_id, track_lots, base_unit,
+                  quantity_precision, quantity_rounding, minimum_quantity,
                   lot_expiration_policy, lot_expiration_alert_days,
                   allow_expired_stock_override, track_serials, active,
                   version, parent_product_id, variant_schema
@@ -458,10 +529,12 @@ export class CatalogRepository {
             await manager.query(
               `INSERT INTO products
                 (id, tenant_id, parent_product_id, name, sku, normalized_sku, barcode,
-                 variant_values, track_lots, track_serials, category_id, brand_id,
+                 variant_values, track_lots, track_serials, base_unit,
+                 quantity_precision, quantity_rounding, minimum_quantity,
+                 category_id, brand_id,
                  lot_expiration_policy, lot_expiration_alert_days,
                  allow_expired_stock_override, cost, price, active)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 id,
                 tenantId,
@@ -473,6 +546,10 @@ export class CatalogRepository {
                 JSON.stringify(variantValues),
                 parent.track_lots,
                 parent.track_serials,
+                parent.base_unit,
+                parent.quantity_precision,
+                parent.quantity_rounding,
+                parent.minimum_quantity,
                 parent.category_id,
                 parent.brand_id,
                 parent.lot_expiration_policy,
@@ -786,7 +863,9 @@ export class CatalogRepository {
   }
 
   private productSelect(): string {
-    return `SELECT p.id, p.name, p.sku, p.barcode, p.track_lots,
+    return `SELECT p.id, p.name, p.sku, p.barcode, p.base_unit,
+                   p.quantity_precision, p.quantity_rounding, p.minimum_quantity,
+                   p.track_lots,
                    p.lot_expiration_policy, p.lot_expiration_alert_days,
                    p.allow_expired_stock_override, p.track_serials,
                    p.cost, p.price, p.active, p.version,
@@ -855,6 +934,10 @@ export class CatalogRepository {
       name: row.name,
       sku: row.sku,
       barcode: row.barcode,
+      baseUnit: row.base_unit,
+      quantityPrecision: Number(row.quantity_precision),
+      quantityRounding: row.quantity_rounding,
+      minimumQuantity: row.minimum_quantity,
       trackLots: Boolean(row.track_lots),
       lotExpirationPolicy: row.lot_expiration_policy,
       lotExpirationAlertDays: Number(row.lot_expiration_alert_days),

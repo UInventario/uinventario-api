@@ -11,6 +11,14 @@ import {
   Min,
   MinLength,
 } from 'class-validator';
+import {
+  PRODUCT_BASE_UNITS,
+  QUANTITY_ROUNDING_MODES,
+} from '../../common/quantity-policy';
+import type {
+  ProductBaseUnit,
+  QuantityRoundingMode,
+} from '../../common/quantity-policy';
 
 export const LOT_EXPIRATION_POLICIES = [
   'NONE',
@@ -43,6 +51,29 @@ export class CreateProductDto {
   @IsString()
   @Matches(/^[A-Za-z0-9][A-Za-z0-9._-]{3,63}$/)
   barcode?: string;
+
+  @IsOptional()
+  @IsIn(PRODUCT_BASE_UNITS)
+  baseUnit?: ProductBaseUnit;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(0)
+  @Max(3)
+  quantityPrecision?: number;
+
+  @IsOptional()
+  @IsIn(QUANTITY_ROUNDING_MODES)
+  quantityRounding?: QuantityRoundingMode;
+
+  @Transform(optionalTrim)
+  @IsOptional()
+  @IsString()
+  @Matches(
+    /^(?:[1-9]\d{0,11}(?:\.\d{1,3})?|0\.(?:00[1-9]|0[1-9]\d?|[1-9]\d{0,2}))$/,
+  )
+  minimumQuantity?: string;
 
   @IsOptional()
   @IsBoolean()

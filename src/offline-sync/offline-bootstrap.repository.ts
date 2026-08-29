@@ -133,6 +133,10 @@ export class OfflineBootstrapRepository {
         brand_name: string | null;
         brand_created_at: Date | string | null;
         price: string;
+        base_unit: import('../common/quantity-policy').ProductBaseUnit;
+        quantity_precision: number;
+        quantity_rounding: import('../common/quantity-policy').QuantityRoundingMode;
+        minimum_quantity: string;
         version: number;
         updated_at: Date | string;
       }>
@@ -140,7 +144,8 @@ export class OfflineBootstrapRepository {
       `SELECT p.id, p.name, p.sku, p.barcode, p.category_id,
               c.name AS category_name, c.created_at AS category_created_at,
               p.brand_id, br.name AS brand_name, br.created_at AS brand_created_at,
-              p.price, p.version, p.updated_at
+              p.price, p.base_unit, p.quantity_precision, p.quantity_rounding,
+              p.minimum_quantity, p.version, p.updated_at
        FROM products p
        LEFT JOIN categories c ON c.id = p.category_id AND c.tenant_id = p.tenant_id
        LEFT JOIN brands br ON br.id = p.brand_id AND br.tenant_id = p.tenant_id
@@ -185,6 +190,10 @@ export class OfflineBootstrapRepository {
         categoryId: product.category_id,
         brandId: product.brand_id,
         price: this.decimal(product.price, 2),
+        baseUnit: product.base_unit,
+        quantityPrecision: Number(product.quantity_precision),
+        quantityRounding: product.quantity_rounding,
+        minimumQuantity: this.decimal(product.minimum_quantity, 3),
         active: true,
       })),
     );

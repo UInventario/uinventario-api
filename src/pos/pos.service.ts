@@ -6,6 +6,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { normalizeProductQuantity } from '../common/quantity-policy';
 import type { ConfigType } from '@nestjs/config';
 import { createHash } from 'node:crypto';
 import { posConfig } from '../config/pos.config';
@@ -555,7 +556,25 @@ export class PosService {
         currency,
         productIds: [...requested.keys()],
       });
-      const preparedLines = [...requested.entries()].map(
+      const normalizedRequested = new Map(
+        [...requested.entries()].map(([productId, quantity]) => {
+          const product = productMap.get(productId);
+          if (!product)
+            throw new NotFoundException({ code: 'PRODUCT_NOT_FOUND' });
+          return [
+            productId,
+            this.toQuantityUnits(
+              normalizeProductQuantity(this.fromQuantityUnits(quantity), {
+                baseUnit: product.baseUnit ?? 'UNIT',
+                precision: product.quantityPrecision ?? 3,
+                rounding: product.quantityRounding ?? 'HALF_UP',
+                minimumQuantity: product.minimumQuantity ?? '0.001',
+              }),
+            ),
+          ] as const;
+        }),
+      );
+      const preparedLines = [...normalizedRequested.entries()].map(
         ([productId, quantityUnits]) => {
           const product = productMap.get(productId);
           if (!product)
@@ -620,7 +639,14 @@ export class PosService {
             grossCents,
           );
           return {
-            product: { id: product.id, name: product.name, sku: product.sku },
+            product: {
+              id: product.id,
+              name: product.name,
+              sku: product.sku,
+              baseUnit: product.baseUnit ?? 'UNIT',
+              quantityPrecision: product.quantityPrecision ?? 3,
+              minimumQuantity: product.minimumQuantity ?? '0.001',
+            },
             quantity: this.fromQuantityUnits(quantityUnits),
             lotId: requestedLots.get(productId) ?? null,
             expiredLotOverrideReason: expired ? expiredReason : null,

@@ -1,4 +1,10 @@
 import { Injectable } from '@nestjs/common';
+import {
+  normalizeProductQuantity,
+  ProductBaseUnit,
+  ProductQuantityPolicy,
+  QuantityRoundingMode,
+} from '../common/quantity-policy';
 import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
 import {
@@ -42,6 +48,9 @@ interface LineRow {
   product_id: string;
   product_name: string;
   product_sku: string;
+  base_unit: ProductBaseUnit;
+  quantity_precision: number;
+  minimum_quantity: string;
   snapshot_quantity: string;
   counted_quantity: string | null;
   variance_quantity: string | null;
@@ -238,7 +247,13 @@ export class InventoryCountRepository {
     countedQuantity: string;
     expectedAttempt: number;
   }): Promise<InventoryCountSessionData> {
-    const quantity = this.fromUnits(this.toUnits(input.countedQuantity));
+    const policy = await this.productQuantityPolicy(
+      input.tenantId,
+      input.productId,
+    );
+    const quantity = normalizeProductQuantity(input.countedQuantity, policy, {
+      enforceMinimum: false,
+    });
     await this.dataSource.transaction('READ COMMITTED', async (manager) => {
       const [session] = await manager.query<
         Array<{ status: 'OPEN' | 'CLOSED' }>
@@ -455,6 +470,7 @@ export class InventoryCountRepository {
 
     const lines = await manager.query<LineRow[]>(
       `SELECT line.id, line.product_id, p.name AS product_name, p.sku AS product_sku,
+              p.base_unit, p.quantity_precision, p.minimum_quantity,
               line.snapshot_quantity, line.counted_quantity, line.variance_quantity,
               line.attempt_count, counter.id AS counted_by_id,
               counter.email AS counted_by_email, line.counted_at, line.movement_id
@@ -500,6 +516,9 @@ export class InventoryCountRepository {
           id: line.product_id,
           name: line.product_name,
           sku: line.product_sku,
+          baseUnit: line.base_unit,
+          quantityPrecision: Number(line.quantity_precision),
+          minimumQuantity: line.minimum_quantity,
         },
         snapshotQuantity: hidden
           ? null
@@ -550,6 +569,31 @@ export class InventoryCountRepository {
 
   private fingerprint(value: object): string {
     return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  }
+
+  private async productQuantityPolicy(
+    tenantId: string,
+    productId: string,
+  ): Promise<ProductQuantityPolicy> {
+    const [row] = await this.dataSource.query<
+      Array<{
+        base_unit: ProductBaseUnit;
+        quantity_precision: number;
+        quantity_rounding: QuantityRoundingMode;
+        minimum_quantity: string;
+      }>
+    >(
+      `SELECT base_unit, quantity_precision, quantity_rounding, minimum_quantity
+       FROM products WHERE id = ? AND tenant_id = ? AND active = TRUE LIMIT 1`,
+      [productId, tenantId],
+    );
+    if (!row) throw new InventoryCountSessionNotFoundError();
+    return {
+      baseUnit: row.base_unit,
+      precision: Number(row.quantity_precision),
+      rounding: row.quantity_rounding,
+      minimumQuantity: row.minimum_quantity,
+    };
   }
 
   private toUnits(value: string): bigint {

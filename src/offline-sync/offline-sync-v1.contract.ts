@@ -100,6 +100,10 @@ export interface OfflineProductV1 extends OfflineSyncRecordV1 {
   categoryId: string | null;
   brandId: string | null;
   price: string;
+  baseUnit?: import('../common/quantity-policy').ProductBaseUnit;
+  quantityPrecision?: number;
+  quantityRounding?: import('../common/quantity-policy').QuantityRoundingMode;
+  minimumQuantity?: string;
   active: boolean;
 }
 
