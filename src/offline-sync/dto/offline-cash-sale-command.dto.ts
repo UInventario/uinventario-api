@@ -57,6 +57,10 @@ class OfflineCashSaleSnapshotTotalsDto {
 
   @IsOptional()
   @IsIn(['0.00'])
+  promotionDiscount?: '0.00';
+
+  @IsOptional()
+  @IsIn(['0.00'])
   saleDiscount?: '0.00';
 
   @IsOptional()
