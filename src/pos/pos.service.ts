@@ -16,6 +16,8 @@ import { QuoteCartDto, SaleDiscountDto } from './dto/quote-cart.dto';
 import { VoidSaleDto } from './dto/void-sale.dto';
 import {
   PosContextNotFoundError,
+  CustomerCreditLimitExceededError,
+  CustomerCreditNotAvailableError,
   PosCustomerNotAvailableError,
   PosIdempotencyConflictError,
   PosInsufficientStockError,
@@ -201,9 +203,22 @@ export class PosService {
     dto: CreateSaleDto;
     expectedSnapshot?: OfflineCashSaleSnapshot;
     canDiscount?: boolean;
+    canCredit?: boolean;
     canViewMargin?: boolean;
   }): Promise<CashSaleResponse> {
     this.assertIdempotencyKey(input.idempotencyKey);
+    if (input.dto.credit && !input.canCredit) {
+      throw new ForbiddenException({
+        code: 'CUSTOMER_CREDIT_PERMISSION_REQUIRED',
+        message: 'No tienes permiso para registrar ventas a crédito.',
+      });
+    }
+    if (input.dto.credit && !input.dto.customerId) {
+      throw new BadRequestException({
+        code: 'CUSTOMER_REQUIRED_FOR_CREDIT',
+        message: 'Selecciona un cliente para vender a crédito.',
+      });
+    }
     const fingerprint = this.saleFingerprint(input.dto);
     try {
       const replay = await this.sales.findByIdempotency(
@@ -260,6 +275,7 @@ export class PosService {
         reservationId: input.dto.reservationId ?? null,
         suspendedSaleId: input.dto.suspendedSaleId ?? null,
         payments,
+        credit: input.dto.credit ?? null,
       });
       return {
         data: this.applyMarginAccess(result.sale, input.canViewMargin),
@@ -310,6 +326,22 @@ export class PosService {
         throw new BadRequestException({
           code: 'POS_CUSTOMER_NOT_AVAILABLE',
           message: 'El cliente no existe o está inactivo.',
+        });
+      }
+      if (error instanceof CustomerCreditNotAvailableError) {
+        throw new ConflictException({
+          code: 'CUSTOMER_CREDIT_NOT_AVAILABLE',
+          reason: error.reason,
+          message:
+            'La configuración de crédito del cliente no permite esta venta.',
+        });
+      }
+      if (error instanceof CustomerCreditLimitExceededError) {
+        throw new ConflictException({
+          code: 'CUSTOMER_CREDIT_LIMIT_EXCEEDED',
+          balance: error.balance,
+          limit: error.limit,
+          message: 'La venta excede el límite de crédito disponible.',
         });
       }
       if (error instanceof PosReservationNotAvailableError) {
@@ -698,6 +730,15 @@ export class PosService {
     currency: string,
     idempotencyKey: string,
   ) {
+    if (dto.credit) {
+      if (dto.payment || dto.payments) {
+        throw new BadRequestException({
+          code: 'PAYMENT_CONFIGURATION_INVALID',
+          message: 'Una venta a crédito no puede incluir cobros inmediatos.',
+        });
+      }
+      return [];
+    }
     if ((!dto.payment && !dto.payments) || (dto.payment && dto.payments)) {
       throw new BadRequestException({
         code: 'PAYMENT_CONFIGURATION_INVALID',
@@ -837,6 +878,9 @@ export class PosService {
           reference: payment.reference ?? null,
         }),
       ),
+      credit: dto.credit
+        ? { installmentCount: dto.credit.installmentCount }
+        : null,
       customerId: dto.customerId ?? null,
       reservationId: dto.reservationId ?? null,
       suspendedSaleId: dto.suspendedSaleId ?? null,

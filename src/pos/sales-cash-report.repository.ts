@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import type { SalesCashReportDto } from './dto/sales-cash-report.dto';
-import type { PaymentMethod } from './dto/create-sale.dto';
+import type { PaymentMethod } from './pos.types';
 
 export interface BranchScope {
   id: string;
@@ -87,7 +87,7 @@ export class SalesCashReportRepository {
         this.dataSource.query<
           Array<{
             method: PaymentMethod;
-            status: 'COMPLETED' | 'REVERSED';
+            status: 'COMPLETED' | 'PENDING' | 'REVERSED';
             amount: string;
             count: number | string;
           }>
@@ -220,7 +220,7 @@ export class SalesCashReportRepository {
           Array<{
             sale_id: string;
             method: PaymentMethod;
-            status: 'COMPLETED' | 'REVERSED';
+            status: 'COMPLETED' | 'PENDING' | 'REVERSED';
             amount_applied: string;
             change_amount: string;
             external_reference: string | null;
@@ -235,7 +235,7 @@ export class SalesCashReportRepository {
     const total = totals[0];
     const cash = cashTotals[0];
     const paymentApplied = paymentTotals
-      .filter(({ status }) => status === 'COMPLETED')
+      .filter(({ status }) => status !== 'REVERSED')
       .reduce((sum, payment) => sum + this.cents(payment.amount), 0n);
     return {
       scope: branches,

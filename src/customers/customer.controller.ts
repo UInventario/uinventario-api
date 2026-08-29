@@ -20,6 +20,7 @@ import { CustomerService } from './customer.service';
 import { ListCustomersDto } from './dto/list-customers.dto';
 import { ListCustomerHistoryDto } from './dto/list-customer-history.dto';
 import { SaveCustomerDto, UpdateCustomerDto } from './dto/save-customer.dto';
+import { ConfigureCustomerCreditDto } from './dto/configure-customer-credit.dto';
 
 @Controller('customers')
 @UseGuards(SessionGuard, PermissionGuard)
@@ -111,6 +112,33 @@ export class CustomerController {
         active: result.data.active,
         dataProcessingConsent: result.data.dataProcessingConsent,
       },
+    });
+    return result;
+  }
+
+  @Patch(':id/credit')
+  @RequirePermissions('SALES_MANAGE', 'SALES_CREDIT')
+  async configureCredit(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: ConfigureCustomerCreditDto,
+  ) {
+    const before = await this.customers.get(request.principal.tenant.id, id);
+    const result = await this.customers.configureCredit(
+      request.principal.tenant.id,
+      id,
+      request.principal.user.id,
+      dto,
+    );
+    await this.audit.record({
+      tenantId: request.principal.tenant.id,
+      actorUserId: request.principal.user.id,
+      action: 'CUSTOMER_CREDIT_CONFIGURED',
+      entityType: 'CUSTOMER',
+      entityId: id,
+      correlationId: request.requestId!,
+      before: { credit: before.data.credit },
+      after: { credit: result.data.credit },
     });
     return result;
   }

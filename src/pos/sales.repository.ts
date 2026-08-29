@@ -7,6 +7,8 @@ import { applyInventorySerialTracking } from '../inventory/inventory-serial-trac
 import {
   PosIdempotencyConflictError,
   PaymentReferenceConflictError,
+  CustomerCreditLimitExceededError,
+  CustomerCreditNotAvailableError,
   PosCustomerNotAvailableError,
   PosInsufficientStockError,
   PosReservationNotAvailableError,
@@ -22,7 +24,7 @@ import {
   SaleDetailData,
   SaleSummaryData,
 } from './pos.types';
-import type { PaymentMethod } from './dto/create-sale.dto';
+import type { PaymentMethod } from './pos.types';
 import { AuditService } from '../audit/audit.service';
 import { SaleReceiptRepository } from './sale-receipt.repository';
 import { SuspendedSaleStateError } from './suspended-sale.errors';
@@ -428,13 +430,59 @@ export class SalesRepository {
             await applyInventoryLotTracking(manager, voidMovementId);
             await applyInventorySerialTracking(manager, voidMovementId);
           }
+          const [creditAccount] = await manager.query<
+            Array<{
+              id: string;
+              customer_id: string;
+              canceled_at: Date | string | null;
+              balance: string;
+            }>
+          >(
+            `SELECT cca.id, cca.customer_id, cca.canceled_at,
+                    COALESCE(SUM(CASE WHEN cdl.entry_type = 'DEBIT'
+                      THEN cdl.amount ELSE -cdl.amount END), 0) AS balance
+             FROM customer_credit_accounts cca
+             LEFT JOIN customer_debt_ledger cdl
+               ON cdl.account_id = cca.id AND cdl.tenant_id = cca.tenant_id
+             WHERE cca.tenant_id = ? AND cca.sale_id = ?
+             GROUP BY cca.id, cca.customer_id, cca.canceled_at
+             LIMIT 1 FOR UPDATE`,
+            [input.tenantId, sale.id],
+          );
+          if (creditAccount && !creditAccount.canceled_at) {
+            const balance = this.toMoney(creditAccount.balance);
+            if (balance > 0n) {
+              await manager.query(
+                `INSERT INTO customer_debt_ledger
+                  (id, tenant_id, customer_id, account_id, sale_id, entry_type,
+                   amount, reference_type, idempotency_key, created_by_user_id)
+                 VALUES (?, ?, ?, ?, ?, 'CREDIT', ?, 'VOID', ?, ?)`,
+                [
+                  randomUUID(),
+                  input.tenantId,
+                  creditAccount.customer_id,
+                  creditAccount.id,
+                  sale.id,
+                  this.money(balance),
+                  `sale-void:${input.idempotencyKey}`,
+                  input.userId,
+                ],
+              );
+            }
+            await manager.query(
+              `UPDATE customer_credit_accounts
+               SET canceled_at = CURRENT_TIMESTAMP(6)
+               WHERE id = ? AND tenant_id = ? AND canceled_at IS NULL`,
+              [creditAccount.id, input.tenantId],
+            );
+          }
           const paymentUpdate = await manager.query<{ affectedRows?: number }>(
             `UPDATE sale_payments
              SET status = 'REVERSED', reversed_by_user_id = ?, reversed_at = CURRENT_TIMESTAMP(6)
-             WHERE tenant_id = ? AND sale_id = ? AND status = 'COMPLETED'`,
+             WHERE tenant_id = ? AND sale_id = ? AND status IN ('COMPLETED', 'PENDING')`,
             [input.userId, input.tenantId, sale.id],
           );
-          if (Number(paymentUpdate.affectedRows ?? 0) !== 1) {
+          if (Number(paymentUpdate.affectedRows ?? 0) < 1) {
             throw new Error('SALE_VOID_PAYMENT_NOT_REVERSED');
           }
           const saleUpdate = await manager.query<{ affectedRows?: number }>(
@@ -462,12 +510,16 @@ export class SalesRepository {
             entityId: sale.id,
             correlationId: input.correlationId,
             deduplicate: true,
-            before: { status: 'COMPLETED', paymentStatus: 'COMPLETED' },
+            before: {
+              status: 'COMPLETED',
+              paymentStatus: creditAccount ? 'PENDING' : 'COMPLETED',
+            },
             after: {
               status: 'VOIDED',
               paymentStatus: 'REVERSED',
               reason: input.reason,
               restoredMovementCount: movements.length,
+              ...(creditAccount ? { creditReversed: true } : {}),
             },
           });
           return { saleId: sale.id, replay: false };
@@ -511,6 +563,7 @@ export class SalesRepository {
       providerReference: string | null;
       authorizationCode: string | null;
     }>;
+    credit?: { installmentCount: number } | null;
   }): Promise<{ sale: CashSaleData; replay: boolean }> {
     try {
       return await this.dataSource.transaction(
@@ -558,6 +611,12 @@ export class SalesRepository {
               throw new SuspendedSaleStateError(suspended.status);
           }
           let effectiveCustomerId = input.customerId ?? null;
+          let creditProfile: {
+            credit_limit: string;
+            currency: string;
+            term_days: number | string;
+            max_installments: number | string;
+          } | null = null;
           let reservedLocationId: string | null = null;
           const reservationLines = new Map<
             string,
@@ -621,13 +680,68 @@ export class SalesRepository {
             )
               throw new PosReservationNotAvailableError('LINES_MISMATCH');
           }
-          if (effectiveCustomerId && !input.reservationId) {
-            const [customer] = await manager.query<Array<{ id: string }>>(
-              `SELECT id FROM customers
-               WHERE id = ? AND tenant_id = ? AND active = TRUE FOR UPDATE`,
+          if (effectiveCustomerId) {
+            const [customer] = await manager.query<
+              Array<{
+                id: string;
+                enabled: number | boolean | null;
+                credit_limit: string | null;
+                currency: string | null;
+                term_days: number | string | null;
+                max_installments: number | string | null;
+              }>
+            >(
+              `SELECT c.id, ccp.enabled, ccp.credit_limit, ccp.currency,
+                      ccp.term_days, ccp.max_installments
+               FROM customers c
+               LEFT JOIN customer_credit_profiles ccp
+                 ON ccp.customer_id = c.id AND ccp.tenant_id = c.tenant_id
+               WHERE c.id = ? AND c.tenant_id = ? AND c.active = TRUE
+                 AND c.privacy_status = 'ACTIVE' FOR UPDATE`,
               [effectiveCustomerId, input.tenantId],
             );
             if (!customer) throw new PosCustomerNotAvailableError();
+            if (input.credit) {
+              if (
+                !customer.enabled ||
+                !customer.credit_limit ||
+                !customer.currency ||
+                customer.term_days === null ||
+                customer.max_installments === null
+              )
+                throw new CustomerCreditNotAvailableError('DISABLED');
+              if (customer.currency !== input.quote.currency)
+                throw new CustomerCreditNotAvailableError('CURRENCY');
+              if (
+                input.credit.installmentCount >
+                Number(customer.max_installments)
+              )
+                throw new CustomerCreditNotAvailableError('INSTALLMENTS');
+              creditProfile = {
+                credit_limit: customer.credit_limit,
+                currency: customer.currency,
+                term_days: customer.term_days,
+                max_installments: customer.max_installments,
+              };
+              const [exposure] = await manager.query<
+                Array<{ balance: string }>
+              >(
+                `SELECT COALESCE(SUM(CASE WHEN entry_type = 'DEBIT'
+                    THEN amount ELSE -amount END), 0) AS balance
+                 FROM customer_debt_ledger
+                 WHERE tenant_id = ? AND customer_id = ?`,
+                [input.tenantId, effectiveCustomerId],
+              );
+              const currentBalance = this.toMoney(exposure?.balance ?? '0');
+              const limit = this.toMoney(customer.credit_limit);
+              const requested = this.toMoney(input.quote.totals.total);
+              if (currentBalance + requested > limit) {
+                throw new CustomerCreditLimitExceededError(
+                  this.money(currentBalance),
+                  this.money(limit),
+                );
+              }
+            }
           }
           const [openShift] = await manager.query<Array<{ id: string }>>(
             `SELECT id FROM cash_register_shifts
@@ -927,6 +1041,88 @@ export class SalesRepository {
               });
             }
           }
+          let creditAccountId: string | null = null;
+          if (input.credit && effectiveCustomerId && creditProfile) {
+            creditAccountId = randomUUID();
+            const termDays = Number(creditProfile.term_days);
+            await manager.query(
+              `INSERT INTO customer_credit_accounts
+                (id, tenant_id, customer_id, sale_id, currency, original_amount,
+                 installment_count, term_days, due_date, created_by_user_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(CURRENT_DATE(), INTERVAL ? DAY), ?)`,
+              [
+                creditAccountId,
+                input.tenantId,
+                effectiveCustomerId,
+                saleId,
+                creditProfile.currency,
+                input.quote.totals.total,
+                input.credit.installmentCount,
+                termDays,
+                termDays,
+                input.userId,
+              ],
+            );
+            const totalCents = this.toMoney(input.quote.totals.total);
+            const count = BigInt(input.credit.installmentCount);
+            const baseAmount = totalCents / count;
+            const remainder = totalCents % count;
+            for (
+              let index = 0;
+              index < input.credit.installmentCount;
+              index++
+            ) {
+              const amount = baseAmount + (BigInt(index) < remainder ? 1n : 0n);
+              const dueOffset = Math.ceil(
+                (termDays * (index + 1)) / input.credit.installmentCount,
+              );
+              await manager.query(
+                `INSERT INTO customer_credit_installments
+                  (id, tenant_id, account_id, installment_number, due_date, amount)
+                 VALUES (?, ?, ?, ?, DATE_ADD(CURRENT_DATE(), INTERVAL ? DAY), ?)`,
+                [
+                  randomUUID(),
+                  input.tenantId,
+                  creditAccountId,
+                  index + 1,
+                  dueOffset,
+                  this.money(amount),
+                ],
+              );
+            }
+            await manager.query(
+              `INSERT INTO customer_debt_ledger
+                (id, tenant_id, customer_id, account_id, sale_id, entry_type,
+                 amount, reference_type, idempotency_key, created_by_user_id)
+               VALUES (?, ?, ?, ?, ?, 'DEBIT', ?, 'SALE', ?, ?)`,
+              [
+                randomUUID(),
+                input.tenantId,
+                effectiveCustomerId,
+                creditAccountId,
+                saleId,
+                input.quote.totals.total,
+                `sale-credit:${input.idempotencyKey}`,
+                input.userId,
+              ],
+            );
+            await manager.query(
+              `INSERT INTO sale_payments
+                (id, tenant_id, sale_id, method, provider, external_reference,
+                 provider_reference, authorization_code, authorization_status,
+                 currency, amount_received, amount_applied, change_amount, status)
+               VALUES (?, ?, ?, 'CREDIT', 'CUSTOMER_CREDIT', NULL, ?, NULL,
+                 'PENDING', ?, 0, ?, 0, 'PENDING')`,
+              [
+                randomUUID(),
+                input.tenantId,
+                saleId,
+                creditAccountId,
+                input.quote.currency,
+                input.quote.totals.total,
+              ],
+            );
+          }
           for (const payment of input.payments) {
             await manager.query(
               `INSERT INTO sale_payments
@@ -1068,7 +1264,7 @@ export class SalesRepository {
       Array<{
         id: string;
         method: PaymentMethod;
-        status: 'COMPLETED' | 'REVERSED';
+        status: 'COMPLETED' | 'PENDING' | 'REVERSED';
         amount_received: string;
         amount_applied: string;
         change_amount: string;
@@ -1094,6 +1290,78 @@ export class SalesRepository {
       authorizationCode: payment.authorization_code,
     }));
     if (!payments[0]) throw new Error('SALE_PAYMENT_NOT_FOUND');
+    const [creditAccount] = await manager.query<
+      Array<{
+        id: string;
+        currency: string;
+        original_amount: string;
+        term_days: number | string;
+        due_date: Date | string;
+        canceled_at: Date | string | null;
+        balance: string;
+        overdue_amount: string;
+      }>
+    >(
+      `SELECT cca.id, cca.currency, cca.original_amount, cca.term_days,
+              cca.due_date, cca.canceled_at,
+              COALESCE((SELECT SUM(CASE WHEN cdl.entry_type = 'DEBIT'
+                THEN cdl.amount ELSE -cdl.amount END)
+                FROM customer_debt_ledger cdl
+                WHERE cdl.account_id = cca.id AND cdl.tenant_id = cca.tenant_id), 0)
+                AS balance,
+              GREATEST(COALESCE((SELECT SUM(cci.amount)
+                FROM customer_credit_installments cci
+                WHERE cci.account_id = cca.id AND cci.tenant_id = cca.tenant_id
+                  AND cci.due_date < CURRENT_DATE()), 0)
+                - GREATEST(cca.original_amount - COALESCE((SELECT SUM(
+                  CASE WHEN cdl.entry_type = 'DEBIT' THEN cdl.amount ELSE -cdl.amount END)
+                  FROM customer_debt_ledger cdl
+                  WHERE cdl.account_id = cca.id AND cdl.tenant_id = cca.tenant_id), 0), 0), 0)
+                AS overdue_amount
+       FROM customer_credit_accounts cca
+       WHERE cca.tenant_id = ? AND cca.sale_id = ?
+       LIMIT 1`,
+      [tenantId, row.id],
+    );
+    const creditInstallments = creditAccount
+      ? await manager.query<
+          Array<{
+            installment_number: number | string;
+            due_date: Date | string;
+            amount: string;
+          }>
+        >(
+          `SELECT installment_number, due_date, amount
+           FROM customer_credit_installments
+           WHERE tenant_id = ? AND account_id = ?
+           ORDER BY installment_number`,
+          [tenantId, creditAccount.id],
+        )
+      : [];
+    const creditBalance = this.toMoney(creditAccount?.balance ?? '0');
+    const creditOverdue = this.toMoney(creditAccount?.overdue_amount ?? '0');
+    const credit = creditAccount
+      ? {
+          accountId: creditAccount.id,
+          originalAmount: this.decimal(creditAccount.original_amount, 2),
+          balance: this.money(creditBalance),
+          currency: creditAccount.currency,
+          termDays: Number(creditAccount.term_days),
+          status: creditAccount.canceled_at
+            ? ('CANCELLED' as const)
+            : creditBalance <= 0n
+              ? ('PAID' as const)
+              : creditOverdue > 0n
+                ? ('OVERDUE' as const)
+                : ('OPEN' as const),
+          dueDate: this.date(creditAccount.due_date),
+          installments: creditInstallments.map((installment) => ({
+            number: Number(installment.installment_number),
+            dueDate: this.date(installment.due_date),
+            amount: this.decimal(installment.amount, 2),
+          })),
+        }
+      : null;
     const grossProfit = lines.reduce(
       (sum, line) =>
         sum +
@@ -1194,6 +1462,7 @@ export class SalesRepository {
         },
         payment: payments[0],
         payments,
+        credit,
         createdAt: new Date(row.created_at).toISOString(),
         void:
           row.voided_by_user_id &&
@@ -1230,6 +1499,11 @@ export class SalesRepository {
   private decimal(value: string, scale: number): string {
     const [whole, fraction = ''] = value.split('.');
     return `${whole}.${fraction.padEnd(scale, '0').slice(0, scale)}`;
+  }
+
+  private date(value: Date | string): string {
+    if (value instanceof Date) return value.toISOString().slice(0, 10);
+    return String(value).slice(0, 10);
   }
 
   private toQuantityUnits(value: string): bigint {
