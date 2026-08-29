@@ -92,6 +92,8 @@ interface ReceiptLineRow {
   purchase_order_line_id: string;
   received_quantity: string;
   lot_code: string | null;
+  manufactured_on: string | Date | null;
+  expires_on: string | Date | null;
   overage_quantity: string;
   unit_cost: string;
   total_cost: string;
@@ -539,7 +541,8 @@ export class PurchaseOrderRepository {
     const receiptLines = receipts.length
       ? await manager.query<ReceiptLineRow[]>(
           `SELECT prl.id, prl.receipt_id, prl.purchase_order_line_id,
-                  prl.received_quantity, prl.lot_code, prl.overage_quantity, prl.unit_cost,
+                  prl.received_quantity, prl.lot_code, prl.manufactured_on,
+                  prl.expires_on, prl.overage_quantity, prl.unit_cost,
                   prl.total_cost, prl.previous_catalog_cost,
                   prl.resulting_catalog_cost,
                   COALESCE((SELECT SUM(returned_quantity)
@@ -635,6 +638,8 @@ export class PurchaseOrderRepository {
               purchaseOrderLineId: line.purchase_order_line_id,
               receivedQuantity: line.received_quantity,
               lotCode: line.lot_code,
+              manufacturedOn: this.dateOnly(line.manufactured_on),
+              expiresOn: this.dateOnly(line.expires_on),
               overageQuantity: line.overage_quantity,
               unitCost: line.unit_cost,
               totalCost: line.total_cost,
@@ -801,5 +806,12 @@ export class PurchaseOrderRepository {
 
   private dateTime(value: Date | string | null): string | null {
     return value ? new Date(value).toISOString() : null;
+  }
+
+  private dateOnly(value: Date | string | null): string | null {
+    if (!value) return null;
+    return value instanceof Date
+      ? value.toISOString().slice(0, 10)
+      : value.slice(0, 10);
   }
 }

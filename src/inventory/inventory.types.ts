@@ -127,6 +127,11 @@ export interface InventoryLotData {
   unitCost: string;
   currency: string;
   inventoryValue: string;
+  manufacturedOn: string | null;
+  expiresOn: string | null;
+  expirationStatus:
+    'NO_EXPIRATION' | 'ACTIVE' | 'EXPIRING' | 'EXPIRED' | 'EXHAUSTED';
+  daysUntilExpiration: number | null;
   createdAt: string;
   origins: Array<{
     purchaseReceiptLineId: string;
@@ -140,6 +145,21 @@ export interface InventoryLotData {
     location: InventoryLocationData;
     quantity: string;
   }>;
+}
+
+export interface InventoryLotExpirationAlertData {
+  id: string;
+  status: 'EXPIRING' | 'EXPIRED';
+  product: { id: string; name: string; sku: string };
+  lot: { id: string; code: string; expiresOn: string };
+  location: InventoryLocationData;
+  quantity: string;
+  daysUntilExpiration: number;
+}
+
+export interface InventoryLotExpirationAlertsResponse {
+  data: InventoryLotExpirationAlertData[];
+  meta: { apiVersion: '1'; businessDate: string };
 }
 
 export interface InventoryLotsResponse {

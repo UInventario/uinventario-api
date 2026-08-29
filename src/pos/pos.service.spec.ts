@@ -4,6 +4,112 @@ import { PosService } from './pos.service';
 import { CashRegisterShiftService } from './cash-register-shift.service';
 
 describe('PosService', () => {
+  const expirationService = () => {
+    const productId = '7efc799b-2086-4cb6-808d-bfa682543757';
+    const lotId = '6a5ec4cd-a854-4fb1-85d7-9ed7c98279c1';
+    const repository = {
+      getContext: jest.fn().mockResolvedValue({
+        countryCode: 'MX',
+        timezone: 'America/Mexico_City',
+        branch: { id: 'branch', name: 'Sucursal' },
+        warehouse: { id: 'warehouse', name: 'Bodega' },
+        cashRegister: { id: 'register', name: 'Caja', code: 'MAIN' },
+      }),
+      getProducts: jest.fn().mockResolvedValue([
+        {
+          id: productId,
+          name: 'Producto',
+          sku: 'PRODUCTO-1',
+          price: '10.00',
+          active: true,
+          trackLots: true,
+          trackSerials: false,
+          availableQuantity: '5.000',
+        },
+      ]),
+      getSelectedLotAvailability: jest.fn().mockResolvedValue(
+        new Map([
+          [
+            `${productId}:${lotId}`,
+            {
+              quantity: '5.000',
+              expiresOn: '2000-01-01',
+              allowExpiredStockOverride: true,
+            },
+          ],
+        ]),
+      ),
+    };
+    const service = new PosService(
+      repository as unknown as PosRepository,
+      {} as SalesRepository,
+      {
+        requireCurrent: jest.fn().mockResolvedValue({ id: 'shift' }),
+      } as unknown as CashRegisterShiftService,
+      { enabledMethods: jest.fn().mockReturnValue(['CASH']) } as never,
+      { resolve: jest.fn().mockResolvedValue(new Map()) } as never,
+      {
+        taxRates: { MX: '0.1600', DEFAULT: '0.0000' },
+        nonCashProvider: 'DISABLED',
+        paymentMethods: ['CASH'],
+      },
+    );
+    return { service, productId, lotId };
+  };
+
+  it('requires the expiration override permission for an expired lot', async () => {
+    const { service, productId, lotId } = expirationService();
+
+    await expect(
+      service.quoteCart({
+        tenantId: 'tenant',
+        branchId: 'branch',
+        warehouseId: 'warehouse',
+        cashRegisterId: 'register',
+        userId: 'user',
+        dto: {
+          lines: [
+            {
+              productId,
+              lotId,
+              quantity: '1',
+              expiredLotOverrideReason: 'Autorización sanitaria documentada',
+            },
+          ],
+        },
+      }),
+    ).rejects.toMatchObject({
+      response: { code: 'EXPIRED_INVENTORY_LOT_PERMISSION_REQUIRED' },
+    });
+  });
+
+  it('records the reason when an authorized user overrides an expired lot', async () => {
+    const { service, productId, lotId } = expirationService();
+
+    const quote = await service.quoteCart({
+      tenantId: 'tenant',
+      branchId: 'branch',
+      warehouseId: 'warehouse',
+      cashRegisterId: 'register',
+      userId: 'user',
+      canOverrideExpired: true,
+      dto: {
+        lines: [
+          {
+            productId,
+            lotId,
+            quantity: '1',
+            expiredLotOverrideReason: 'Autorización sanitaria documentada',
+          },
+        ],
+      },
+    });
+
+    expect(quote.data.lines[0].expiredLotOverrideReason).toBe(
+      'Autorización sanitaria documentada',
+    );
+  });
+
   it('selects the tenant country tax rate without changing the final sale price', async () => {
     const repository = {
       getContext: jest.fn().mockResolvedValue({

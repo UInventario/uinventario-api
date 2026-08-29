@@ -478,6 +478,7 @@ export class SalesQuotationRepository {
         },
         quantity: this.decimal(line.quantity, 3),
         lotId: line.lot_id,
+        expiredLotOverrideReason: null,
         serialNumbers: this.json(line.serial_numbers),
         availableQuantity: this.decimal(line.available_quantity, 3),
         unitPrice: this.decimal(line.unit_price, 2),

@@ -76,6 +76,24 @@ export class InventoryLotCurrencyMismatchError extends Error {
   }
 }
 
+export class InvalidInventoryLotDatesError extends Error {
+  constructor() {
+    super('INVALID_INVENTORY_LOT_DATES');
+  }
+}
+
+export class InventoryLotExpirationRequiredError extends Error {
+  constructor() {
+    super('INVENTORY_LOT_EXPIRATION_REQUIRED');
+  }
+}
+
+export class ExpiredInventoryLotError extends Error {
+  constructor() {
+    super('EXPIRED_INVENTORY_LOT');
+  }
+}
+
 export class InventoryFifoLayerShortageError extends Error {
   constructor() {
     super('INVENTORY_FIFO_LAYER_SHORTAGE');

@@ -5,6 +5,7 @@ export interface PosProductSnapshot {
   price: string;
   active: boolean;
   trackLots: boolean;
+  allowExpiredStockOverride?: boolean;
   trackSerials: boolean;
   availableQuantity: string;
 }
@@ -22,6 +23,7 @@ export interface PosCartQuoteResponse {
       branch: { id: string; name: string };
       warehouse: { id: string; name: string };
       cashRegister: { id: string; name: string; code: string };
+      businessDate?: string;
     };
     currency: string;
     taxRate: string;
@@ -30,6 +32,7 @@ export interface PosCartQuoteResponse {
       product: { id: string; name: string; sku: string };
       quantity: string;
       lotId: string | null;
+      expiredLotOverrideReason?: string | null;
       serialNumbers: string[];
       availableQuantity: string;
       unitPrice: string;
@@ -117,6 +120,7 @@ export interface CashSaleData {
     id: string;
     product: { id: string; name: string; sku: string };
     quantity: string;
+    expiredLotOverrideReason: string | null;
     unitPrice: string;
     priceSource: 'BASE' | 'PRICE_LIST';
     priceList: { id: string; name: string } | null;

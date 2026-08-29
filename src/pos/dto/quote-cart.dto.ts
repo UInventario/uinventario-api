@@ -1,4 +1,4 @@
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize,
   ArrayMinSize,
@@ -44,6 +44,15 @@ export class QuoteCartLineDto {
   @IsUUID()
   @IsOptional()
   lotId?: string;
+
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : value,
+  )
+  @IsOptional()
+  @IsString()
+  @MinLength(3)
+  @MaxLength(240)
+  expiredLotOverrideReason?: string;
 
   @IsOptional()
   @IsArray()

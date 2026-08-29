@@ -268,6 +268,9 @@ export class PosController {
       userId: principal.user.id,
       dto,
       canDiscount: principal.user.permissions.includes('SALES_DISCOUNT'),
+      canOverrideExpired: principal.user.permissions.includes(
+        'INVENTORY_EXPIRED_STOCK_OVERRIDE',
+      ),
     });
   }
 
@@ -287,6 +290,9 @@ export class PosController {
       idempotencyKey,
       dto,
       canDiscount: principal.user.permissions.includes('SALES_DISCOUNT'),
+      canOverrideExpired: principal.user.permissions.includes(
+        'INVENTORY_EXPIRED_STOCK_OVERRIDE',
+      ),
       canViewMargin: principal.user.permissions.includes(
         'INVENTORY_VALUATION_MANAGE',
       ),
@@ -302,6 +308,7 @@ export class PosController {
       after: {
         discountTotal: result.data.totals.discount,
         discountReasons: this.discountReasons(result.data),
+        expiredLotOverrides: this.expiredLotOverrides(result.data),
       },
     });
     if (dto.reservationId) {
@@ -335,6 +342,9 @@ export class PosController {
       idempotencyKey,
       dto,
       canDiscount: principal.user.permissions.includes('SALES_DISCOUNT'),
+      canOverrideExpired: principal.user.permissions.includes(
+        'INVENTORY_EXPIRED_STOCK_OVERRIDE',
+      ),
       canCredit: principal.user.permissions.includes('SALES_CREDIT'),
       canViewMargin: principal.user.permissions.includes(
         'INVENTORY_VALUATION_MANAGE',
@@ -352,6 +362,7 @@ export class PosController {
         paymentMethods: result.data.payments.map((payment) => payment.method),
         discountTotal: result.data.totals.discount,
         discountReasons: this.discountReasons(result.data),
+        expiredLotOverrides: this.expiredLotOverrides(result.data),
       },
     });
     if (dto.reservationId) {
@@ -385,6 +396,21 @@ export class PosController {
       sale.discount?.reason,
       ...sale.lines.map((line) => line.discount.line?.reason),
     ].filter((reason): reason is string => Boolean(reason));
+  }
+
+  private expiredLotOverrides(
+    sale: Awaited<ReturnType<PosService['createSale']>>['data'],
+  ): Array<{ productId: string; reason: string }> {
+    return sale.lines.flatMap((line) =>
+      line.expiredLotOverrideReason
+        ? [
+            {
+              productId: line.product.id,
+              reason: line.expiredLotOverrideReason,
+            },
+          ]
+        : [],
+    );
   }
 
   private async auditCashMovement(

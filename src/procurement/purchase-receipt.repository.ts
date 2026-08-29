@@ -52,6 +52,8 @@ export class PurchaseReceiptRepository {
       purchaseOrderLineId: line.purchaseOrderLineId,
       receivedQuantity: this.fromUnits(this.toUnits(line.receivedQuantity)),
       lotCode: line.lotCode ?? null,
+      manufacturedOn: line.manufacturedOn ?? null,
+      expiresOn: line.expiresOn ?? null,
       serialNumbers: line.serialNumbers ?? [],
     }));
     const fingerprint = createHash('sha256')
@@ -138,6 +140,8 @@ export class PurchaseReceiptRepository {
               received,
               overage,
               lotCode: line.lotCode ?? null,
+              manufacturedOn: line.manufacturedOn,
+              expiresOn: line.expiresOn,
               serialNumbers: line.serialNumbers,
             };
           });
@@ -232,9 +236,10 @@ export class PurchaseReceiptRepository {
             await manager.query(
               `INSERT INTO purchase_receipt_lines
                 (id, tenant_id, receipt_id, purchase_order_line_id, line_number,
-                 received_quantity, lot_code, overage_quantity, unit_cost, total_cost,
-                 previous_catalog_cost, resulting_catalog_cost)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 received_quantity, lot_code, manufactured_on, expires_on,
+                 overage_quantity, unit_cost, total_cost, previous_catalog_cost,
+                 resulting_catalog_cost)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 receiptLineId,
                 input.tenantId,
@@ -243,6 +248,8 @@ export class PurchaseReceiptRepository {
                 index + 1,
                 this.fromUnits(item.received),
                 item.lotCode,
+                item.manufacturedOn,
+                item.expiresOn,
                 this.fromUnits(item.overage),
                 item.orderLine.unit_cost,
                 this.receiptCost(item.received, item.orderLine.unit_cost),

@@ -802,7 +802,17 @@ export class SalesRepository {
               }>
             >(
               `SELECT ib.location_id, ib.quantity, ib.available_quantity, ib.reserved_quantity,
-                      CASE WHEN ? IS NULL THEN NULL ELSE COALESCE((
+                      CASE WHEN ? IS NULL THEN
+                        CASE WHEN p.track_lots THEN COALESCE((
+                          SELECT SUM(ilb.quantity) FROM inventory_lot_balances ilb
+                          INNER JOIN inventory_lots il
+                            ON il.id = ilb.lot_id AND il.tenant_id = ilb.tenant_id
+                          WHERE ilb.tenant_id = ib.tenant_id
+                            AND ilb.location_id = ib.location_id
+                            AND il.product_id = ib.product_id
+                            AND (il.expires_on IS NULL OR il.expires_on >= ?)
+                        ), 0) ELSE NULL END
+                      ELSE COALESCE((
                         SELECT ilb.quantity FROM inventory_lot_balances ilb
                         INNER JOIN inventory_lots il
                           ON il.id = ilb.lot_id AND il.tenant_id = ilb.tenant_id
@@ -813,11 +823,14 @@ export class SalesRepository {
 
              FROM inventory_balances ib
              INNER JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
+             INNER JOIN products p ON p.id = ib.product_id AND p.tenant_id = ib.tenant_id
              WHERE ib.tenant_id = ? AND ib.product_id = ? AND l.warehouse_id = ?
                AND (? IS NULL OR ib.location_id = ?)
              ORDER BY l.created_at, l.id FOR UPDATE`,
               [
                 line.lotId,
+                input.quote.context.businessDate ??
+                  new Date().toISOString().slice(0, 10),
                 line.lotId,
                 input.tenantId,
                 line.product.id,
@@ -836,7 +849,7 @@ export class SalesRepository {
                   : balance.available_quantity,
               );
               const lotAvailable =
-                line.lotId && balance.lot_quantity !== null
+                balance.lot_quantity !== null
                   ? this.toQuantityUnits(balance.lot_quantity)
                   : available;
               const total = this.toQuantityUnits(balance.quantity);
@@ -954,8 +967,8 @@ export class SalesRepository {
                product_sku, quantity, unit_price, price_source, price_list_id,
                price_list_name, unit_cost, gross_total, line_discount_total,
                sale_discount_total, discount_total, discount_type, discount_value,
-               discount_reason, subtotal, tax, total)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               discount_reason, expired_lot_override_reason, subtotal, tax, total)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 saleLineId,
                 input.tenantId,
@@ -977,6 +990,7 @@ export class SalesRepository {
                 line.discount.line?.type ?? null,
                 line.discount.line?.value ?? null,
                 line.discount.line?.reason ?? null,
+                line.expiredLotOverrideReason,
                 line.subtotal,
                 line.tax,
                 line.total,
@@ -1039,6 +1053,7 @@ export class SalesRepository {
               await applyInventoryValuation(manager, movementId);
               await applyInventoryLotTracking(manager, movementId, {
                 preferredLotId: line.lotId ?? undefined,
+                allowExpired: Boolean(line.expiredLotOverrideReason),
               });
               await applyInventorySerialTracking(manager, movementId, {
                 serialNumbers: allocation.serialNumbers,
@@ -1253,6 +1268,7 @@ export class SalesRepository {
         discount_type: 'PERCENT' | 'AMOUNT' | null;
         discount_value: string | null;
         discount_reason: string | null;
+        expired_lot_override_reason: string | null;
         subtotal: string;
         tax: string;
         total: string;
@@ -1262,6 +1278,7 @@ export class SalesRepository {
               price_source, price_list_id, price_list_name, unit_cost,
               gross_total, line_discount_total, sale_discount_total,
               discount_total, discount_type, discount_value, discount_reason,
+              expired_lot_override_reason,
               subtotal, tax, total
        FROM sale_lines WHERE tenant_id = ? AND sale_id = ? ORDER BY line_number`,
       [tenantId, row.id],
@@ -1422,6 +1439,7 @@ export class SalesRepository {
             sku: line.product_sku,
           },
           quantity: this.decimal(line.quantity, 3),
+          expiredLotOverrideReason: line.expired_lot_override_reason,
           unitPrice: this.decimal(line.unit_price, 2),
           priceSource: line.price_source,
           priceList: line.price_list_id

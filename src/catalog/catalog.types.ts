@@ -4,6 +4,9 @@ export interface ProductData {
   sku: string;
   barcode: string | null;
   trackLots: boolean;
+  lotExpirationPolicy?: 'NONE' | 'OPTIONAL' | 'REQUIRED';
+  lotExpirationAlertDays?: number;
+  allowExpiredStockOverride?: boolean;
   trackSerials: boolean;
   category: { id: string; name: string } | null;
   brand: { id: string; name: string } | null;

@@ -4,8 +4,11 @@ import {
   InsufficientInventoryLotStockError,
   InvalidInventoryLotCodeError,
   InventoryLotCurrencyMismatchError,
+  InvalidInventoryLotDatesError,
+  InventoryLotExpirationRequiredError,
   InventoryLotNotFoundError,
   InventoryLotRequiredError,
+  ExpiredInventoryLotError,
 } from './inventory.errors';
 import { finalizeSpecificLotMovementValuation } from './inventory-valuation-policy';
 
@@ -26,13 +29,16 @@ interface MovementLotRow {
   source_sale_movement_id: string | null;
   transfer_line_id: string | null;
   track_lots: number | boolean;
+  lot_expiration_policy: 'NONE' | 'OPTIONAL' | 'REQUIRED';
   unit_cost: string | null;
   country_code: string;
+  timezone: string;
 }
 
 interface LotBalanceRow {
   lot_id: string;
   quantity: string;
+  expires_on: string | Date | null;
 }
 
 const SCALE = 1000n;
@@ -98,6 +104,35 @@ function normalizeLotCode(value: string): string {
     throw new InvalidInventoryLotCodeError();
   }
   return code;
+}
+
+function normalizedDate(value?: string | null): string | null {
+  if (!value) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value))
+    throw new InvalidInventoryLotDatesError();
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (
+    Number.isNaN(parsed.valueOf()) ||
+    parsed.toISOString().slice(0, 10) !== value
+  )
+    throw new InvalidInventoryLotDatesError();
+  return value;
+}
+
+export function inventoryLocalDate(timezone: string, now = new Date()): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(now);
+}
+
+function rowDate(value: string | Date | null): string | null {
+  if (!value) return null;
+  return value instanceof Date
+    ? value.toISOString().slice(0, 10)
+    : value.slice(0, 10);
 }
 
 async function changeLotBalance(
@@ -190,14 +225,27 @@ async function findOrCreateLot(
   rawCode: string,
   unitCost: string,
   currency: string,
+  manufacturedOn?: string | null,
+  expiresOn?: string | null,
 ): Promise<string> {
   const code = normalizeLotCode(rawCode);
   const normalizedCode = code.toUpperCase();
-  await manager.query(
-    `SELECT id FROM products
+  const manufactured = normalizedDate(manufacturedOn);
+  const expires = normalizedDate(expiresOn);
+  if (manufactured && expires && manufactured > expires)
+    throw new InvalidInventoryLotDatesError();
+  const [product] = await manager.query<
+    Array<{ lot_expiration_policy: 'NONE' | 'OPTIONAL' | 'REQUIRED' }>
+  >(
+    `SELECT lot_expiration_policy FROM products
      WHERE id = ? AND tenant_id = ? FOR UPDATE`,
     [movement.product_id, movement.tenant_id],
   );
+  if (!product) throw new InventoryLotNotFoundError();
+  if (product.lot_expiration_policy === 'REQUIRED' && !expires)
+    throw new InventoryLotExpirationRequiredError();
+  if (product.lot_expiration_policy === 'NONE' && (manufactured || expires))
+    throw new InvalidInventoryLotDatesError();
   const [productCurrency] = await manager.query<Array<{ currency: string }>>(
     `SELECT currency FROM inventory_lots
      WHERE tenant_id = ? AND product_id = ?
@@ -208,9 +256,14 @@ async function findOrCreateLot(
     throw new InventoryLotCurrencyMismatchError();
   }
   const [existing] = await manager.query<
-    Array<{ id: string; currency: string }>
+    Array<{
+      id: string;
+      currency: string;
+      manufactured_on: string | Date | null;
+      expires_on: string | Date | null;
+    }>
   >(
-    `SELECT id, currency FROM inventory_lots
+    `SELECT id, currency, manufactured_on, expires_on FROM inventory_lots
      WHERE tenant_id = ? AND product_id = ? AND normalized_code = ?
      FOR UPDATE`,
     [movement.tenant_id, movement.product_id, normalizedCode],
@@ -218,20 +271,27 @@ async function findOrCreateLot(
   if (existing) {
     if (existing.currency !== currency)
       throw new InventoryLotCurrencyMismatchError();
+    if (
+      rowDate(existing.manufactured_on) !== manufactured ||
+      rowDate(existing.expires_on) !== expires
+    )
+      throw new InvalidInventoryLotDatesError();
     return existing.id;
   }
   const id = randomUUID();
   await manager.query(
     `INSERT INTO inventory_lots
-       (id, tenant_id, product_id, code, normalized_code, unit_cost, currency,
-        created_by_user_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, tenant_id, product_id, code, normalized_code, manufactured_on,
+        expires_on, unit_cost, currency, created_by_user_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       id,
       movement.tenant_id,
       movement.product_id,
       code,
       normalizedCode,
+      manufactured,
+      expires,
       unitCost,
       currency,
       movement.created_by_user_id,
@@ -333,6 +393,7 @@ async function consumeLots(
   preferredLotId?: string,
   preferredLotCode?: string,
   costSource?: LotCostSource,
+  allowExpired = false,
 ): Promise<void> {
   let balances: LotBalanceRow[];
   let mode: SelectionMode = 'AUTOMATIC';
@@ -343,7 +404,7 @@ async function consumeLots(
       ? preferredLotId
       : normalizeLotCode(preferredLotCode!).toUpperCase();
     balances = await manager.query<LotBalanceRow[]>(
-      `SELECT ilb.lot_id, ilb.quantity
+      `SELECT ilb.lot_id, ilb.quantity, il.expires_on
        FROM inventory_lot_balances ilb
        INNER JOIN inventory_lots il
          ON il.id = ilb.lot_id AND il.tenant_id = ilb.tenant_id
@@ -353,17 +414,30 @@ async function consumeLots(
       [movement.tenant_id, movement.product_id, movement.location_id, value],
     );
     if (balances.length === 0) throw new InventoryLotNotFoundError();
+    const expiry = rowDate(balances[0].expires_on);
+    if (
+      expiry &&
+      expiry < inventoryLocalDate(movement.timezone) &&
+      !allowExpired
+    )
+      throw new ExpiredInventoryLotError();
   } else {
     balances = await manager.query<LotBalanceRow[]>(
-      `SELECT ilb.lot_id, ilb.quantity
+      `SELECT ilb.lot_id, ilb.quantity, il.expires_on
        FROM inventory_lot_balances ilb
        INNER JOIN inventory_lots il
          ON il.id = ilb.lot_id AND il.tenant_id = ilb.tenant_id
        WHERE ilb.tenant_id = ? AND il.product_id = ?
          AND ilb.location_id = ? AND ilb.quantity > 0
-       ORDER BY il.created_at, il.id
+         AND (il.expires_on IS NULL OR il.expires_on >= ?)
+       ORDER BY il.expires_on IS NULL, il.expires_on, il.created_at, il.id
        FOR UPDATE`,
-      [movement.tenant_id, movement.product_id, movement.location_id],
+      [
+        movement.tenant_id,
+        movement.product_id,
+        movement.location_id,
+        inventoryLocalDate(movement.timezone),
+      ],
     );
   }
   let remaining = quantity;
@@ -388,18 +462,27 @@ async function consumeLots(
 export async function applyInventoryLotTracking(
   manager: EntityManager,
   movementId: string,
-  options: { lotCode?: string; preferredLotId?: string } = {},
+  options: {
+    lotCode?: string;
+    preferredLotId?: string;
+    manufacturedOn?: string;
+    expiresOn?: string;
+    allowExpired?: boolean;
+  } = {},
 ): Promise<void> {
   const [movement] = await manager.query<MovementLotRow[]>(
     `SELECT im.id, im.tenant_id, im.product_id, im.location_id, im.type,
             im.quantity_change, im.created_by_user_id,
             im.purchase_receipt_line_id, im.purchase_return_line_id,
             im.sale_id, im.sale_line_id, im.source_sale_movement_id,
-            im.transfer_line_id, p.track_lots,
-            im.unit_cost, t.country_code
+            im.transfer_line_id, p.track_lots, p.lot_expiration_policy,
+            im.unit_cost, t.country_code, b.timezone
      FROM inventory_movements im
      INNER JOIN products p ON p.id = im.product_id AND p.tenant_id = im.tenant_id
      INNER JOIN tenants t ON t.id = im.tenant_id
+     INNER JOIN locations l ON l.id = im.location_id AND l.tenant_id = im.tenant_id
+     INNER JOIN warehouses w ON w.id = l.warehouse_id AND w.tenant_id = l.tenant_id
+     INNER JOIN branches b ON b.id = w.branch_id AND b.tenant_id = w.tenant_id
      WHERE im.id = ?`,
     [movementId],
   );
@@ -426,9 +509,16 @@ export async function applyInventoryLotTracking(
 
   if (movement.type === 'PURCHASE_RECEIPT') {
     const [line] = await manager.query<
-      Array<{ lot_code: string | null; unit_cost: string; currency: string }>
+      Array<{
+        lot_code: string | null;
+        manufactured_on: string | Date | null;
+        expires_on: string | Date | null;
+        unit_cost: string;
+        currency: string;
+      }>
     >(
-      `SELECT prl.lot_code, prl.unit_cost, po.currency
+      `SELECT prl.lot_code, prl.manufactured_on, prl.expires_on,
+              prl.unit_cost, po.currency
        FROM purchase_receipt_lines prl
        INNER JOIN purchase_receipts pr
          ON pr.id = prl.receipt_id AND pr.tenant_id = prl.tenant_id
@@ -444,6 +534,8 @@ export async function applyInventoryLotTracking(
       line.lot_code,
       line.unit_cost,
       line.currency,
+      rowDate(line.manufactured_on),
+      rowDate(line.expires_on),
     );
     await manager.query(
       `UPDATE purchase_receipt_lines SET lot_id = ?
@@ -498,6 +590,8 @@ export async function applyInventoryLotTracking(
       options.lotCode,
       movement.unit_cost,
       currency,
+      options.manufacturedOn,
+      options.expiresOn,
     );
     await changeLotBalance(manager, movement, lotId, quantityChange, 'MANUAL', {
       unitCost: movement.unit_cost,
@@ -550,6 +644,7 @@ export async function applyInventoryLotTracking(
     preferredLotId,
     options.lotCode,
     costSource,
+    options.allowExpired || movement.type === 'SUPPLIER_RETURN',
   );
   await finalizeSpecificLotMovementValuation(manager, movementId);
 }

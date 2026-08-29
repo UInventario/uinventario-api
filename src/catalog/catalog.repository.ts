@@ -31,6 +31,9 @@ interface ProductRow {
   sku: string;
   barcode: string | null;
   track_lots: number | boolean;
+  lot_expiration_policy: 'NONE' | 'OPTIONAL' | 'REQUIRED';
+  lot_expiration_alert_days: number;
+  allow_expired_stock_override: number | boolean;
   track_serials: number | boolean;
   cost: string;
   price: string;
@@ -79,8 +82,10 @@ export class CatalogRepository {
         await manager.query(
           `INSERT INTO products
             (id, tenant_id, name, sku, normalized_sku, barcode, track_lots,
-             track_serials, category_id, brand_id, cost, price)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             lot_expiration_policy, lot_expiration_alert_days,
+             allow_expired_stock_override, track_serials, category_id, brand_id,
+             cost, price)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             id,
             tenantId,
@@ -89,6 +94,9 @@ export class CatalogRepository {
             this.normalize(dto.sku),
             dto.barcode ?? null,
             specificLotPolicy || (dto.trackLots ?? false),
+            dto.lotExpirationPolicy ?? 'NONE',
+            dto.lotExpirationAlertDays ?? 30,
+            dto.allowExpiredStockOverride ?? false,
             dto.trackSerials ?? false,
             categoryId,
             brandId,
@@ -136,6 +144,9 @@ export class CatalogRepository {
         const [currentTracking] = await manager.query<
           Array<{
             track_lots: number | boolean;
+            lot_expiration_policy: 'NONE' | 'OPTIONAL' | 'REQUIRED';
+            lot_expiration_alert_days: number;
+            allow_expired_stock_override: number | boolean;
             track_serials: number | boolean;
             has_movements: number | string;
             specific_lot_policy: number | string;
@@ -191,6 +202,9 @@ export class CatalogRepository {
           `UPDATE products
            SET name = ?, sku = ?, normalized_sku = ?, barcode = ?,
                track_lots = COALESCE(?, track_lots),
+               lot_expiration_policy = COALESCE(?, lot_expiration_policy),
+               lot_expiration_alert_days = COALESCE(?, lot_expiration_alert_days),
+               allow_expired_stock_override = COALESCE(?, allow_expired_stock_override),
                track_serials = COALESCE(?, track_serials),
                category_id = ?, brand_id = ?, cost = ?, price = ?, version = version + 1
            WHERE id = ? AND tenant_id = ? AND version = ?`,
@@ -200,6 +214,9 @@ export class CatalogRepository {
             this.normalize(dto.sku),
             dto.barcode ?? null,
             dto.trackLots ?? null,
+            dto.lotExpirationPolicy ?? null,
+            dto.lotExpirationAlertDays ?? null,
+            dto.allowExpiredStockOverride ?? null,
             dto.trackSerials ?? null,
             categoryId,
             brandId,
@@ -215,6 +232,19 @@ export class CatalogRepository {
           if (!current) return null;
           throw new ProductVersionConflictError(current.version);
         }
+        await manager.query(
+          `UPDATE products child
+           INNER JOIN products parent
+             ON parent.id = child.parent_product_id
+            AND parent.tenant_id = child.tenant_id
+           SET child.track_lots = parent.track_lots,
+               child.lot_expiration_policy = parent.lot_expiration_policy,
+               child.lot_expiration_alert_days = parent.lot_expiration_alert_days,
+               child.allow_expired_stock_override = parent.allow_expired_stock_override,
+               child.version = child.version + 1
+           WHERE child.tenant_id = ? AND parent.id = ?`,
+          [tenantId, id],
+        );
         return this.findProduct(manager, tenantId, id);
       });
     } catch (error) {
@@ -321,6 +351,9 @@ export class CatalogRepository {
             category_id: string | null;
             brand_id: string | null;
             track_lots: number | boolean;
+            lot_expiration_policy: 'NONE' | 'OPTIONAL' | 'REQUIRED';
+            lot_expiration_alert_days: number;
+            allow_expired_stock_override: number | boolean;
             track_serials: number | boolean;
             active: number | boolean;
             version: number;
@@ -328,7 +361,9 @@ export class CatalogRepository {
             variant_schema: unknown;
           }>
         >(
-          `SELECT id, name, category_id, brand_id, track_lots, track_serials, active,
+          `SELECT id, name, category_id, brand_id, track_lots,
+                  lot_expiration_policy, lot_expiration_alert_days,
+                  allow_expired_stock_override, track_serials, active,
                   version, parent_product_id, variant_schema
            FROM products WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE`,
           [parentId, tenantId],
@@ -424,8 +459,9 @@ export class CatalogRepository {
               `INSERT INTO products
                 (id, tenant_id, parent_product_id, name, sku, normalized_sku, barcode,
                  variant_values, track_lots, track_serials, category_id, brand_id,
-                 cost, price, active)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 lot_expiration_policy, lot_expiration_alert_days,
+                 allow_expired_stock_override, cost, price, active)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 id,
                 tenantId,
@@ -439,6 +475,9 @@ export class CatalogRepository {
                 parent.track_serials,
                 parent.category_id,
                 parent.brand_id,
+                parent.lot_expiration_policy,
+                parent.lot_expiration_alert_days,
+                parent.allow_expired_stock_override,
                 input.cost,
                 input.price,
                 input.active,
@@ -747,7 +786,10 @@ export class CatalogRepository {
   }
 
   private productSelect(): string {
-    return `SELECT p.id, p.name, p.sku, p.barcode, p.track_lots, p.track_serials, p.cost, p.price, p.active, p.version,
+    return `SELECT p.id, p.name, p.sku, p.barcode, p.track_lots,
+                   p.lot_expiration_policy, p.lot_expiration_alert_days,
+                   p.allow_expired_stock_override, p.track_serials,
+                   p.cost, p.price, p.active, p.version,
                    p.parent_product_id, p.variant_schema, p.variant_values,
                    c.id AS category_id, c.name AS category_name,
                    b.id AS brand_id, b.name AS brand_name
@@ -814,6 +856,9 @@ export class CatalogRepository {
       sku: row.sku,
       barcode: row.barcode,
       trackLots: Boolean(row.track_lots),
+      lotExpirationPolicy: row.lot_expiration_policy,
+      lotExpirationAlertDays: Number(row.lot_expiration_alert_days),
+      allowExpiredStockOverride: Boolean(row.allow_expired_stock_override),
       trackSerials: Boolean(row.track_serials),
       category:
         row.category_id && row.category_name

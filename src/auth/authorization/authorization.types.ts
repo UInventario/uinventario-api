@@ -25,6 +25,7 @@ export const APP_PERMISSIONS = [
   'INVENTORY_COUNT',
   'INVENTORY_APPROVE',
   'INVENTORY_VALUATION_MANAGE',
+  'INVENTORY_EXPIRED_STOCK_OVERRIDE',
 ] as const;
 
 export type AppPermission = (typeof APP_PERMISSIONS)[number];
@@ -36,6 +37,7 @@ export const INVENTORY_PERMISSIONS = [
   'INVENTORY_COUNT',
   'INVENTORY_APPROVE',
   'INVENTORY_VALUATION_MANAGE',
+  'INVENTORY_EXPIRED_STOCK_OVERRIDE',
 ] as const satisfies readonly AppPermission[];
 
 export const OPERATIONAL_PERMISSIONS = [

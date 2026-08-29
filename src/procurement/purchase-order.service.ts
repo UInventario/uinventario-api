@@ -40,6 +40,8 @@ import {
   InventoryLotCurrencyMismatchError,
   InventoryLotNotFoundError,
   InventoryLotRequiredError,
+  InvalidInventoryLotDatesError,
+  InventoryLotExpirationRequiredError,
   InventoryFifoCurrencyMismatchError,
   InventoryFifoLayerShortageError,
 } from '../inventory/inventory.errors';
@@ -386,6 +388,18 @@ export class PurchaseOrderService {
       throw new BadRequestException({
         code: 'INVENTORY_LOT_REQUIRED',
         message: 'Indica el lote de cada producto que controla lotes.',
+      });
+    }
+    if (error instanceof InventoryLotExpirationRequiredError) {
+      throw new BadRequestException({
+        code: 'INVENTORY_LOT_EXPIRATION_REQUIRED',
+        message: 'Indica la fecha de caducidad del lote.',
+      });
+    }
+    if (error instanceof InvalidInventoryLotDatesError) {
+      throw new BadRequestException({
+        code: 'INVALID_INVENTORY_LOT_DATES',
+        message: 'Las fechas del lote no son válidas o no coinciden.',
       });
     }
     if (error instanceof InvalidInventoryLotCodeError) {
