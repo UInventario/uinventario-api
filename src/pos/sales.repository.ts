@@ -44,6 +44,7 @@ interface SaleRow {
   tax_rate: string;
   gross_total: string;
   line_discount_total: string;
+  promotion_discount_total: string;
   sale_discount_total: string;
   discount_total: string;
   discount_type: 'PERCENT' | 'AMOUNT' | null;
@@ -997,10 +998,10 @@ export class SalesRepository {
             (id, tenant_id, branch_id, warehouse_id, cash_register_id,
              cash_register_shift_id, created_by_user_id, customer_id, reservation_id, quotation_id,
              receipt_number, currency, tax_rate, gross_total, line_discount_total,
-             sale_discount_total, discount_total, discount_type, discount_value,
+             promotion_discount_total, sale_discount_total, discount_total, discount_type, discount_value,
              discount_reason, subtotal, tax_total, total, status, idempotency_key,
              request_fingerprint)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
             [
               saleId,
               input.tenantId,
@@ -1017,6 +1018,7 @@ export class SalesRepository {
               input.quote.taxRate,
               input.quote.totals.gross,
               input.quote.totals.lineDiscount,
+              input.quote.totals.promotionDiscount,
               input.quote.totals.saleDiscount,
               input.quote.totals.discount,
               input.quote.discount?.type ?? null,
@@ -1031,6 +1033,12 @@ export class SalesRepository {
           );
           for (const [index, line] of input.quote.lines.entries()) {
             const saleLineId = randomUUID();
+            const promotionDiscountTotal = this.money(
+              line.promotions.reduce(
+                (sum, promotion) => sum + this.toMoney(promotion.amount),
+                0n,
+              ),
+            );
             let unitCost = line.kit?.unitCost;
             if (!unitCost) {
               const [productCost] = await manager.query<
@@ -1047,9 +1055,9 @@ export class SalesRepository {
               (id, tenant_id, sale_id, line_number, product_id, product_name,
                product_sku, quantity, unit_price, price_source, price_list_id,
                price_list_name, unit_cost, gross_total, line_discount_total,
-               sale_discount_total, discount_total, discount_type, discount_value,
+               promotion_discount_total, sale_discount_total, discount_total, discount_type, discount_value,
                discount_reason, expired_lot_override_reason, subtotal, tax, total)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 saleLineId,
                 input.tenantId,
@@ -1066,6 +1074,7 @@ export class SalesRepository {
                 unitCost,
                 line.grossTotal,
                 line.discount.line?.amount ?? '0.00',
+                promotionDiscountTotal,
                 line.discount.sale?.amount ?? '0.00',
                 line.discount.total,
                 line.discount.line?.type ?? null,
@@ -1077,6 +1086,28 @@ export class SalesRepository {
                 line.total,
               ],
             );
+            for (const promotion of line.promotions) {
+              await manager.query(
+                `INSERT INTO sale_line_promotions
+                   (id, tenant_id, sale_id, sale_line_id, promotion_id,
+                    promotion_name, promotion_type, priority, discount_amount,
+                    explanation, rule_snapshot)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [
+                  randomUUID(),
+                  input.tenantId,
+                  saleId,
+                  saleLineId,
+                  promotion.promotion.id,
+                  promotion.promotion.name,
+                  promotion.promotion.type,
+                  promotion.promotion.priority,
+                  promotion.amount,
+                  promotion.explanation,
+                  JSON.stringify(promotion.ruleSnapshot),
+                ],
+              );
+            }
             if (line.kit?.stockMode === 'DERIVED') {
               for (const component of line.kit.components) {
                 await manager.query(
@@ -1362,7 +1393,7 @@ export class SalesRepository {
               c.identifier AS customer_identifier,
               q.id AS quotation_id, q.quotation_number,
               s.currency, s.tax_rate, s.gross_total, s.line_discount_total,
-              s.sale_discount_total, s.discount_total, s.discount_type,
+              s.promotion_discount_total, s.sale_discount_total, s.discount_total, s.discount_type,
               s.discount_value, s.discount_reason, s.subtotal, s.tax_total, s.total,
               s.request_fingerprint, s.created_at, s.voided_by_user_id,
               vu.email AS voided_by_email, s.void_reason, s.voided_at,
@@ -1396,6 +1427,7 @@ export class SalesRepository {
         unit_cost: string;
         gross_total: string;
         line_discount_total: string;
+        promotion_discount_total: string;
         sale_discount_total: string;
         discount_total: string;
         discount_type: 'PERCENT' | 'AMOUNT' | null;
@@ -1409,11 +1441,34 @@ export class SalesRepository {
     >(
       `SELECT id, product_id, product_name, product_sku, quantity, unit_price,
               price_source, price_list_id, price_list_name, unit_cost,
-              gross_total, line_discount_total, sale_discount_total,
+              gross_total, line_discount_total, promotion_discount_total, sale_discount_total,
               discount_total, discount_type, discount_value, discount_reason,
               expired_lot_override_reason,
               subtotal, tax, total
        FROM sale_lines WHERE tenant_id = ? AND sale_id = ? ORDER BY line_number`,
+      [tenantId, row.id],
+    );
+    const promotionRows = await manager.query<
+      Array<{
+        sale_line_id: string;
+        promotion_id: string;
+        promotion_name: string;
+        promotion_type:
+          | 'BUY_X_GET_Y'
+          | 'SECOND_UNIT_PERCENT'
+          | 'BUNDLE_FIXED'
+          | 'QUANTITY_PERCENT';
+        priority: number | string;
+        discount_amount: string;
+        explanation: string;
+        rule_snapshot: string | Record<string, unknown>;
+      }>
+    >(
+      `SELECT sale_line_id, promotion_id, promotion_name, promotion_type,
+              priority, discount_amount, explanation, rule_snapshot
+       FROM sale_line_promotions
+       WHERE tenant_id = ? AND sale_id = ?
+       ORDER BY priority DESC, id`,
       [tenantId, row.id],
     );
     const paymentRows = await manager.query<
@@ -1598,6 +1653,19 @@ export class SalesRepository {
               : null,
             total: this.decimal(line.discount_total, 2),
           },
+          promotions: promotionRows
+            .filter((promotion) => promotion.sale_line_id === line.id)
+            .map((promotion) => ({
+              promotion: {
+                id: promotion.promotion_id,
+                name: promotion.promotion_name,
+                type: promotion.promotion_type,
+                priority: Number(promotion.priority),
+              },
+              amount: this.decimal(promotion.discount_amount, 2),
+              explanation: promotion.explanation,
+              ruleSnapshot: this.jsonObject(promotion.rule_snapshot),
+            })),
           subtotal: this.decimal(line.subtotal, 2),
           tax: this.decimal(line.tax, 2),
           total: this.decimal(line.total, 2),
@@ -1613,6 +1681,7 @@ export class SalesRepository {
         totals: {
           gross: this.decimal(row.gross_total, 2),
           lineDiscount: this.decimal(row.line_discount_total, 2),
+          promotionDiscount: this.decimal(row.promotion_discount_total, 2),
           saleDiscount: this.decimal(row.sale_discount_total, 2),
           discount: this.decimal(row.discount_total, 2),
           subtotal: this.decimal(row.subtotal, 2),
@@ -1664,6 +1733,17 @@ export class SalesRepository {
   private date(value: Date | string): string {
     if (value instanceof Date) return value.toISOString().slice(0, 10);
     return String(value).slice(0, 10);
+  }
+
+  private jsonObject(
+    value: string | Record<string, unknown>,
+  ): Record<string, unknown> {
+    if (typeof value !== 'string') return value;
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('INVALID_PROMOTION_RULE_SNAPSHOT');
+    }
+    return parsed as Record<string, unknown>;
   }
 
   private toQuantityUnits(value: string): bigint {

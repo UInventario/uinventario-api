@@ -1,7 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
-import type { PosCartQuoteResponse } from '../pos/pos.types';
+import type {
+  PosAppliedPromotion,
+  PosCartQuoteResponse,
+} from '../pos/pos.types';
 import {
   SalesQuotationIdempotencyConflictError,
   SalesQuotationNotFoundError,
@@ -40,6 +43,7 @@ interface QuotationRow {
   tax_rate: string;
   gross_total: string;
   line_discount_total: string;
+  promotion_discount_total: string;
   sale_discount_total: string;
   discount_total: string;
   discount_type: 'PERCENT' | 'AMOUNT' | null;
@@ -70,11 +74,13 @@ interface QuotationLineRow {
   price_list_name: string | null;
   gross_total: string;
   line_discount_total: string;
+  promotion_discount_total: string;
   sale_discount_total: string;
   discount_total: string;
   discount_type: 'PERCENT' | 'AMOUNT' | null;
   discount_value: string | null;
   discount_reason: string | null;
+  promotions_snapshot: string | PosAppliedPromotion[];
   subtotal: string;
   tax: string;
   total: string;
@@ -115,10 +121,10 @@ export class SalesQuotationRepository {
           `INSERT INTO sales_quotations
            (id, tenant_id, branch_id, warehouse_id, cash_register_id, customer_id,
             reservation_id, quotation_number, channel, status, currency, tax_rate,
-            gross_total, line_discount_total, sale_discount_total, discount_total,
+            gross_total, line_discount_total, promotion_discount_total, sale_discount_total, discount_total,
             discount_type, discount_value, discount_reason, subtotal, tax_total, total,
             valid_until, notes, idempotency_key, request_fingerprint, created_by_user_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             id,
             input.tenantId,
@@ -133,6 +139,7 @@ export class SalesQuotationRepository {
             input.quote.taxRate,
             input.quote.totals.gross,
             input.quote.totals.lineDiscount,
+            input.quote.totals.promotionDiscount,
             input.quote.totals.saleDiscount,
             input.quote.totals.discount,
             input.quote.discount?.type ?? null,
@@ -211,7 +218,7 @@ export class SalesQuotationRepository {
         await manager.query(
           `UPDATE sales_quotations SET customer_id = ?, reservation_id = ?, channel = ?,
              currency = ?, tax_rate = ?, gross_total = ?, line_discount_total = ?,
-             sale_discount_total = ?, discount_total = ?, discount_type = ?, discount_value = ?,
+             promotion_discount_total = ?, sale_discount_total = ?, discount_total = ?, discount_type = ?, discount_value = ?,
              discount_reason = ?, subtotal = ?, tax_total = ?, total = ?, valid_until = ?, notes = ?,
              version = version + 1 WHERE id = ? AND tenant_id = ?`,
           [
@@ -222,6 +229,7 @@ export class SalesQuotationRepository {
             input.quote.taxRate,
             input.quote.totals.gross,
             input.quote.totals.lineDiscount,
+            input.quote.totals.promotionDiscount,
             input.quote.totals.saleDiscount,
             input.quote.totals.discount,
             input.quote.discount?.type ?? null,
@@ -506,6 +514,9 @@ export class SalesQuotationRepository {
             : null,
           total: this.decimal(line.discount_total, 2),
         },
+        promotions: this.jsonArray<PosAppliedPromotion>(
+          line.promotions_snapshot,
+        ),
         subtotal: this.decimal(line.subtotal, 2),
         tax: this.decimal(line.tax, 2),
         total: this.decimal(line.total, 2),
@@ -513,6 +524,7 @@ export class SalesQuotationRepository {
       totals: {
         gross: this.decimal(row.gross_total, 2),
         lineDiscount: this.decimal(row.line_discount_total, 2),
+        promotionDiscount: this.decimal(row.promotion_discount_total, 2),
         saleDiscount: this.decimal(row.sale_discount_total, 2),
         discount: this.decimal(row.discount_total, 2),
         subtotal: this.decimal(row.subtotal, 2),
@@ -544,9 +556,9 @@ export class SalesQuotationRepository {
         `INSERT INTO sales_quotation_lines
          (id, tenant_id, quotation_id, line_number, product_id, lot_id, quantity, serial_numbers,
           product_name, product_sku, available_quantity, unit_price, price_source, price_list_id,
-          price_list_name, gross_total, line_discount_total, sale_discount_total, discount_total,
-          discount_type, discount_value, discount_reason, subtotal, tax, total)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          price_list_name, gross_total, line_discount_total, promotion_discount_total, sale_discount_total, discount_total,
+          discount_type, discount_value, discount_reason, promotions_snapshot, subtotal, tax, total)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           randomUUID(),
           tenantId,
@@ -565,11 +577,16 @@ export class SalesQuotationRepository {
           line.priceList?.name ?? null,
           line.grossTotal,
           line.discount.line?.amount ?? '0.00',
+          line.promotions.reduce(
+            (total, promotion) => this.decimalSum(total, promotion.amount),
+            '0.00',
+          ),
           line.discount.sale?.amount ?? '0.00',
           line.discount.total,
           line.discount.line?.type ?? null,
           line.discount.line?.value ?? null,
           line.discount.line?.reason ?? null,
+          JSON.stringify(line.promotions),
           line.subtotal,
           line.tax,
           line.total,
@@ -720,6 +737,17 @@ export class SalesQuotationRepository {
     return Array.isArray(value)
       ? value
       : (JSON.parse(value || '[]') as string[]);
+  }
+  private jsonArray<T>(value: string | T[]): T[] {
+    return Array.isArray(value) ? value : (JSON.parse(value || '[]') as T[]);
+  }
+  private decimalSum(left: string, right: string): string {
+    const cents = (value: string) => {
+      const [whole, fraction = ''] = value.split('.');
+      return BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0'));
+    };
+    const total = cents(left) + cents(right);
+    return `${total / 100n}.${String(total % 100n).padStart(2, '0')}`;
   }
   private duplicate(error: unknown) {
     return (

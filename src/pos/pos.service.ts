@@ -58,6 +58,8 @@ import {
 } from '../inventory/inventory-serial-tracking';
 import { SuspendedSaleStateError } from './suspended-sale.errors';
 import { PriceListRepository } from '../pricing/price-list.repository';
+import { PromotionEngineService } from '../promotions/promotion-engine.service';
+import type { AppliedPromotion } from '../promotions/promotion.types';
 
 @Injectable()
 export class PosService {
@@ -67,6 +69,7 @@ export class PosService {
     private readonly shifts: CashRegisterShiftService,
     private readonly paymentAuthorization: PaymentAuthorizationService,
     private readonly priceLists: PriceListRepository,
+    private readonly promotionEngine: PromotionEngineService,
     @Inject(posConfig.KEY)
     private readonly config: ConfigType<typeof posConfig>,
   ) {}
@@ -731,9 +734,40 @@ export class PosService {
             grossCents,
             lineDiscountCents,
             requestedDiscount,
+            promotions: [] as AppliedPromotion[],
+            promotionDiscountCents: 0n,
           };
         },
       );
+      const promotionAllocations = await this.promotionEngine.resolve({
+        tenantId: input.tenantId,
+        branchId: input.branchId,
+        ...(input.dto.customerId ? { customerId: input.dto.customerId } : {}),
+        channel: input.dto.channel ?? 'POS',
+        at: new Date(),
+        lines: preparedLines.map((line) => ({
+          productId: line.product.id,
+          quantity: line.quantity,
+          unitPrice: line.unitPrice,
+          grossTotal: this.fromMoneyCents(line.grossCents),
+        })),
+      });
+      for (const line of preparedLines) {
+        line.promotions = promotionAllocations.get(line.product.id) ?? [];
+        line.promotionDiscountCents = line.promotions.reduce(
+          (sum, promotion) => sum + this.toMoneyCents(promotion.amount),
+          0n,
+        );
+        if (
+          line.lineDiscountCents + line.promotionDiscountCents >=
+          line.grossCents
+        ) {
+          throw new BadRequestException({
+            code: 'SALE_DISCOUNT_LIMIT_EXCEEDED',
+            message: 'Los descuentos no pueden consumir el total de una línea.',
+          });
+        }
+      }
       const grossCents = preparedLines.reduce(
         (sum, line) => sum + line.grossCents,
         0n,
@@ -742,12 +776,18 @@ export class PosService {
         (sum, line) => sum + line.lineDiscountCents,
         0n,
       );
-      const saleDiscountBase = grossCents - lineDiscountCents;
+      const promotionDiscountCents = preparedLines.reduce(
+        (sum, line) => sum + line.promotionDiscountCents,
+        0n,
+      );
+      const saleDiscountBase =
+        grossCents - lineDiscountCents - promotionDiscountCents;
       const saleDiscountCents = this.discountAmount(
         input.dto.discount ?? null,
         saleDiscountBase,
       );
-      const totalDiscountCents = lineDiscountCents + saleDiscountCents;
+      const totalDiscountCents =
+        lineDiscountCents + promotionDiscountCents + saleDiscountCents;
       if (totalDiscountCents * 2n > grossCents) {
         throw new BadRequestException({
           code: 'SALE_DISCOUNT_LIMIT_EXCEEDED',
@@ -755,7 +795,12 @@ export class PosService {
         });
       }
       const saleAllocations = this.allocateDiscount(
-        preparedLines.map((line) => line.grossCents - line.lineDiscountCents),
+        preparedLines.map(
+          (line) =>
+            line.grossCents -
+            line.lineDiscountCents -
+            line.promotionDiscountCents,
+        ),
         saleDiscountCents,
       );
       let subtotalCents = 0n;
@@ -763,7 +808,8 @@ export class PosService {
       let totalCents = 0n;
       const lines = preparedLines.map((line, index) => {
         const saleAllocation = saleAllocations[index] ?? 0n;
-        const totalDiscount = line.lineDiscountCents + saleAllocation;
+        const totalDiscount =
+          line.lineDiscountCents + line.promotionDiscountCents + saleAllocation;
         const lineTotal = line.grossCents - totalDiscount;
         const lineTax =
           taxBasisPoints === 0n
@@ -796,6 +842,7 @@ export class PosService {
             sale: this.appliedDiscount(input.dto.discount, saleAllocation),
             total: this.fromMoneyCents(totalDiscount),
           },
+          promotions: line.promotions,
           subtotal: this.fromMoneyCents(lineSubtotal),
           tax: this.fromMoneyCents(lineTax),
           total: this.fromMoneyCents(lineTotal),
@@ -816,6 +863,7 @@ export class PosService {
           totals: {
             gross: this.fromMoneyCents(grossCents),
             lineDiscount: this.fromMoneyCents(lineDiscountCents),
+            promotionDiscount: this.fromMoneyCents(promotionDiscountCents),
             saleDiscount: this.fromMoneyCents(saleDiscountCents),
             discount: this.fromMoneyCents(totalDiscountCents),
             subtotal: this.fromMoneyCents(subtotalCents),

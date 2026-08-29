@@ -41,6 +41,7 @@ import { CustomerCreditPaymentService } from './customer-credit-payment.service'
 import { PosProfitabilityReportRepository } from './pos-profitability-report.repository';
 import { PosProfitabilityReportService } from './pos-profitability-report.service';
 import { ExternalAdapterModule } from '../integrations/external-adapter.module';
+import { PromotionModule } from '../promotions/promotion.module';
 
 @Module({
   imports: [
@@ -48,6 +49,7 @@ import { ExternalAdapterModule } from '../integrations/external-adapter.module';
     PriceListModule,
     CustomerModule,
     ExternalAdapterModule,
+    PromotionModule,
   ],
   controllers: [
     PosController,
