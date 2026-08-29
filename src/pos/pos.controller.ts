@@ -32,6 +32,8 @@ import { PermissionGuard } from '../auth/authorization/permission.guard';
 import { RequirePermissions } from '../auth/authorization/require-permissions.decorator';
 import { SalesCashReportDto } from './dto/sales-cash-report.dto';
 import { SalesCashReportService } from './sales-cash-report.service';
+import { PosProfitabilityReportDto } from './dto/pos-profitability-report.dto';
+import { PosProfitabilityReportService } from './pos-profitability-report.service';
 
 @Controller('pos')
 @UseGuards(SessionGuard, PosAccessGuard)
@@ -43,7 +45,24 @@ export class PosController {
     private readonly closures: CashRegisterClosureService,
     private readonly audit: AuditService,
     private readonly reports: SalesCashReportService,
+    private readonly profitabilityReports: PosProfitabilityReportService,
   ) {}
+
+  @Get('reports/profitability')
+  @UseGuards(PermissionGuard)
+  @RequirePermissions('SALES_MANAGE', 'INVENTORY_VALUATION_MANAGE')
+  profitabilityReport(
+    @Req() request: AuthenticatedRequest,
+    @Query() query: PosProfitabilityReportDto,
+  ) {
+    const { principal } = request;
+    return this.profitabilityReports.report({
+      tenantId: principal.tenant.id,
+      userId: principal.user.id,
+      administrator: principal.user.permissions.includes('TENANT_MANAGE'),
+      query,
+    });
+  }
 
   @Get('reports/sales-cash')
   @UseGuards(PermissionGuard)
