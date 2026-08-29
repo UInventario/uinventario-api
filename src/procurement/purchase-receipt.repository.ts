@@ -176,7 +176,7 @@ export class PurchaseReceiptRepository {
               }>
             >(
               `SELECT cost, track_lots, track_serials FROM products
-               WHERE id = ? AND tenant_id = ? FOR UPDATE`,
+               WHERE id = ? AND tenant_id = ? AND variant_schema IS NULL FOR UPDATE`,
               [item.orderLine.product_id, input.tenantId],
             );
             if (!product) throw new InvalidPurchaseReceiptError();

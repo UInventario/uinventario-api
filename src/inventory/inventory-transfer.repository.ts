@@ -1048,7 +1048,8 @@ export class InventoryTransferRepository {
        INNER JOIN locations destination ON destination.id = ?
          AND destination.tenant_id = p.tenant_id
          AND destination.warehouse_id = ? AND destination.active = TRUE
-       WHERE p.id = ? AND p.tenant_id = ? AND p.active = TRUE LIMIT 1`,
+       WHERE p.id = ? AND p.tenant_id = ? AND p.active = TRUE
+         AND p.variant_schema IS NULL LIMIT 1`,
       [
         sourceLocationId,
         originWarehouseId,

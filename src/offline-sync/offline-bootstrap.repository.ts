@@ -144,7 +144,8 @@ export class OfflineBootstrapRepository {
        FROM products p
        LEFT JOIN categories c ON c.id = p.category_id AND c.tenant_id = p.tenant_id
        LEFT JOIN brands br ON br.id = p.brand_id AND br.tenant_id = p.tenant_id
-       WHERE p.tenant_id = ? AND p.active = TRUE AND p.updated_at <= ? ORDER BY p.id`,
+       WHERE p.tenant_id = ? AND p.active = TRUE AND p.variant_schema IS NULL
+         AND p.updated_at <= ? ORDER BY p.id`,
       [input.scope.tenantId, input.snapshotAt],
     );
     const classifications = new Map<string, OfflineSyncEntityV1>();

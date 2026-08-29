@@ -9,6 +9,8 @@ import {
   ProductIdentifierConflictError,
   ProductVersionConflictError,
   ProductLotTrackingLockedError,
+  ProductVariantConfigurationError,
+  ProductVariantsRequireZeroStockError,
 } from './catalog.errors';
 import {
   CatalogClassificationData,
@@ -21,6 +23,7 @@ import {
   CatalogClassificationKind,
   UpdateCatalogClassificationDto,
 } from './dto/catalog-classification.dto';
+import { UpdateProductVariantsDto } from './dto/update-product-variants.dto';
 
 interface ProductRow {
   id: string;
@@ -37,6 +40,9 @@ interface ProductRow {
   category_name: string | null;
   brand_id: string | null;
   brand_name: string | null;
+  parent_product_id: string | null;
+  variant_schema: string | Array<{ name: string; values: string[] }> | null;
+  variant_values: string | Array<{ attribute: string; value: string }> | null;
 }
 
 @Injectable()
@@ -137,7 +143,12 @@ export class CatalogRepository {
         >(
           `SELECT p.track_lots, p.track_serials,
                   EXISTS(SELECT 1 FROM inventory_movements im
-                         WHERE im.tenant_id = p.tenant_id AND im.product_id = p.id) AS has_movements,
+                         WHERE im.tenant_id = p.tenant_id
+                           AND (im.product_id = p.id OR im.product_id IN (
+                             SELECT child.id FROM products child
+                             WHERE child.tenant_id = p.tenant_id
+                               AND child.parent_product_id = p.id
+                           ))) AS has_movements,
                   EXISTS(SELECT 1 FROM inventory_valuation_policies ivp
                          WHERE ivp.tenant_id = p.tenant_id
                            AND ivp.method = 'SPECIFIC_LOT') AS specific_lot_policy
@@ -243,6 +254,7 @@ export class CatalogRepository {
       conditions.push('p.brand_id = ?');
       parameters.push(query.brandId);
     }
+    if (query.sellableOnly) conditions.push('p.variant_schema IS NULL');
     const where = conditions.join(' AND ');
     const offset = (query.page - 1) * query.pageSize;
     const [rows, countRows] = await Promise.all([
@@ -267,7 +279,17 @@ export class CatalogRepository {
       `${this.productSelect()} WHERE p.id = ? AND p.tenant_id = ? LIMIT 1`,
       [id, tenantId],
     );
-    return rows[0] ? this.toProduct(rows[0]) : null;
+    if (!rows[0]) return null;
+    const product = this.toProduct(rows[0]);
+    if (product.variantAttributes.length > 0) {
+      const variants = await this.dataSource.query<ProductRow[]>(
+        `${this.productSelect()} WHERE p.parent_product_id = ? AND p.tenant_id = ?
+         ORDER BY p.created_at, p.id`,
+        [id, tenantId],
+      );
+      product.variants = variants.map((row) => this.toProduct(row));
+    }
+    return product;
   }
 
   async resolveCode(
@@ -276,12 +298,195 @@ export class CatalogRepository {
   ): Promise<ProductData | null> {
     const rows = await this.dataSource.query<ProductRow[]>(
       `${this.productSelect()} WHERE p.tenant_id = ?
+         AND p.variant_schema IS NULL
          AND (p.normalized_sku = ? OR p.barcode = ?)
        ORDER BY p.id LIMIT 2`,
       [tenantId, this.normalize(code), code],
     );
     if (rows.length > 1) throw new ProductCodeAmbiguousError();
     return rows[0] ? this.toProduct(rows[0]) : null;
+  }
+
+  async updateProductVariants(
+    tenantId: string,
+    parentId: string,
+    dto: UpdateProductVariantsDto,
+  ): Promise<ProductData | null> {
+    try {
+      return await this.dataSource.transaction(async (manager) => {
+        const [parent] = await manager.query<
+          Array<{
+            id: string;
+            name: string;
+            category_id: string | null;
+            brand_id: string | null;
+            track_lots: number | boolean;
+            track_serials: number | boolean;
+            active: number | boolean;
+            version: number;
+            parent_product_id: string | null;
+            variant_schema: unknown;
+          }>
+        >(
+          `SELECT id, name, category_id, brand_id, track_lots, track_serials, active,
+                  version, parent_product_id, variant_schema
+           FROM products WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE`,
+          [parentId, tenantId],
+        );
+        if (!parent) return null;
+        if (parent.parent_product_id) {
+          throw new ProductVariantConfigurationError(
+            'Una variante no puede contener otras variantes.',
+          );
+        }
+        if (!parent.active) {
+          throw new ProductVariantConfigurationError(
+            'Activa el producto padre antes de modificar sus variantes.',
+          );
+        }
+        if (Number(parent.version) !== dto.version) {
+          throw new ProductVersionConflictError(Number(parent.version));
+        }
+
+        const attributes = this.validateVariantConfiguration(dto);
+        if (parent.variant_schema === null) {
+          const [stock] = await manager.query<
+            Array<{ has_stock: number | string }>
+          >(
+            `SELECT EXISTS(
+               SELECT 1 FROM inventory_balances
+               WHERE tenant_id = ? AND product_id = ? AND quantity <> 0
+             ) AS has_stock`,
+            [tenantId, parentId],
+          );
+          if (Number(stock.has_stock) === 1) {
+            throw new ProductVariantsRequireZeroStockError();
+          }
+        }
+
+        const existing = await manager.query<
+          Array<{
+            id: string;
+            version: number;
+            active: number | boolean;
+            variant_values: unknown;
+          }>
+        >(
+          `SELECT id, version, active, variant_values FROM products
+           WHERE tenant_id = ? AND parent_product_id = ? FOR UPDATE`,
+          [tenantId, parentId],
+        );
+        const existingById = new Map(existing.map((row) => [row.id, row]));
+        const retainedIds = new Set<string>();
+        for (const input of dto.variants) {
+          const variantValues = attributes.map((attribute, index) => ({
+            attribute: attribute.name,
+            value: input.values[index],
+          }));
+          const name = `${parent.name} · ${input.values.join(' / ')}`;
+          if (input.id) {
+            if (retainedIds.has(input.id)) {
+              throw new ProductVariantConfigurationError(
+                'Una variante existente no puede asignarse a dos combinaciones.',
+              );
+            }
+            const current = existingById.get(input.id);
+            if (!current || input.version === undefined) {
+              throw new ProductVariantConfigurationError(
+                'La variante indicada no pertenece a este producto.',
+              );
+            }
+            if (Number(current.version) !== input.version) {
+              throw new ProductVersionConflictError(Number(current.version));
+            }
+            await manager.query(
+              `UPDATE products SET name = ?, sku = ?, normalized_sku = ?, barcode = ?,
+                 variant_values = ?, cost = ?, price = ?, active = ?, version = version + 1
+               WHERE id = ? AND tenant_id = ? AND parent_product_id = ?`,
+              [
+                name,
+                input.sku,
+                this.normalize(input.sku),
+                input.barcode ?? null,
+                JSON.stringify(variantValues),
+                input.cost,
+                input.price,
+                input.active,
+                input.id,
+                tenantId,
+                parentId,
+              ],
+            );
+            retainedIds.add(input.id);
+          } else {
+            const id = randomUUID();
+            await manager.query(
+              `INSERT INTO products
+                (id, tenant_id, parent_product_id, name, sku, normalized_sku, barcode,
+                 variant_values, track_lots, track_serials, category_id, brand_id,
+                 cost, price, active)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                id,
+                tenantId,
+                parentId,
+                name,
+                input.sku,
+                this.normalize(input.sku),
+                input.barcode ?? null,
+                JSON.stringify(variantValues),
+                parent.track_lots,
+                parent.track_serials,
+                parent.category_id,
+                parent.brand_id,
+                input.cost,
+                input.price,
+                input.active,
+              ],
+            );
+            retainedIds.add(id);
+          }
+        }
+
+        const removedIds = existing
+          .map(({ id }) => id)
+          .filter(
+            (id) =>
+              !retainedIds.has(id) && Boolean(existingById.get(id)?.active),
+          );
+        if (removedIds.length > 0) {
+          await manager.query(
+            `UPDATE products SET active = FALSE, version = version + 1
+             WHERE tenant_id = ? AND parent_product_id = ?
+               AND id IN (${removedIds.map(() => '?').join(',')})`,
+            [tenantId, parentId, ...removedIds],
+          );
+        }
+        await manager.query(
+          `UPDATE products SET variant_schema = ?, version = version + 1
+           WHERE id = ? AND tenant_id = ? AND version = ?`,
+          [JSON.stringify(attributes), parentId, tenantId, dto.version],
+        );
+        const product = await this.findProduct(manager, tenantId, parentId);
+        if (!product) throw new Error('UPDATED_PRODUCT_NOT_FOUND');
+        const variantRows = await manager.query<ProductRow[]>(
+          `${this.productSelect()} WHERE p.parent_product_id = ? AND p.tenant_id = ?
+           ORDER BY p.created_at, p.id`,
+          [parentId, tenantId],
+        );
+        product.variants = variantRows.map((row) => this.toProduct(row));
+        return product;
+      });
+    } catch (error) {
+      const constraint = this.duplicateConstraint(error);
+      if (constraint?.includes('uq_products_tenant_sku')) {
+        throw new ProductIdentifierConflictError('sku');
+      }
+      if (constraint?.includes('uq_products_tenant_barcode')) {
+        throw new ProductIdentifierConflictError('barcode');
+      }
+      throw error;
+    }
   }
 
   async retireProduct(
@@ -316,26 +521,28 @@ export class CatalogRepository {
           has_movements: number | string;
           has_sales: number | string;
           has_stock: number | string;
+          has_variants: number | string;
         }>
       >(
         `SELECT
            EXISTS(SELECT 1 FROM inventory_movements WHERE tenant_id = ? AND product_id = ?) AS has_movements,
            EXISTS(SELECT 1 FROM sale_lines WHERE tenant_id = ? AND product_id = ?) AS has_sales,
-           EXISTS(SELECT 1 FROM inventory_balances WHERE tenant_id = ? AND product_id = ? AND quantity <> 0) AS has_stock`,
-        [tenantId, id, tenantId, id, tenantId, id],
+           EXISTS(SELECT 1 FROM inventory_balances WHERE tenant_id = ? AND product_id = ? AND quantity <> 0) AS has_stock,
+           EXISTS(SELECT 1 FROM products WHERE tenant_id = ? AND parent_product_id = ?) AS has_variants`,
+        [tenantId, id, tenantId, id, tenantId, id, tenantId, id],
       );
       const mustPreserve =
         Number(references.has_movements) === 1 ||
         Number(references.has_sales) === 1 ||
-        Number(references.has_stock) === 1;
+        Number(references.has_stock) === 1 ||
+        Number(references.has_variants) === 1;
       if (mustPreserve) {
-        if (products[0].active) {
-          await manager.query(
-            `UPDATE products SET active = FALSE, version = version + 1
-             WHERE id = ? AND tenant_id = ?`,
-            [id, tenantId],
-          );
-        }
+        await manager.query(
+          `UPDATE products SET active = FALSE, version = version + 1
+           WHERE tenant_id = ? AND active = TRUE
+             AND (id = ? OR parent_product_id = ?)`,
+          [tenantId, id, id],
+        );
         return {
           outcome: 'DEACTIVATED',
           product: await this.findProduct(manager, tenantId, id),
@@ -541,6 +748,7 @@ export class CatalogRepository {
 
   private productSelect(): string {
     return `SELECT p.id, p.name, p.sku, p.barcode, p.track_lots, p.track_serials, p.cost, p.price, p.active, p.version,
+                   p.parent_product_id, p.variant_schema, p.variant_values,
                    c.id AS category_id, c.name AS category_name,
                    b.id AS brand_id, b.name AS brand_name
             FROM products p
@@ -619,7 +827,88 @@ export class CatalogRepository {
       price: row.price,
       active: Boolean(row.active),
       version: Number(row.version),
+      parentProductId: row.parent_product_id,
+      variantAttributes: this.jsonValue(row.variant_schema),
+      variantValues: this.jsonValue(row.variant_values),
+      sellable: row.variant_schema === null,
+      variants: [],
     };
+  }
+
+  private validateVariantConfiguration(dto: UpdateProductVariantsDto) {
+    const normalizedNames = new Set<string>();
+    const attributes = dto.attributes.map((attribute) => {
+      const normalizedName = this.normalize(attribute.name);
+      if (normalizedNames.has(normalizedName)) {
+        throw new ProductVariantConfigurationError(
+          'Los nombres de atributo no pueden repetirse.',
+        );
+      }
+      normalizedNames.add(normalizedName);
+      const normalizedValues = new Set<string>();
+      for (const value of attribute.values) {
+        const normalized = this.normalize(value);
+        if (normalizedValues.has(normalized)) {
+          throw new ProductVariantConfigurationError(
+            `El atributo ${attribute.name} contiene valores repetidos.`,
+          );
+        }
+        normalizedValues.add(normalized);
+      }
+      return { name: attribute.name, values: attribute.values };
+    });
+    const combinationCount = attributes.reduce(
+      (total, attribute) => total * attribute.values.length,
+      1,
+    );
+    if (combinationCount > 100) {
+      throw new ProductVariantConfigurationError(
+        'La configuración genera más de 100 combinaciones.',
+      );
+    }
+    if (dto.variants.length !== combinationCount) {
+      throw new ProductVariantConfigurationError(
+        'Debes configurar exactamente una variante por combinación.',
+      );
+    }
+    const expected = new Set(
+      this.cartesian(attributes.map(({ values }) => values)),
+    );
+    const received = new Set<string>();
+    for (const variant of dto.variants) {
+      if (variant.values.length !== attributes.length) {
+        throw new ProductVariantConfigurationError(
+          'Cada variante debe seleccionar un valor por atributo.',
+        );
+      }
+      const key = variant.values
+        .map((value) => this.normalize(value))
+        .join('\u0000');
+      if (!expected.has(key) || received.has(key)) {
+        throw new ProductVariantConfigurationError(
+          'Las combinaciones son inválidas o están repetidas.',
+        );
+      }
+      received.add(key);
+    }
+    return attributes;
+  }
+
+  private cartesian(values: string[][]): string[] {
+    return values
+      .reduce<string[][]>(
+        (combinations, options) =>
+          combinations.flatMap((combination) =>
+            options.map((option) => [...combination, this.normalize(option)]),
+          ),
+        [[]],
+      )
+      .map((combination) => combination.join('\u0000'));
+  }
+
+  private jsonValue<T>(value: string | T | null): T {
+    if (value === null) return [] as T;
+    return (typeof value === 'string' ? JSON.parse(value) : value) as T;
   }
 
   private normalize(value: string): string {

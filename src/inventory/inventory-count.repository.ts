@@ -115,7 +115,7 @@ export class InventoryCountRepository {
 
           const products = await manager.query<Array<{ id: string }>>(
             `SELECT id FROM products
-           WHERE tenant_id = ? AND active = TRUE
+           WHERE tenant_id = ? AND active = TRUE AND variant_schema IS NULL
              AND id IN (${productIds.map(() => '?').join(',')})
            ORDER BY id`,
             [input.tenantId, ...productIds],

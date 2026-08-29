@@ -4510,6 +4510,299 @@ describe('UInventario API (e2e)', () => {
         .query({ code: 'SCAN-SKU-1' })
         .expect(404);
     });
+
+    it('generates sellable variants with independent stock and preserves retired combinations', async () => {
+      await registerAccount('product-variant-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeOnboarding(registrationPayload.email, cookie);
+      const created = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Playera básica',
+          sku: 'PLAYERA',
+          barcode: '7500000000300',
+          categoryName: 'Ropa',
+          cost: '80.00',
+          price: '149.00',
+        })
+        .expect(201);
+      const parent = (created.body as { data: { id: string; version: number } })
+        .data;
+      const [location] = await dataSource.query<
+        Array<{ id: string; tenant_id: string }>
+      >(
+        `SELECT l.id, l.tenant_id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'variant-parent-initial-stock')
+        .send({
+          productId: parent.id,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '1',
+          reason: 'Validar conversión con stock',
+        })
+        .expect(201);
+
+      const attributes = [
+        { name: 'Color', values: ['Rojo', 'Azul'] },
+        { name: 'Talla', values: ['CH', 'M'] },
+      ];
+      const variant = (color: string, size: string, suffix: string) => ({
+        values: [color, size],
+        sku: `PLAYERA-${suffix}`,
+        barcode: `75000000003${
+          (
+            {
+              'R-CH': '11',
+              'R-M': '12',
+              'A-CH': '13',
+              'A-M': '14',
+              'N-CH': '15',
+              'N-M': '16',
+            } as Record<string, string>
+          )[suffix]
+        }`,
+        cost: '80.00',
+        price: '149.00',
+        active: true,
+      });
+      const initialVariants = [
+        variant('Rojo', 'CH', 'R-CH'),
+        variant('Rojo', 'M', 'R-M'),
+        variant('Azul', 'CH', 'A-CH'),
+        variant('Azul', 'M', 'A-M'),
+      ];
+      await request(app.getHttpServer())
+        .put(`/api/v1/products/${parent.id}/variants`)
+        .set('Cookie', cookie)
+        .send({
+          version: parent.version,
+          attributes,
+          variants: initialVariants,
+        })
+        .expect(409)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            code: 'PRODUCT_VARIANTS_REQUIRE_ZERO_STOCK',
+          }),
+        );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'variant-parent-clear-stock')
+        .send({
+          productId: parent.id,
+          locationId: location.id,
+          type: 'ADJUSTMENT',
+          quantity: '-1',
+          reason: 'Dejar padre sin stock',
+          reference: 'UIN-110-CONVERSION',
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .put(`/api/v1/products/${parent.id}/variants`)
+        .set('Cookie', cookie)
+        .send({
+          version: parent.version,
+          attributes,
+          variants: initialVariants.map((item) => ({
+            ...item,
+            sku: 'DUPLICADO',
+          })),
+        })
+        .expect(409)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({ code: 'SKU_ALREADY_EXISTS' }),
+        );
+
+      const configured = await request(app.getHttpServer())
+        .put(`/api/v1/products/${parent.id}/variants`)
+        .set('Cookie', cookie)
+        .send({
+          version: parent.version,
+          attributes,
+          variants: initialVariants,
+        })
+        .expect(200);
+      const configuredData = configured.body as {
+        data: {
+          id: string;
+          version: number;
+          sellable: boolean;
+          variantAttributes: typeof attributes;
+          variants: Array<{
+            id: string;
+            sku: string;
+            version: number;
+            active: boolean;
+            variantValues: Array<{ attribute: string; value: string }>;
+          }>;
+        };
+      };
+      expect(configuredData.data).toMatchObject({
+        id: parent.id,
+        version: 2,
+        sellable: false,
+        variantAttributes: attributes,
+      });
+      expect(configuredData.data.variants).toHaveLength(4);
+      const redSmall = configuredData.data.variants.find(
+        ({ sku }) => sku === 'PLAYERA-R-CH',
+      )!;
+
+      await request(app.getHttpServer())
+        .put(`/api/v1/products/${parent.id}/variants`)
+        .set('Cookie', cookie)
+        .send({
+          version: configuredData.data.version,
+          attributes,
+          variants: configuredData.data.variants.map((item, index) => ({
+            id: index === 1 ? configuredData.data.variants[0].id : item.id,
+            version:
+              index === 1
+                ? configuredData.data.variants[0].version
+                : item.version,
+            values: item.variantValues.map(({ value }) => value),
+            sku: item.sku,
+            cost: '80.00',
+            price: '149.00',
+            active: true,
+          })),
+        })
+        .expect(400)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            code: 'PRODUCT_VARIANT_CONFIGURATION_INVALID',
+          }),
+        );
+
+      await request(app.getHttpServer())
+        .get('/api/v1/products')
+        .set('Cookie', cookie)
+        .query({ q: 'PLAYERA', sellableOnly: true, pageSize: 10 })
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: Array<{ id: string; parentProductId: string }> };
+          }) => {
+            expect(body.data).toHaveLength(4);
+            expect(
+              body.data.every((item) => item.parentProductId === parent.id),
+            ).toBe(true);
+          },
+        );
+      await request(app.getHttpServer())
+        .get('/api/v1/products/resolve-code')
+        .set('Cookie', cookie)
+        .query({ code: 'PLAYERA' })
+        .expect(404);
+      await request(app.getHttpServer())
+        .get('/api/v1/products/resolve-code')
+        .set('Cookie', cookie)
+        .query({ code: redSmall.sku })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: { id: redSmall.id, parentProductId: parent.id },
+          }),
+        );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'variant-independent-stock')
+        .send({
+          productId: redSmall.id,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '3',
+          reason: 'Stock de variante',
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'parent-stock-rejected')
+        .send({
+          productId: parent.id,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '1',
+          reason: 'No debe aceptar padre',
+        })
+        .expect(404);
+
+      const blueVariants = configuredData.data.variants.filter(({ sku }) =>
+        sku.includes('-A-'),
+      );
+      const changed = await request(app.getHttpServer())
+        .put(`/api/v1/products/${parent.id}/variants`)
+        .set('Cookie', cookie)
+        .send({
+          version: configuredData.data.version,
+          attributes: [
+            { name: 'Color', values: ['Negro', 'Azul'] },
+            attributes[1],
+          ],
+          variants: [
+            variant('Negro', 'CH', 'N-CH'),
+            variant('Negro', 'M', 'N-M'),
+            ...blueVariants.map((item) => ({
+              id: item.id,
+              version: item.version,
+              values: item.variantValues.map(({ value }) => value),
+              sku: item.sku,
+              cost: '80.00',
+              price: '149.00',
+              active: true,
+            })),
+          ],
+        })
+        .expect(200);
+      expect(
+        (
+          changed.body as {
+            data: { variants: Array<{ sku: string; active: boolean }> };
+          }
+        ).data.variants,
+      ).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ sku: 'PLAYERA-R-CH', active: false }),
+        ]),
+      );
+      const [history] = await dataSource.query<
+        Array<{ total: number | string }>
+      >(
+        'SELECT COUNT(*) AS total FROM inventory_movements WHERE product_id = ?',
+        [redSmall.id],
+      );
+      expect(Number(history.total)).toBe(1);
+
+      await request(app.getHttpServer())
+        .delete(`/api/v1/products/${parent.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: { outcome: 'DEACTIVATED', product: { active: false } },
+          }),
+        );
+      const activeFamily = await dataSource.query<Array<{ id: string }>>(
+        `SELECT id FROM products
+         WHERE tenant_id = ? AND active = TRUE
+           AND (id = ? OR parent_product_id = ?)`,
+        [location.tenant_id, parent.id, parent.id],
+      );
+      expect(activeFamily).toEqual([]);
+    });
   });
 
   describe('inventory stock', () => {

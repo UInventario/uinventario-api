@@ -1,5 +1,6 @@
 import { Transform, Type } from 'class-transformer';
 import {
+  IsBoolean,
   IsEnum,
   IsInt,
   IsOptional,
@@ -43,6 +44,17 @@ export class ListProductsDto {
   @IsOptional()
   @IsUUID()
   brandId?: string;
+
+  @Transform(({ value }: { value: unknown }) =>
+    value === 'true' || value === true
+      ? true
+      : value === 'false' || value === false
+        ? false
+        : value,
+  )
+  @IsOptional()
+  @IsBoolean()
+  sellableOnly = false;
 
   @Type(() => Number)
   @IsInt()
