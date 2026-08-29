@@ -1058,6 +1058,7 @@ describe('UInventario API (e2e)', () => {
                   'PURCHASE_ORDERS_MANAGE',
                   'PURCHASE_RECEIPTS_OVERAGE',
                   'SALE_REPRINT',
+                  'SALES_CREDIT',
                   'SALES_DISCOUNT',
                   'SALES_MANAGE',
                   'SALES_RETURN',
