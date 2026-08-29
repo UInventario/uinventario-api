@@ -12,11 +12,13 @@ import {
   ProductQuantityPolicyLockedError,
   ProductVariantConfigurationError,
   ProductVariantsRequireZeroStockError,
+  ProductKitConfigurationError,
 } from './catalog.errors';
 import {
   CatalogClassificationData,
   CatalogOptionsResponse,
   ProductData,
+  ProductKitData,
 } from './catalog.types';
 import { ListProductsDto, ProductStatusFilter } from './dto/list-products.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
@@ -25,8 +27,10 @@ import {
   UpdateCatalogClassificationDto,
 } from './dto/catalog-classification.dto';
 import { UpdateProductVariantsDto } from './dto/update-product-variants.dto';
+import { UpdateProductKitDto } from './dto/update-product-kit.dto';
 import {
   assertProductQuantityPolicy,
+  normalizeProductQuantity,
   quantityToUnits,
   ProductBaseUnit,
   QuantityRoundingMode,
@@ -170,6 +174,7 @@ export class CatalogRepository {
             minimum_quantity: string;
             has_movements: number | string;
             specific_lot_policy: number | string;
+            is_kit: number | string;
           }>
         >(
           `SELECT p.track_lots, p.track_serials, p.base_unit,
@@ -183,7 +188,10 @@ export class CatalogRepository {
                            ))) AS has_movements,
                   EXISTS(SELECT 1 FROM inventory_valuation_policies ivp
                          WHERE ivp.tenant_id = p.tenant_id
-                           AND ivp.method = 'SPECIFIC_LOT') AS specific_lot_policy
+                           AND ivp.method = 'SPECIFIC_LOT') AS specific_lot_policy,
+                  EXISTS(SELECT 1 FROM product_kits pk
+                         WHERE pk.tenant_id = p.tenant_id
+                           AND pk.product_id = p.id) AS is_kit
            FROM products p WHERE p.id = ? AND p.tenant_id = ? LIMIT 1 FOR UPDATE`,
           [id, tenantId],
         );
@@ -223,6 +231,18 @@ export class CatalogRepository {
           nextQuantityPolicy,
           dto.trackSerials ?? Boolean(currentTracking.track_serials),
         );
+        if (
+          Number(currentTracking.is_kit) === 1 &&
+          (nextQuantityPolicy.baseUnit !== 'UNIT' ||
+            nextQuantityPolicy.precision !== 0 ||
+            quantityToUnits(nextQuantityPolicy.minimumQuantity) !== 1000n ||
+            (dto.trackLots ?? Boolean(currentTracking.track_lots)) ||
+            (dto.trackSerials ?? Boolean(currentTracking.track_serials)))
+        ) {
+          throw new ProductKitConfigurationError(
+            'El producto debe conservar unidades enteras y no controlar lotes ni series mientras sea un kit.',
+          );
+        }
         const quantityPolicyChanged =
           nextQuantityPolicy.baseUnit !== currentTracking.base_unit ||
           nextQuantityPolicy.precision !==
@@ -385,7 +405,207 @@ export class CatalogRepository {
       );
       product.variants = variants.map((row) => this.toProduct(row));
     }
+    product.kit = await this.findKit(this.dataSource, tenantId, id);
     return product;
+  }
+
+  async updateProductKit(
+    tenantId: string,
+    productId: string,
+    dto: UpdateProductKitDto,
+  ): Promise<ProductData | null> {
+    return this.dataSource.transaction(async (manager) => {
+      const [product] = await manager.query<
+        Array<{
+          id: string;
+          version: number;
+          variant_schema: string | null;
+          base_unit: ProductBaseUnit;
+          quantity_precision: number;
+          minimum_quantity: string;
+          track_lots: number | boolean;
+          track_serials: number | boolean;
+          existing_kit_stock_mode: 'DERIVED' | 'ASSEMBLED' | null;
+          existing_stock: string;
+        }>
+      >(
+        `SELECT p.id, p.version, p.variant_schema, p.base_unit, p.quantity_precision,
+                p.minimum_quantity, p.track_lots, p.track_serials,
+                (SELECT pk.stock_mode FROM product_kits pk
+                 WHERE pk.tenant_id = p.tenant_id AND pk.product_id = p.id
+                 LIMIT 1) AS existing_kit_stock_mode,
+                (SELECT COALESCE(SUM(ib.quantity), 0) FROM inventory_balances ib
+                 WHERE ib.tenant_id = p.tenant_id AND ib.product_id = p.id) AS existing_stock
+         FROM products p WHERE p.id = ? AND p.tenant_id = ? LIMIT 1 FOR UPDATE`,
+        [productId, tenantId],
+      );
+      if (!product) return null;
+      if (Number(product.version) !== dto.version) {
+        throw new ProductVersionConflictError(Number(product.version));
+      }
+      const hasOwnStock = quantityToUnits(product.existing_stock) !== 0n;
+      if (!dto.enabled) {
+        if (hasOwnStock && product.existing_kit_stock_mode) {
+          throw new ProductKitConfigurationError(
+            'Deja la existencia del kit en cero antes de eliminar su configuración.',
+          );
+        }
+        await manager.query(
+          'DELETE FROM product_kits WHERE product_id = ? AND tenant_id = ?',
+          [productId, tenantId],
+        );
+      } else {
+        if (
+          hasOwnStock &&
+          (!product.existing_kit_stock_mode ||
+            product.existing_kit_stock_mode !== dto.stockMode)
+        ) {
+          throw new ProductKitConfigurationError(
+            'Deja la existencia propia en cero antes de crear el kit o cambiar su modo de stock.',
+          );
+        }
+        if (
+          product.variant_schema !== null ||
+          product.base_unit !== 'UNIT' ||
+          Number(product.quantity_precision) !== 0 ||
+          quantityToUnits(product.minimum_quantity) !== 1000n ||
+          Boolean(product.track_lots) ||
+          Boolean(product.track_serials)
+        ) {
+          throw new ProductKitConfigurationError(
+            'El kit debe ser vendible por unidades enteras y no controlar lotes ni series.',
+          );
+        }
+        const requested = dto.components ?? [];
+        const componentIds = requested.map(({ productId: id }) => id);
+        if (
+          new Set(componentIds).size !== componentIds.length ||
+          componentIds.includes(productId)
+        ) {
+          throw new ProductKitConfigurationError(
+            'Los componentes no pueden repetirse ni incluir al propio kit.',
+          );
+        }
+        const components = await manager.query<
+          Array<{
+            id: string;
+            base_unit: ProductBaseUnit;
+            quantity_precision: number;
+            quantity_rounding: QuantityRoundingMode;
+            minimum_quantity: string;
+            track_lots: number | boolean;
+            track_serials: number | boolean;
+            nested_kit: number | string;
+          }>
+        >(
+          `SELECT p.id, p.base_unit, p.quantity_precision, p.quantity_rounding,
+                  p.minimum_quantity, p.track_lots, p.track_serials,
+                  EXISTS(SELECT 1 FROM product_kits pk
+                         WHERE pk.tenant_id = p.tenant_id AND pk.product_id = p.id) AS nested_kit
+           FROM products p
+           WHERE p.tenant_id = ? AND p.active = TRUE AND p.variant_schema IS NULL
+             AND p.id IN (${componentIds.map(() => '?').join(',')})`,
+          [tenantId, ...componentIds],
+        );
+        if (components.length !== componentIds.length) {
+          throw new ProductKitConfigurationError(
+            'Todos los componentes deben existir, estar activos y ser vendibles.',
+          );
+        }
+        const byId = new Map(
+          components.map((component) => [component.id, component]),
+        );
+        const normalized = requested.map((item, position) => {
+          const component = byId.get(item.productId)!;
+          if (
+            Number(component.nested_kit) === 1 ||
+            Boolean(component.track_lots) ||
+            Boolean(component.track_serials)
+          ) {
+            throw new ProductKitConfigurationError(
+              'Los kits anidados y componentes con lotes o series no están permitidos.',
+            );
+          }
+          return {
+            ...item,
+            position,
+            quantity: normalizeProductQuantity(item.quantity, {
+              baseUnit: component.base_unit,
+              precision: Number(component.quantity_precision),
+              rounding: component.quantity_rounding,
+              minimumQuantity: component.minimum_quantity,
+            }),
+          };
+        });
+        if (hasOwnStock) {
+          const currentComponents = await manager.query<
+            Array<{ component_product_id: string; quantity: string }>
+          >(
+            `SELECT component_product_id, quantity FROM product_kit_components
+             WHERE tenant_id = ? AND kit_product_id = ? ORDER BY component_product_id`,
+            [tenantId, productId],
+          );
+          const currentSignature = currentComponents
+            .map(
+              ({ component_product_id, quantity }) =>
+                `${component_product_id}:${quantity}`,
+            )
+            .join('|');
+          const nextSignature = normalized
+            .map(({ productId: id, quantity }) => `${id}:${quantity}`)
+            .sort()
+            .join('|');
+          if (currentSignature !== nextSignature) {
+            throw new ProductKitConfigurationError(
+              'Desensambla la existencia actual antes de cambiar los componentes del kit.',
+            );
+          }
+        }
+        await manager.query(
+          `INSERT INTO product_kits
+             (product_id, tenant_id, stock_mode, price_rule, effective_from, effective_to)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE stock_mode = VALUES(stock_mode),
+             price_rule = VALUES(price_rule), effective_from = VALUES(effective_from),
+             effective_to = VALUES(effective_to)`,
+          [
+            productId,
+            tenantId,
+            dto.stockMode,
+            dto.priceRule,
+            dto.effectiveFrom ?? null,
+            dto.effectiveTo ?? null,
+          ],
+        );
+        await manager.query(
+          'DELETE FROM product_kit_components WHERE tenant_id = ? AND kit_product_id = ?',
+          [tenantId, productId],
+        );
+        for (const component of normalized) {
+          await manager.query(
+            `INSERT INTO product_kit_components
+               (id, tenant_id, kit_product_id, component_product_id, quantity, position)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [
+              randomUUID(),
+              tenantId,
+              productId,
+              component.productId,
+              component.quantity,
+              component.position,
+            ],
+          );
+        }
+      }
+      await manager.query(
+        'UPDATE products SET version = version + 1 WHERE id = ? AND tenant_id = ?',
+        [productId, tenantId],
+      );
+      const updated = await this.findProduct(manager, tenantId, productId);
+      if (!updated) throw new Error('UPDATED_PRODUCT_NOT_FOUND');
+      updated.kit = await this.findKit(manager, tenantId, productId);
+      return updated;
+    });
   }
 
   async resolveCode(
@@ -429,17 +649,26 @@ export class CatalogRepository {
             version: number;
             parent_product_id: string | null;
             variant_schema: unknown;
+            is_kit: number | string;
           }>
         >(
           `SELECT id, name, category_id, brand_id, track_lots, base_unit,
                   quantity_precision, quantity_rounding, minimum_quantity,
                   lot_expiration_policy, lot_expiration_alert_days,
                   allow_expired_stock_override, track_serials, active,
-                  version, parent_product_id, variant_schema
+                  version, parent_product_id, variant_schema,
+                  EXISTS(SELECT 1 FROM product_kits pk
+                         WHERE pk.tenant_id = products.tenant_id
+                           AND pk.product_id = products.id) AS is_kit
            FROM products WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE`,
           [parentId, tenantId],
         );
         if (!parent) return null;
+        if (Number(parent.is_kit) === 1) {
+          throw new ProductVariantConfigurationError(
+            'Elimina la configuración del kit antes de crear variantes.',
+          );
+        }
         if (parent.parent_product_id) {
           throw new ProductVariantConfigurationError(
             'Una variante no puede contener otras variantes.',
@@ -862,6 +1091,58 @@ export class CatalogRepository {
     return row ? this.toProduct(row) : null;
   }
 
+  private async findKit(
+    source: DataSource | EntityManager,
+    tenantId: string,
+    productId: string,
+  ): Promise<ProductKitData | null> {
+    const rows = await source.query<
+      Array<{
+        stock_mode: ProductKitData['stockMode'];
+        price_rule: ProductKitData['priceRule'];
+        effective_from: string | Date | null;
+        effective_to: string | Date | null;
+        component_product_id: string;
+        component_name: string;
+        component_sku: string;
+        quantity: string;
+      }>
+    >(
+      `SELECT pk.stock_mode, pk.price_rule, pk.effective_from, pk.effective_to,
+              c.component_product_id, p.name AS component_name,
+              p.sku AS component_sku, c.quantity
+       FROM product_kits pk
+       INNER JOIN product_kit_components c
+         ON c.kit_product_id = pk.product_id AND c.tenant_id = pk.tenant_id
+       INNER JOIN products p
+         ON p.id = c.component_product_id AND p.tenant_id = c.tenant_id
+       WHERE pk.tenant_id = ? AND pk.product_id = ?
+       ORDER BY c.position, c.id`,
+      [tenantId, productId],
+    );
+    if (!rows[0]) return null;
+    const date = (value: string | Date | null) =>
+      value === null
+        ? null
+        : value instanceof Date
+          ? value.toISOString().slice(0, 10)
+          : value.slice(0, 10);
+    return {
+      stockMode: rows[0].stock_mode,
+      priceRule: rows[0].price_rule,
+      effectiveFrom: date(rows[0].effective_from),
+      effectiveTo: date(rows[0].effective_to),
+      components: rows.map((row) => ({
+        product: {
+          id: row.component_product_id,
+          name: row.component_name,
+          sku: row.component_sku,
+        },
+        quantity: row.quantity,
+      })),
+    };
+  }
+
   private productSelect(): string {
     return `SELECT p.id, p.name, p.sku, p.barcode, p.base_unit,
                    p.quantity_precision, p.quantity_rounding, p.minimum_quantity,
@@ -960,6 +1241,7 @@ export class CatalogRepository {
       variantValues: this.jsonValue(row.variant_values),
       sellable: row.variant_schema === null,
       variants: [],
+      kit: null,
     };
   }
 

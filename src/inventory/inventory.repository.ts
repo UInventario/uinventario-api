@@ -1405,7 +1405,13 @@ export class InventoryRepository {
        LEFT JOIN inventory_balances ib ON ib.tenant_id = p.tenant_id
          AND ib.product_id = p.id AND ib.location_id = l.id
        WHERE p.id = ? AND p.tenant_id = ? AND p.active = TRUE
-         AND p.variant_schema IS NULL LIMIT 1`,
+         AND p.variant_schema IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM product_kits pk
+           WHERE pk.tenant_id = p.tenant_id AND pk.product_id = p.id
+             AND pk.stock_mode = 'DERIVED'
+         )
+       LIMIT 1`,
       [locationId, warehouseId, productId, tenantId],
     );
     if (!rows[0]) throw new InventoryTargetNotFoundError();

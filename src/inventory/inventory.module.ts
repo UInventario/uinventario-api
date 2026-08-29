@@ -19,6 +19,8 @@ import { InventoryStockAlertRepository } from './inventory-stock-alert.repositor
 import { InventoryStockAlertService } from './inventory-stock-alert.service';
 import { InventoryActivityReportRepository } from './inventory-activity-report.repository';
 import { InventoryActivityReportService } from './inventory-activity-report.service';
+import { InventoryKitRepository } from './inventory-kit.repository';
+import { InventoryKitService } from './inventory-kit.service';
 
 @Module({
   imports: [SessionModule],
@@ -43,6 +45,8 @@ import { InventoryActivityReportService } from './inventory-activity-report.serv
     InventoryStockAlertService,
     InventoryActivityReportRepository,
     InventoryActivityReportService,
+    InventoryKitRepository,
+    InventoryKitService,
     PermissionGuard,
   ],
   exports: [

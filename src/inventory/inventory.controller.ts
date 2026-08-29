@@ -40,6 +40,8 @@ import {
   InventoryActivityReportDto,
 } from './dto/inventory-activity-report.dto';
 import { InventoryActivityReportService } from './inventory-activity-report.service';
+import { InventoryKitService } from './inventory-kit.service';
+import { CreateInventoryKitOperationDto } from './dto/create-inventory-kit-operation.dto';
 
 @Controller('inventory')
 @UseGuards(SessionGuard, PermissionGuard)
@@ -51,7 +53,45 @@ export class InventoryController {
     private readonly valuationPolicy: InventoryValuationPolicyService,
     private readonly reconciliation: InventoryReconciliationService,
     private readonly activityReports: InventoryActivityReportService,
+    private readonly inventoryKits: InventoryKitService,
   ) {}
+
+  @Post('kits/:productId/operations')
+  @RequirePermissions('INVENTORY_ADJUST')
+  async operateKit(
+    @Req() request: AuthenticatedRequest,
+    @Param('productId', new ParseUUIDPipe()) productId: string,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: CreateInventoryKitOperationDto,
+  ) {
+    const result = await this.inventoryKits.operate({
+      tenantId: request.principal.tenant.id,
+      warehouseId: request.principal.context.warehouse!.id,
+      userId: request.principal.user.id,
+      productId,
+      idempotencyKey,
+      dto,
+    });
+    if (!result.meta.idempotentReplay) {
+      await this.audit.record({
+        tenantId: request.principal.tenant.id,
+        actorUserId: request.principal.user.id,
+        action:
+          dto.operationType === 'ASSEMBLE'
+            ? 'PRODUCT_KIT_ASSEMBLED'
+            : 'PRODUCT_KIT_DISASSEMBLED',
+        entityType: 'KIT_INVENTORY_OPERATION',
+        entityId: result.data.id,
+        correlationId: request.requestId!,
+        after: {
+          kitProductId: productId,
+          locationId: dto.locationId,
+          quantity: result.data.quantity,
+        },
+      });
+    }
+    return result;
+  }
 
   @Get('reports/activity')
   @RequirePermissions('INVENTORY_VIEW')

@@ -32,6 +32,7 @@ import {
   type ProductImportFile,
 } from './product-import.service';
 import { UpdateProductVariantsDto } from './dto/update-product-variants.dto';
+import { UpdateProductKitDto } from './dto/update-product-kit.dto';
 
 @Controller('products')
 @UseGuards(SessionGuard, ProductAccessGuard)
@@ -208,6 +209,29 @@ export class CatalogController {
           }),
         ),
       },
+    });
+    return result;
+  }
+
+  @Put(':id/kit')
+  async updateProductKit(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Body() dto: UpdateProductKitDto,
+  ) {
+    const result = await this.catalog.updateProductKit(
+      request.principal.tenant.id,
+      id,
+      dto,
+    );
+    await this.audit.record({
+      tenantId: request.principal.tenant.id,
+      actorUserId: request.principal.user.id,
+      action: 'PRODUCT_KIT_UPDATED',
+      entityType: 'PRODUCT',
+      entityId: id,
+      correlationId: request.requestId!,
+      after: result.data.kit ? { ...result.data.kit } : { enabled: false },
     });
     return result;
   }

@@ -761,10 +761,85 @@ export class SalesRepository {
           );
           if (!openShift) throw new CashRegisterShiftRequiredError();
           const allocations = new Map<string, StockAllocation[]>();
+          const derivedAllocations = new Map<string, StockAllocation[]>();
           let insufficientProductId: string | null = null;
+          for (const line of [...input.quote.lines]
+            .filter((item) => item.kit?.stockMode === 'DERIVED')
+            .sort((left, right) =>
+              left.product.id.localeCompare(right.product.id),
+            )) {
+            for (const component of [...line.kit!.components].sort(
+              (left, right) => left.product.id.localeCompare(right.product.id),
+            )) {
+              const balances = await manager.query<
+                Array<{
+                  location_id: string;
+                  quantity: string;
+                  available_quantity: string;
+                  reserved_quantity: string;
+                }>
+              >(
+                `SELECT ib.location_id, ib.quantity, ib.available_quantity,
+                        ib.reserved_quantity
+                 FROM inventory_balances ib
+                 INNER JOIN locations l
+                   ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
+                 WHERE ib.tenant_id = ? AND ib.product_id = ? AND l.warehouse_id = ?
+                 ORDER BY l.created_at, l.id FOR UPDATE`,
+                [
+                  input.tenantId,
+                  component.product.id,
+                  input.quote.context.warehouse.id,
+                ],
+              );
+              let remaining = this.toQuantityUnits(component.totalQuantity);
+              const componentAllocations: StockAllocation[] = [];
+              for (const balance of balances) {
+                if (remaining === 0n) break;
+                const available = this.toQuantityUnits(
+                  balance.available_quantity,
+                );
+                const total = this.toQuantityUnits(balance.quantity);
+                const reserved = this.toQuantityUnits(
+                  balance.reserved_quantity,
+                );
+                const taken = available < remaining ? available : remaining;
+                if (taken === 0n) continue;
+                const allocation = {
+                  locationId: balance.location_id,
+                  quantityChange: this.fromQuantityUnits(-taken),
+                  resultingQuantity: this.fromQuantityUnits(total - taken),
+                  resultingAvailableQuantity: this.fromQuantityUnits(
+                    available - taken,
+                  ),
+                  resultingReservedQuantity: this.fromQuantityUnits(reserved),
+                };
+                componentAllocations.push(allocation);
+                await manager.query(
+                  `UPDATE inventory_balances
+                   SET quantity = ?, available_quantity = ?
+                   WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
+                  [
+                    allocation.resultingQuantity,
+                    allocation.resultingAvailableQuantity,
+                    input.tenantId,
+                    component.product.id,
+                    allocation.locationId,
+                  ],
+                );
+                remaining -= taken;
+              }
+              derivedAllocations.set(
+                `${line.product.id}:${component.product.id}`,
+                componentAllocations,
+              );
+              if (remaining > 0n) insufficientProductId = line.product.id;
+            }
+          }
           for (const line of [...input.quote.lines].sort((left, right) =>
             left.product.id.localeCompare(right.product.id),
           )) {
+            if (line.kit?.stockMode === 'DERIVED') continue;
             const serialsByLocation = new Map<string, string[]>();
             if (line.serialNumbers.length > 0) {
               const placeholders = line.serialNumbers.map(() => '?').join(',');
@@ -956,11 +1031,17 @@ export class SalesRepository {
           );
           for (const [index, line] of input.quote.lines.entries()) {
             const saleLineId = randomUUID();
-            const [productCost] = await manager.query<Array<{ cost: string }>>(
-              `SELECT cost FROM products WHERE id = ? AND tenant_id = ? LIMIT 1`,
-              [line.product.id, input.tenantId],
-            );
-            if (!productCost) throw new Error('SALE_PRODUCT_COST_NOT_FOUND');
+            let unitCost = line.kit?.unitCost;
+            if (!unitCost) {
+              const [productCost] = await manager.query<
+                Array<{ cost: string }>
+              >(
+                `SELECT cost FROM products WHERE id = ? AND tenant_id = ? LIMIT 1`,
+                [line.product.id, input.tenantId],
+              );
+              if (!productCost) throw new Error('SALE_PRODUCT_COST_NOT_FOUND');
+              unitCost = productCost.cost;
+            }
             await manager.query(
               `INSERT INTO sale_lines
               (id, tenant_id, sale_id, line_number, product_id, product_name,
@@ -982,7 +1063,7 @@ export class SalesRepository {
                 line.priceSource,
                 line.priceList?.id ?? null,
                 line.priceList?.name ?? null,
-                productCost.cost,
+                unitCost,
                 line.grossTotal,
                 line.discount.line?.amount ?? '0.00',
                 line.discount.sale?.amount ?? '0.00',
@@ -996,68 +1077,120 @@ export class SalesRepository {
                 line.total,
               ],
             );
-            for (const [allocationIndex, allocation] of (
-              allocations.get(line.product.id) ?? []
-            ).entries()) {
-              const movementId = randomUUID();
-              await manager.query(
-                `UPDATE inventory_balances
-                 SET quantity = ?, available_quantity = ?, reserved_quantity = ?
-               WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
-                [
-                  allocation.resultingQuantity,
-                  allocation.resultingAvailableQuantity,
-                  allocation.resultingReservedQuantity,
-                  input.tenantId,
-                  line.product.id,
-                  allocation.locationId,
-                ],
-              );
-              const movementKey = `sale:${saleId}:${index + 1}:${allocationIndex + 1}`;
-              const movementFingerprint = createHash('sha256')
-                .update(
-                  JSON.stringify({
+            if (line.kit?.stockMode === 'DERIVED') {
+              for (const component of line.kit.components) {
+                await manager.query(
+                  `INSERT INTO sale_kit_components
+                     (id, tenant_id, sale_id, sale_line_id, kit_product_id,
+                      component_product_id, component_name, component_sku,
+                      quantity_per_kit, total_quantity, unit_cost)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  [
+                    randomUUID(),
+                    input.tenantId,
                     saleId,
                     saleLineId,
-                    productId: line.product.id,
-                    locationId: allocation.locationId,
-                    quantityChange: allocation.quantityChange,
-                  }),
-                )
-                .digest('hex');
-              await manager.query(
-                `INSERT INTO inventory_movements
+                    line.product.id,
+                    component.product.id,
+                    component.product.name,
+                    component.product.sku,
+                    component.quantityPerKit,
+                    component.totalQuantity,
+                    component.unitCost,
+                  ],
+                );
+              }
+            }
+            const inventoryTargets =
+              line.kit?.stockMode === 'DERIVED'
+                ? line.kit.components.map((component) => ({
+                    productId: component.product.id,
+                    allocations:
+                      derivedAllocations.get(
+                        `${line.product.id}:${component.product.id}`,
+                      ) ?? [],
+                    derived: true,
+                  }))
+                : [
+                    {
+                      productId: line.product.id,
+                      allocations: allocations.get(line.product.id) ?? [],
+                      derived: false,
+                    },
+                  ];
+            for (const [targetIndex, target] of inventoryTargets.entries()) {
+              for (const [
+                allocationIndex,
+                allocation,
+              ] of target.allocations.entries()) {
+                const movementId = randomUUID();
+                // Derived component balances were already updated while acquiring
+                // their locks so later direct lines allocate from the reduced stock.
+                // Reapplying an intermediate value here could overwrite a direct
+                // component allocation when the cart order differs.
+                if (!target.derived) {
+                  await manager.query(
+                    `UPDATE inventory_balances
+                     SET quantity = ?, available_quantity = ?, reserved_quantity = ?
+                     WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
+                    [
+                      allocation.resultingQuantity,
+                      allocation.resultingAvailableQuantity,
+                      allocation.resultingReservedQuantity,
+                      input.tenantId,
+                      target.productId,
+                      allocation.locationId,
+                    ],
+                  );
+                }
+                const movementKey = `sale:${saleId}:${index + 1}:${targetIndex + 1}:${allocationIndex + 1}`;
+                const movementFingerprint = createHash('sha256')
+                  .update(
+                    JSON.stringify({
+                      saleId,
+                      saleLineId,
+                      productId: target.productId,
+                      locationId: allocation.locationId,
+                      quantityChange: allocation.quantityChange,
+                    }),
+                  )
+                  .digest('hex');
+                await manager.query(
+                  `INSERT INTO inventory_movements
                 (id, tenant_id, product_id, location_id, type, quantity_change,
                  resulting_quantity, reason, reference, idempotency_key,
                  request_fingerprint, created_by_user_id, sale_id, sale_line_id,
                  reservation_id, reservation_line_id)
                VALUES (?, ?, ?, ?, 'SALE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [
-                  movementId,
-                  input.tenantId,
-                  line.product.id,
-                  allocation.locationId,
-                  allocation.quantityChange,
-                  allocation.resultingQuantity,
-                  `Venta ${receiptNumber}`,
-                  receiptNumber,
-                  movementKey,
-                  movementFingerprint,
-                  input.userId,
-                  saleId,
-                  saleLineId,
-                  input.reservationId ?? null,
-                  allocation.reservationLineId ?? null,
-                ],
-              );
-              await applyInventoryValuation(manager, movementId);
-              await applyInventoryLotTracking(manager, movementId, {
-                preferredLotId: line.lotId ?? undefined,
-                allowExpired: Boolean(line.expiredLotOverrideReason),
-              });
-              await applyInventorySerialTracking(manager, movementId, {
-                serialNumbers: allocation.serialNumbers,
-              });
+                  [
+                    movementId,
+                    input.tenantId,
+                    target.productId,
+                    allocation.locationId,
+                    allocation.quantityChange,
+                    allocation.resultingQuantity,
+                    `Venta ${receiptNumber}`,
+                    receiptNumber,
+                    movementKey,
+                    movementFingerprint,
+                    input.userId,
+                    saleId,
+                    saleLineId,
+                    input.reservationId ?? null,
+                    allocation.reservationLineId ?? null,
+                  ],
+                );
+                await applyInventoryValuation(manager, movementId);
+                if (!target.derived) {
+                  await applyInventoryLotTracking(manager, movementId, {
+                    preferredLotId: line.lotId ?? undefined,
+                    allowExpired: Boolean(line.expiredLotOverrideReason),
+                  });
+                  await applyInventorySerialTracking(manager, movementId, {
+                    serialNumbers: allocation.serialNumbers,
+                  });
+                }
+              }
             }
           }
           let creditAccountId: string | null = null;
