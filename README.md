@@ -63,6 +63,8 @@ El mapeo verificado de nombres, IDs y números de proyecto para Dev/Prod está e
 de despliegue debe indicar el Project ID explícitamente.
 El contrato validado de variables y nombres de Secret Manager está en
 [`docs/operations/environment-contract.md`](docs/operations/environment-contract.md).
+El contrato v1, diagnóstico y alta segura de adaptadores externos está en
+[`docs/operations/external-adapters.md`](docs/operations/external-adapters.md).
 Las imágenes, recursos mínimos, migración previa y rollback de Cloud Run están en
 [`docs/operations/cloud-run.md`](docs/operations/cloud-run.md).
 El mapeo automático `develop` → Dev y `master` → Prod, sus identidades y triggers

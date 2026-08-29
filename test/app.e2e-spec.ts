@@ -41,6 +41,8 @@ describe('UInventario API (e2e)', () => {
   async function resetIdentityData(): Promise<void> {
     await dataSource.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const table of [
+      'external_adapter_executions',
+      'external_adapter_configs',
       'notification_deliveries',
       'notifications',
       'notification_preferences',
@@ -219,6 +221,228 @@ describe('UInventario API (e2e)', () => {
           error: {},
           details: { database: { status: 'up' } },
         });
+    });
+  });
+
+  describe('versioned external adapters', () => {
+    beforeEach(resetIdentityData);
+
+    it('configures tenant adapters and observes idempotent retry, rejection and timeout', async () => {
+      await registerAccount('adapter-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Adapters SA',
+          tradeName: 'Adapters',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega',
+          locationName: 'General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja' })
+        .expect(200);
+      const configurations = await request(app.getHttpServer())
+        .get('/api/v1/integrations/adapters')
+        .set('Cookie', cookie)
+        .expect(200);
+      expect(configurations.body).toMatchObject({
+        data: [
+          {
+            capability: 'NOTIFICATION_EMAIL',
+            countryCode: 'MX',
+            provider: 'SIMULATOR',
+            adapterVersion: '1',
+          },
+          {
+            capability: 'NOTIFICATION_PUSH',
+            countryCode: 'MX',
+            provider: 'SIMULATOR',
+            adapterVersion: '1',
+          },
+        ],
+        meta: {
+          apiVersion: '1',
+          secrets: { valuesAcceptedByApi: false },
+        },
+      });
+
+      await request(app.getHttpServer())
+        .put('/api/v1/integrations/adapters/NOTIFICATION_EMAIL')
+        .set('Cookie', cookie)
+        .send({
+          countryCode: 'CL',
+          provider: 'SIMULATOR',
+          adapterVersion: '1',
+          enabled: true,
+          timeoutMs: 50,
+          maxAttempts: 2,
+          secretReference: 'uinventario-email-provider-key',
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: {
+              capability: 'NOTIFICATION_EMAIL',
+              countryCode: 'CL',
+              timeoutMs: 50,
+              maxAttempts: 2,
+              secretReference: 'uinventario-email-provider-key',
+            },
+          }),
+        );
+
+      const retry = await request(app.getHttpServer())
+        .post('/api/v1/integrations/adapters/NOTIFICATION_EMAIL/diagnostics')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'adapter-retry-001')
+        .send({ scenario: 'RETRY' })
+        .expect(201);
+      const retryBody = retry.body as {
+        data: {
+          id: string;
+          status: string;
+          attemptCount: number;
+          errorCode: string | null;
+        };
+      };
+      expect(retryBody).toMatchObject({
+        data: { status: 'SUCCEEDED', attemptCount: 2, errorCode: null },
+      });
+      const replay = await request(app.getHttpServer())
+        .post('/api/v1/integrations/adapters/NOTIFICATION_EMAIL/diagnostics')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'adapter-retry-001')
+        .send({ scenario: 'REJECT' })
+        .expect(201);
+      const replayBody = replay.body as {
+        data: { id: string; status: string; attemptCount: number };
+      };
+      expect(replayBody.data).toMatchObject({
+        id: retryBody.data.id,
+        status: 'SUCCEEDED',
+        attemptCount: 2,
+      });
+      await request(app.getHttpServer())
+        .post('/api/v1/integrations/adapters/NOTIFICATION_EMAIL/diagnostics')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'adapter-reject-001')
+        .send({ scenario: 'REJECT' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: {
+              status: 'REJECTED',
+              attemptCount: 1,
+              errorCode: 'SIMULATED_REJECTED',
+            },
+          }),
+        );
+      await request(app.getHttpServer())
+        .post('/api/v1/integrations/adapters/NOTIFICATION_EMAIL/diagnostics')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'adapter-timeout-001')
+        .send({ scenario: 'TIMEOUT' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: {
+              status: 'TIMED_OUT',
+              attemptCount: 2,
+              errorCode: 'ADAPTER_TIMEOUT',
+            },
+          }),
+        );
+      await request(app.getHttpServer())
+        .get('/api/v1/integrations/adapters/executions')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) =>
+          expect(body.data).toHaveLength(3),
+        );
+
+      const secondary = {
+        organizationName: 'Tenant de adaptadores B',
+        email: 'adapter-secondary@example.com',
+        password: 'Correcta-2026!',
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'adapter-secondary-registration')
+        .send(secondary)
+        .expect(201);
+      const secondaryCookie = await createPersistedSession(secondary.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', secondaryCookie)
+        .send({
+          legalName: 'Adapters B SA',
+          tradeName: 'Adapters B',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', secondaryCookie)
+        .send({
+          branchName: 'Principal B',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega B',
+          locationName: 'General B',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', secondaryCookie)
+        .send({ name: 'Caja B' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/integrations/adapters/executions')
+        .set('Cookie', secondaryCookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({ data: [] }),
+        );
+      await request(app.getHttpServer())
+        .post('/api/v1/integrations/adapters/NOTIFICATION_EMAIL/diagnostics')
+        .set('Cookie', secondaryCookie)
+        .set('Idempotency-Key', 'adapter-retry-001')
+        .send({ scenario: 'SUCCESS' })
+        .expect(201)
+        .expect(({ body }: { body: { data: { id: string } } }) =>
+          expect(body.data.id).not.toBe(retryBody.data.id),
+        );
+
+      const [identity] = await dataSource.query<
+        Array<{ role_id: string; tenant_id: string }>
+      >(
+        `SELECT role.id AS role_id, role.tenant_id FROM users user
+         INNER JOIN user_roles user_role ON user_role.user_id = user.id
+         INNER JOIN roles role ON role.id = user_role.role_id
+         WHERE user.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions WHERE role_id = ? AND tenant_id = ?
+           AND permission = 'TENANT_MANAGE'`,
+        [identity.role_id, identity.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/integrations/adapters')
+        .set('Cookie', cookie)
+        .expect(403);
     });
   });
 

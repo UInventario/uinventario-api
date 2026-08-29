@@ -1,3 +1,4 @@
+import { ExternalAdapterExecutionService } from '../integrations/external-adapter-execution.service';
 import { NotificationDeliveryService } from './notification-delivery.service';
 import { NotificationRepository } from './notification.repository';
 
@@ -28,20 +29,18 @@ describe('NotificationDeliveryService', () => {
       markDeliveryFailed: jest.fn().mockResolvedValue(undefined),
       markDeliverySent: jest.fn().mockResolvedValue(undefined),
     };
-    const email = {
-      channel: 'EMAIL' as const,
-      send: jest
+    const adapters = {
+      execute: jest
         .fn()
         .mockRejectedValueOnce(new Error('provider included sensitive details'))
-        .mockResolvedValueOnce({ providerReference: 'SIM-EMAIL-safe' }),
+        .mockResolvedValueOnce({
+          status: 'SUCCEEDED',
+          providerReference: 'SIM-EMAIL-safe',
+        }),
     };
     const service = new NotificationDeliveryService(
       repository as unknown as NotificationRepository,
-      email,
-      {
-        channel: 'PUSH',
-        send: jest.fn(),
-      },
+      adapters as unknown as ExternalAdapterExecutionService,
     );
 
     await expect(service.process('tenant-1')).resolves.toEqual({
@@ -61,6 +60,13 @@ describe('NotificationDeliveryService', () => {
     expect(repository.markDeliverySent).toHaveBeenCalledWith(
       'delivery-1',
       'SIM-EMAIL-safe',
+    );
+    expect(adapters.execute).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        tenantId: 'tenant-1',
+        capability: 'NOTIFICATION_EMAIL',
+        idempotencyKey: 'delivery-1:2',
+      }),
     );
   });
 });
