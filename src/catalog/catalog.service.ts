@@ -11,6 +11,7 @@ import {
   ProductIdentifierConflictError,
   ProductVersionConflictError,
   ProductLotTrackingLockedError,
+  ProductQuantityPolicyLockedError,
   ProductVariantConfigurationError,
   ProductVariantsRequireZeroStockError,
 } from './catalog.errors';
@@ -28,6 +29,7 @@ import {
   UpdateCatalogClassificationDto,
 } from './dto/catalog-classification.dto';
 import { UpdateProductVariantsDto } from './dto/update-product-variants.dto';
+import { assertProductQuantityPolicy } from '../common/quantity-policy';
 
 @Injectable()
 export class CatalogService {
@@ -38,6 +40,16 @@ export class CatalogService {
     dto: CreateProductDto,
   ): Promise<ProductResponse> {
     this.assertLotExpirationPolicy(dto, true);
+    assertProductQuantityPolicy(
+      {
+        baseUnit: dto.baseUnit ?? 'UNIT',
+        precision: dto.quantityPrecision ?? (dto.trackSerials ? 0 : 3),
+        rounding: dto.quantityRounding ?? 'HALF_UP',
+        minimumQuantity:
+          dto.minimumQuantity ?? (dto.trackSerials ? '1.000' : '0.001'),
+      },
+      dto.trackSerials ?? false,
+    );
     try {
       return {
         data: await this.catalog.createProduct(tenantId, dto),
@@ -95,6 +107,13 @@ export class CatalogService {
           code: 'PRODUCT_LOT_TRACKING_LOCKED',
           message:
             'El control por lotes no puede cambiar después del primer movimiento de inventario.',
+        });
+      }
+      if (error instanceof ProductQuantityPolicyLockedError) {
+        throw new ConflictException({
+          code: 'PRODUCT_QUANTITY_POLICY_LOCKED',
+          message:
+            'La unidad, precisi\u00f3n, redondeo y cantidad m\u00ednima no pueden cambiar despu\u00e9s del primer movimiento.',
         });
       }
       throw error;

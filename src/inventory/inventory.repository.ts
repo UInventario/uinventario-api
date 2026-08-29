@@ -1,6 +1,12 @@
 import { Injectable } from '@nestjs/common';
 import { createHash, randomUUID } from 'node:crypto';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
+import {
+  normalizeProductQuantity,
+  ProductBaseUnit,
+  ProductQuantityPolicy,
+  QuantityRoundingMode,
+} from '../common/quantity-policy';
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
 import { CreateInventoryStateTransitionDto } from './dto/create-inventory-state-transition.dto';
 import { ListInventoryStockDto } from './dto/list-inventory-stock.dto';
@@ -1134,6 +1140,9 @@ export class InventoryRepository {
           product_sku: string;
           active: number | boolean;
           track_lots: number | boolean;
+          base_unit: ProductBaseUnit;
+          quantity_precision: number;
+          minimum_quantity: string;
           available_quantity: string;
           reserved_quantity: string;
           damaged_quantity: string;
@@ -1151,7 +1160,8 @@ export class InventoryRepository {
           fifo_currency: string | null;
         }>
       >(
-        `SELECT p.id AS product_id, p.name AS product_name, p.sku AS product_sku, p.active, p.track_lots,
+        `SELECT p.id AS product_id, p.name AS product_name, p.sku AS product_sku,
+                p.active, p.track_lots, p.base_unit, p.quantity_precision, p.minimum_quantity,
                 CASE WHEN p.track_lots THEN LEAST(
                   COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.available_quantity ELSE 0 END), 0),
                   (SELECT COALESCE(SUM(ilb.quantity), 0)
@@ -1226,7 +1236,8 @@ export class InventoryRepository {
          LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
          LEFT JOIN inventory_valuations iv ON iv.product_id = p.id AND iv.tenant_id = p.tenant_id
          WHERE ${where}
-         GROUP BY p.id, p.name, p.sku, p.active, p.track_lots, p.cost, p.created_at,
+         GROUP BY p.id, p.name, p.sku, p.active, p.track_lots, p.base_unit,
+                  p.quantity_precision, p.minimum_quantity, p.cost, p.created_at,
                   iv.quantity, iv.average_unit_cost, iv.inventory_value
          ORDER BY p.created_at DESC, p.id DESC LIMIT ? OFFSET ?`,
         [
@@ -1310,6 +1321,9 @@ export class InventoryRepository {
             sku: row.product_sku,
             active: Boolean(row.active),
             trackLots: Boolean(row.track_lots),
+            baseUnit: row.base_unit,
+            quantityPrecision: Number(row.quantity_precision),
+            minimumQuantity: row.minimum_quantity,
           },
           availableQuantity: available,
           totalQuantity: total,
@@ -1430,7 +1444,18 @@ export class InventoryRepository {
     idempotencyKey: string;
     dto: CreateInventoryMovementDto;
   }): Promise<{ movement: InventoryMovementData; replay: boolean }> {
-    const quantityChange = this.quantityChange(input.dto);
+    const policy = await this.productQuantityPolicy(
+      input.tenantId,
+      input.dto.productId,
+    );
+    const normalizedInput = normalizeProductQuantity(
+      input.dto.quantity,
+      policy,
+      {
+        allowNegative: input.dto.type === 'ADJUSTMENT',
+      },
+    );
+    const quantityChange = this.quantityChange(input.dto, normalizedInput);
     const fingerprint = createHash('sha256')
       .update(
         JSON.stringify({
@@ -1589,8 +1614,20 @@ export class InventoryRepository {
     },
     attempt = 0,
   ): Promise<{ count: InventoryCountData; replay: boolean }> {
-    const snapshotUnits = this.toUnits(input.dto.snapshotQuantity);
-    const countedUnits = this.toUnits(input.dto.countedQuantity);
+    const policy = await this.productQuantityPolicy(
+      input.tenantId,
+      input.dto.productId,
+    );
+    const snapshotUnits = this.toUnits(
+      normalizeProductQuantity(input.dto.snapshotQuantity, policy, {
+        enforceMinimum: false,
+      }),
+    );
+    const countedUnits = this.toUnits(
+      normalizeProductQuantity(input.dto.countedQuantity, policy, {
+        enforceMinimum: false,
+      }),
+    );
     const fingerprint = createHash('sha256')
       .update(
         JSON.stringify({
@@ -1760,7 +1797,13 @@ export class InventoryRepository {
     ) {
       throw new InvalidStockStateTransitionError();
     }
-    const quantityUnits = this.toUnits(input.dto.quantity);
+    const policy = await this.productQuantityPolicy(
+      input.tenantId,
+      input.dto.productId,
+    );
+    const quantityUnits = this.toUnits(
+      normalizeProductQuantity(input.dto.quantity, policy),
+    );
     if (quantityUnits <= 0n) throw new InvalidStockStateTransitionError();
     const normalizedQuantity = this.fromUnits(quantityUnits);
     const fingerprint = createHash('sha256')
@@ -1966,8 +2009,11 @@ export class InventoryRepository {
     return rows[0] ?? null;
   }
 
-  private quantityChange(dto: CreateInventoryMovementDto): string {
-    const units = this.toUnits(dto.quantity);
+  private quantityChange(
+    dto: CreateInventoryMovementDto,
+    normalizedQuantity: string,
+  ): string {
+    const units = this.toUnits(normalizedQuantity);
     if (units === 0n) throw new InsufficientStockError();
     if (dto.type === 'ADJUSTMENT') return this.fromUnits(units);
     if (units < 0n) throw new InsufficientStockError();
@@ -1981,6 +2027,31 @@ export class InventoryRepository {
     const [whole, fraction = ''] = unsigned.split('.');
     const units = BigInt(whole) * 1000n + BigInt(fraction.padEnd(3, '0'));
     return negative ? -units : units;
+  }
+
+  private async productQuantityPolicy(
+    tenantId: string,
+    productId: string,
+  ): Promise<ProductQuantityPolicy> {
+    const [row] = await this.dataSource.query<
+      Array<{
+        base_unit: ProductBaseUnit;
+        quantity_precision: number;
+        quantity_rounding: QuantityRoundingMode;
+        minimum_quantity: string;
+      }>
+    >(
+      `SELECT base_unit, quantity_precision, quantity_rounding, minimum_quantity
+       FROM products WHERE id = ? AND tenant_id = ? AND active = TRUE LIMIT 1`,
+      [productId, tenantId],
+    );
+    if (!row) throw new InventoryTargetNotFoundError();
+    return {
+      baseUnit: row.base_unit,
+      precision: Number(row.quantity_precision),
+      rounding: row.quantity_rounding,
+      minimumQuantity: row.minimum_quantity,
+    };
   }
 
   private stateColumn(

@@ -24,6 +24,9 @@ interface LinkRow {
   product_sku: string;
   catalog_cost: string;
   catalog_price: string;
+  base_unit: import('../common/quantity-policy').ProductBaseUnit;
+  quantity_precision: number;
+  product_minimum_quantity: string;
   supplier_code: string;
   minimum_quantity: string | null;
   active: number | boolean;
@@ -282,6 +285,9 @@ export class SupplierProductRepository {
         sku: row.product_sku,
         catalogCost: row.catalog_cost,
         catalogPrice: row.catalog_price,
+        baseUnit: row.base_unit,
+        quantityPrecision: Number(row.quantity_precision),
+        minimumQuantity: row.product_minimum_quantity,
       },
       supplierCode: row.supplier_code,
       minimumQuantity: row.minimum_quantity,
@@ -307,6 +313,8 @@ export class SupplierProductRepository {
                    COALESCE(s.trade_name, s.legal_name) AS supplier_name,
                    sp.product_id, p.name AS product_name, p.sku AS product_sku,
                    p.cost AS catalog_cost, p.price AS catalog_price,
+                   p.base_unit, p.quantity_precision,
+                   p.minimum_quantity AS product_minimum_quantity,
                    sp.supplier_code, sp.minimum_quantity, sp.active, sp.version,
                    sp.created_at, sp.updated_at
             FROM supplier_products sp

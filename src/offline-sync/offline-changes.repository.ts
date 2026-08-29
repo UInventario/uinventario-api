@@ -103,11 +103,16 @@ export class OfflineChangesRepository {
           category_id: string | null;
           brand_id: string | null;
           price: string;
+          base_unit: import('../common/quantity-policy').ProductBaseUnit;
+          quantity_precision: number;
+          quantity_rounding: import('../common/quantity-policy').QuantityRoundingMode;
+          minimum_quantity: string;
           version: number;
           updated_at: string | Date;
         }>
       >(
-        `SELECT id, sku, barcode, name, category_id, brand_id, price, version, updated_at
+        `SELECT id, sku, barcode, name, category_id, brand_id, price, base_unit,
+                quantity_precision, quantity_rounding, minimum_quantity, version, updated_at
          FROM products WHERE tenant_id = ? AND active = FALSE AND variant_schema IS NULL
            AND updated_at > ? AND updated_at <= ?`,
         [input.tenantId, input.since, input.until],
@@ -125,6 +130,10 @@ export class OfflineChangesRepository {
           categoryId: row.category_id,
           brandId: row.brand_id,
           price: this.decimal(row.price, 2),
+          baseUnit: row.base_unit,
+          quantityPrecision: Number(row.quantity_precision),
+          quantityRounding: row.quantity_rounding,
+          minimumQuantity: this.decimal(row.minimum_quantity, 3),
           active: false,
         })),
       );
@@ -158,6 +167,12 @@ export class OfflineChangesRepository {
             categoryId: this.nullableScalar(payload.categoryId),
             brandId: this.nullableScalar(payload.brandId),
             price: this.scalar(payload.price),
+            baseUnit: (this.scalar(payload.baseUnit) ||
+              'UNIT') as import('../common/quantity-policy').ProductBaseUnit,
+            quantityPrecision: Number(payload.quantityPrecision ?? 3),
+            quantityRounding: (this.scalar(payload.quantityRounding) ||
+              'HALF_UP') as import('../common/quantity-policy').QuantityRoundingMode,
+            minimumQuantity: this.scalar(payload.minimumQuantity) || '0.001',
             active: false,
           };
         }),

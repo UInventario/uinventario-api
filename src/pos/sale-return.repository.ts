@@ -15,6 +15,7 @@ import {
   SaleReturnQuantityError,
   SaleReturnSerialError,
 } from './sale-return.types';
+import { normalizeProductQuantity } from '../common/quantity-policy';
 
 interface SaleLineRow {
   id: string;
@@ -26,6 +27,10 @@ interface SaleLineRow {
   tax: string;
   total: string;
   track_serials: number | boolean;
+  base_unit: import('../common/quantity-policy').ProductBaseUnit;
+  quantity_precision: number;
+  quantity_rounding: import('../common/quantity-policy').QuantityRoundingMode;
+  minimum_quantity: string;
 }
 
 interface SourceMovementRow {
@@ -172,7 +177,9 @@ export class SaleReturnRepository {
           const placeholders = requestedIds.map(() => '?').join(',');
           const saleLines = await manager.query<SaleLineRow[]>(
             `SELECT sl.id, sl.product_id, sl.product_name, sl.product_sku,
-                    sl.quantity, sl.subtotal, sl.tax, sl.total, p.track_serials
+                    sl.quantity, sl.subtotal, sl.tax, sl.total, p.track_serials,
+                    p.base_unit, p.quantity_precision, p.quantity_rounding,
+                    p.minimum_quantity
              FROM sale_lines sl
              INNER JOIN products p
                ON p.id = sl.product_id AND p.tenant_id = sl.tenant_id
@@ -201,7 +208,14 @@ export class SaleReturnRepository {
           }>;
           for (const requested of input.dto.lines) {
             const source = byId.get(requested.saleLineId)!;
-            const quantity = this.toQuantity(requested.quantity);
+            const quantity = this.toQuantity(
+              normalizeProductQuantity(requested.quantity, {
+                baseUnit: source.base_unit,
+                precision: Number(source.quantity_precision),
+                rounding: source.quantity_rounding,
+                minimumQuantity: source.minimum_quantity,
+              }),
+            );
             const [accumulated] = await manager.query<
               Array<{
                 quantity: string;

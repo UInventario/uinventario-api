@@ -366,6 +366,9 @@ export interface InventoryStockItem {
     sku: string;
     active: boolean;
     trackLots: boolean;
+    baseUnit: import('../common/quantity-policy').ProductBaseUnit;
+    quantityPrecision: number;
+    minimumQuantity: string;
   };
   availableQuantity: string;
   totalQuantity: string;

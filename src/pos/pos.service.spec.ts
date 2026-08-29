@@ -110,6 +110,48 @@ describe('PosService', () => {
     );
   });
 
+  it('quotes a fractional product using its decimal quantity policy', async () => {
+    const { service, productId } = expirationService();
+    const repository = (
+      service as unknown as { pos: { getProducts: jest.Mock } }
+    ).pos;
+    repository.getProducts.mockResolvedValueOnce([
+      {
+        id: productId,
+        name: 'Producto por peso',
+        sku: 'PESO-1',
+        price: '10.00',
+        active: true,
+        trackLots: false,
+        trackSerials: false,
+        baseUnit: 'KILOGRAM',
+        quantityPrecision: 2,
+        quantityRounding: 'HALF_UP',
+        minimumQuantity: '0.250',
+        availableQuantity: '5.000',
+      },
+    ]);
+
+    const quote = await service.quoteCart({
+      tenantId: 'tenant',
+      branchId: 'branch',
+      warehouseId: 'warehouse',
+      cashRegisterId: 'register',
+      userId: 'user',
+      dto: { lines: [{ productId, quantity: '1.235' }] },
+    });
+
+    expect(quote.data.lines[0]).toMatchObject({
+      quantity: '1.240',
+      product: {
+        baseUnit: 'KILOGRAM',
+        quantityPrecision: 2,
+        minimumQuantity: '0.250',
+      },
+      total: '12.40',
+    });
+  });
+
   it('selects the tenant country tax rate without changing the final sale price', async () => {
     const repository = {
       getContext: jest.fn().mockResolvedValue({

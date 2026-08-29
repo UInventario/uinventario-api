@@ -12,6 +12,9 @@ export interface PurchaseOrderLineData {
   productId: string;
   productName: string;
   productSku: string;
+  baseUnit: import('../common/quantity-policy').ProductBaseUnit;
+  quantityPrecision: number;
+  minimumQuantity: string;
   supplierCode: string;
   quantity: string;
   receivedQuantity: string;

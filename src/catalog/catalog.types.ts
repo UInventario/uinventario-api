@@ -3,6 +3,10 @@ export interface ProductData {
   name: string;
   sku: string;
   barcode: string | null;
+  baseUnit: import('../common/quantity-policy').ProductBaseUnit;
+  quantityPrecision: number;
+  quantityRounding: import('../common/quantity-policy').QuantityRoundingMode;
+  minimumQuantity: string;
   trackLots: boolean;
   lotExpirationPolicy?: 'NONE' | 'OPTIONAL' | 'REQUIRED';
   lotExpirationAlertDays?: number;

@@ -1,4 +1,9 @@
 import { Injectable } from '@nestjs/common';
+import {
+  normalizeProductQuantity,
+  ProductBaseUnit,
+  QuantityRoundingMode,
+} from '../common/quantity-policy';
 import { randomUUID } from 'node:crypto';
 import type { ResultSetHeader } from 'mysql2';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
@@ -65,6 +70,9 @@ interface LineRow {
   product_id: string;
   product_name: string;
   product_sku: string;
+  base_unit: ProductBaseUnit;
+  quantity_precision: number;
+  minimum_quantity: string;
   supplier_code: string;
   quantity: string;
   received_quantity: string;
@@ -136,6 +144,10 @@ interface LineReferenceRow {
   product_sku: string;
   supplier_code: string;
   price_currency: string | null;
+  base_unit: ProductBaseUnit;
+  quantity_precision: number;
+  quantity_rounding: QuantityRoundingMode;
+  minimum_quantity: string;
 }
 
 interface PersistedLine {
@@ -387,7 +399,8 @@ export class PurchaseOrderRepository {
     const ids = dto.lines.map((line) => line.supplierProductId);
     const references = await manager.query<LineReferenceRow[]>(
       `SELECT sp.id, sp.product_id, p.name AS product_name, p.sku AS product_sku,
-              sp.supplier_code,
+              sp.supplier_code, p.base_unit, p.quantity_precision,
+              p.quantity_rounding, p.minimum_quantity,
               (SELECT spp.currency FROM supplier_product_prices spp
                WHERE spp.tenant_id = sp.tenant_id AND spp.supplier_product_id = sp.id
                ORDER BY spp.valid_from DESC, spp.created_at DESC, spp.id DESC LIMIT 1
@@ -408,10 +421,16 @@ export class PurchaseOrderRepository {
       if (reference.price_currency !== dto.currency) {
         throw new PurchaseOrderReferenceError('CURRENCY');
       }
+      const quantity = normalizeProductQuantity(input.quantity, {
+        baseUnit: reference.base_unit,
+        precision: Number(reference.quantity_precision),
+        rounding: reference.quantity_rounding,
+        minimumQuantity: reference.minimum_quantity,
+      });
       return {
-        input,
+        input: { ...input, quantity },
         reference,
-        subtotal: this.lineSubtotal(input.quantity, input.unitCost),
+        subtotal: this.lineSubtotal(quantity, input.unitCost),
       };
     });
   }
@@ -495,12 +514,14 @@ export class PurchaseOrderRepository {
     const parameters = [tenantId, ...rows.map((row) => row.id)];
     const [lines, transitions, receipts, returns] = await Promise.all([
       manager.query<LineRow[]>(
-        `SELECT id, purchase_order_id, supplier_product_id, product_id,
-                product_name, product_sku, supplier_code, quantity,
+        `SELECT pol.id, pol.purchase_order_id, pol.supplier_product_id, pol.product_id,
+                pol.product_name, pol.product_sku, pol.supplier_code, pol.quantity,
+                p.base_unit, p.quantity_precision, p.minimum_quantity,
                 received_quantity, unit_cost, subtotal, notes
-         FROM purchase_order_lines
-         WHERE tenant_id = ? AND purchase_order_id IN (${placeholders})
-         ORDER BY purchase_order_id, position`,
+         FROM purchase_order_lines pol
+         INNER JOIN products p ON p.id = pol.product_id AND p.tenant_id = pol.tenant_id
+         WHERE pol.tenant_id = ? AND pol.purchase_order_id IN (${placeholders})
+         ORDER BY pol.purchase_order_id, pol.position`,
         parameters,
       ),
       manager.query<TransitionRow[]>(
@@ -695,6 +716,9 @@ export class PurchaseOrderRepository {
             productId: line.product_id,
             productName: line.product_name,
             productSku: line.product_sku,
+            baseUnit: line.base_unit,
+            quantityPrecision: Number(line.quantity_precision),
+            minimumQuantity: line.minimum_quantity,
             supplierCode: line.supplier_code,
             quantity: line.quantity,
             receivedQuantity: line.received_quantity,

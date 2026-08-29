@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { quantityFromUnits, quantityToUnits } from '../common/quantity-policy';
 import { DataSource } from 'typeorm';
 import { ListStockAlertsDto } from './dto/list-stock-alerts.dto';
 import { InventoryTargetNotFoundError } from './inventory.errors';
@@ -252,8 +253,10 @@ export class InventoryStockAlertRepository {
         code: row.location_code,
       },
       status: row.status,
-      availableQuantity: Number(row.available_quantity).toFixed(3),
-      threshold: Number(row.low_stock_threshold).toFixed(3),
+      availableQuantity: quantityFromUnits(
+        quantityToUnits(row.available_quantity),
+      ),
+      threshold: quantityFromUnits(quantityToUnits(row.low_stock_threshold)),
       transitionedAt: new Date(row.transitioned_at).toISOString(),
     };
   }
