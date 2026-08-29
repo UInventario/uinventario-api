@@ -48,6 +48,7 @@ describe('PosService', () => {
       } as unknown as CashRegisterShiftService,
       { enabledMethods: jest.fn().mockReturnValue(['CASH']) } as never,
       { resolve: jest.fn().mockResolvedValue(new Map()) } as never,
+      { resolve: jest.fn().mockResolvedValue(new Map()) } as never,
       {
         taxRates: { MX: '0.1600', DEFAULT: '0.0000' },
         nonCashProvider: 'DISABLED',
@@ -180,6 +181,7 @@ describe('PosService', () => {
       } as unknown as CashRegisterShiftService,
       { enabledMethods: jest.fn().mockReturnValue(['CASH']) } as never,
       { resolve: jest.fn().mockResolvedValue(new Map()) } as never,
+      { resolve: jest.fn().mockResolvedValue(new Map()) } as never,
       {
         taxRates: { MX: '0.1600', CL: '0.1900', DEFAULT: '0.0000' },
         nonCashProvider: 'DISABLED',
@@ -250,6 +252,7 @@ describe('PosService', () => {
       } as unknown as CashRegisterShiftService,
       { enabledMethods: jest.fn().mockReturnValue(['CASH']) } as never,
       { resolve: jest.fn().mockResolvedValue(new Map()) } as never,
+      { resolve: jest.fn().mockResolvedValue(new Map()) } as never,
       {
         taxRates: { US: '0.0000', DEFAULT: '0.0000' },
         nonCashProvider: 'DISABLED',
@@ -284,6 +287,7 @@ describe('PosService', () => {
     expect(quote.data.totals).toEqual({
       gross: '3.00',
       lineDiscount: '0.00',
+      promotionDiscount: '0.00',
       saleDiscount: '1.00',
       discount: '1.00',
       subtotal: '2.00',

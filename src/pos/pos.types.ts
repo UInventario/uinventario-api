@@ -31,6 +31,9 @@ export interface PosAppliedDiscount {
   amount: string;
 }
 
+export type PosAppliedPromotion =
+  import('../promotions/promotion.types').AppliedPromotion;
+
 export interface PosCartQuoteResponse {
   data: {
     context: {
@@ -75,6 +78,7 @@ export interface PosCartQuoteResponse {
         sale: PosAppliedDiscount | null;
         total: string;
       };
+      promotions: PosAppliedPromotion[];
       subtotal: string;
       tax: string;
       total: string;
@@ -82,6 +86,7 @@ export interface PosCartQuoteResponse {
     totals: {
       gross: string;
       lineDiscount: string;
+      promotionDiscount: string;
       saleDiscount: string;
       discount: string;
       subtotal: string;
@@ -114,6 +119,7 @@ export interface OfflineCashSaleSnapshot {
   totals: {
     gross?: string;
     lineDiscount?: '0.00';
+    promotionDiscount?: '0.00';
     saleDiscount?: '0.00';
     discount?: '0.00';
     subtotal: string;
@@ -161,6 +167,7 @@ export interface CashSaleData {
       sale: PosAppliedDiscount | null;
       total: string;
     };
+    promotions: PosAppliedPromotion[];
     subtotal: string;
     tax: string;
     total: string;

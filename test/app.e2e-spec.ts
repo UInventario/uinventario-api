@@ -66,6 +66,9 @@ describe('UInventario API (e2e)', () => {
       'password_reset_tokens',
       'pos_peripheral_operations',
       'pos_peripheral_profiles',
+      'sale_line_promotions',
+      'promotion_quantity_tiers',
+      'promotion_products',
       'price_list_items',
       'sale_receipt_snapshots',
       'customer_credit_ledger',
@@ -92,6 +95,7 @@ describe('UInventario API (e2e)', () => {
       'sale_lines',
       'sales',
       'sales_quotations',
+      'promotions',
       'price_lists',
       'cash_register_movements',
       'cash_register_shifts',
@@ -8258,6 +8262,172 @@ describe('UInventario API (e2e)', () => {
               ],
             },
           });
+        });
+    });
+
+    it('applies scoped promotions deterministically and preserves their sale snapshot on update and return', async () => {
+      const { cookie, productId } = await preparePos();
+      const [branch] = await dataSource.query<Array<{ id: string }>>(
+        'SELECT id FROM branches LIMIT 1',
+      );
+      const past = new Date(Date.now() - 60_000).toISOString();
+      const future = new Date(Date.now() + 86_400_000).toISOString();
+      const expiredFrom = new Date(Date.now() - 172_800_000).toISOString();
+      const expiredTo = new Date(Date.now() - 86_400_000).toISOString();
+      const promotionBody = {
+        type: 'BUY_X_GET_Y',
+        branchId: branch.id,
+        channel: 'POS',
+        priority: 100,
+        stackable: false,
+        validFrom: past,
+        validTo: future,
+        active: true,
+        discountPercent: '100',
+        buyQuantity: '1',
+        rewardQuantity: '1',
+        products: [{ productId, quantity: '1' }],
+        tiers: [],
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/promotions')
+        .set('Cookie', cookie)
+        .send({
+          ...promotionBody,
+          name: '2x1 expirado',
+          priority: 1000,
+          validFrom: expiredFrom,
+          validTo: expiredTo,
+        })
+        .expect(201);
+      const createdResponse = await request(app.getHttpServer())
+        .post('/api/v1/promotions')
+        .set('Cookie', cookie)
+        .send({ ...promotionBody, name: '2x1 vigente' })
+        .expect(201);
+      const created = createdResponse.body as {
+        data: { id: string; version: number };
+      };
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ channel: 'POS', lines: [{ productId, quantity: '2' }] })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  promotions: [
+                    {
+                      promotion: {
+                        id: created.data.id,
+                        name: '2x1 vigente',
+                        type: 'BUY_X_GET_Y',
+                      },
+                      amount: '119.90',
+                      ruleSnapshot: { discountPercent: '100.0000' },
+                    },
+                  ],
+                  total: '119.90',
+                },
+              ],
+              totals: {
+                gross: '239.80',
+                promotionDiscount: '119.90',
+                discount: '119.90',
+                total: '119.90',
+              },
+            },
+          });
+        });
+
+      const createSale = () =>
+        request(app.getHttpServer())
+          .post('/api/v1/pos/sales')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', 'promotion-sale-001')
+          .send({
+            channel: 'POS',
+            lines: [{ productId, quantity: '2' }],
+            payments: [
+              {
+                method: 'CASH',
+                amount: '119.90',
+                amountReceived: '120.00',
+              },
+            ],
+          });
+      const saleResponse = await createSale()
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [{ promotions: [{ amount: '119.90' }] }],
+              totals: { promotionDiscount: '119.90', total: '119.90' },
+            },
+            meta: { idempotentReplay: false },
+          });
+        });
+      await createSale()
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { idempotentReplay: true } });
+        });
+      const sale = saleResponse.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+
+      await request(app.getHttpServer())
+        .put(`/api/v1/promotions/${created.data.id}`)
+        .set('Cookie', cookie)
+        .send({
+          ...promotionBody,
+          name: '2x1 vigente modificado',
+          discountPercent: '50',
+          version: created.data.version,
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${sale.data.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  promotions: [
+                    {
+                      promotion: { name: '2x1 vigente' },
+                      amount: '119.90',
+                      ruleSnapshot: { discountPercent: '100.0000' },
+                    },
+                  ],
+                },
+              ],
+              totals: { promotionDiscount: '119.90' },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${sale.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'promotion-return-001')
+        .send({
+          reason: 'Devolución parcial con promoción histórica',
+          lines: [
+            {
+              saleLineId: sale.data.lines[0].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { totals: { total: '59.95' } } });
         });
     });
 
