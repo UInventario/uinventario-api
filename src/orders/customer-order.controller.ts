@@ -114,6 +114,22 @@ export class CustomerOrderController {
     return this.runTransition(request, orderId, idempotencyKey, dto, 'deliver');
   }
 
+  @Post(':orderId/dispatch')
+  dispatch(
+    @Req() request: AuthenticatedRequest,
+    @Param('orderId', ParseUUIDPipe) orderId: string,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: TransitionCustomerOrderDto,
+  ) {
+    return this.runTransition(
+      request,
+      orderId,
+      idempotencyKey,
+      dto,
+      'dispatch',
+    );
+  }
+
   @Post(':orderId/cancel')
   cancel(
     @Req() request: AuthenticatedRequest,
@@ -129,7 +145,7 @@ export class CustomerOrderController {
     orderId: string,
     idempotencyKey: string | undefined,
     dto: TransitionCustomerOrderDto,
-    action: 'confirm' | 'prepare' | 'ready' | 'deliver' | 'cancel',
+    action: 'confirm' | 'prepare' | 'ready' | 'dispatch' | 'deliver' | 'cancel',
   ) {
     const input = { ...this.context(request), orderId, idempotencyKey, dto };
     const result =
@@ -140,20 +156,33 @@ export class CustomerOrderController {
               'INVENTORY_VALUATION_MANAGE',
             ),
           })
-        : await this.orders[action](input);
-    const auditAction = {
-      confirm: 'CUSTOMER_ORDER_CONFIRMED',
-      prepare: 'CUSTOMER_ORDER_PREPARED',
-      ready: 'CUSTOMER_ORDER_READY',
-      deliver: 'CUSTOMER_ORDER_DELIVERED',
-      cancel: 'CUSTOMER_ORDER_CANCELLED',
-    }[action];
+        : action === 'dispatch'
+          ? await this.orders.dispatch(input)
+          : await this.orders[action](input);
+    const auditAction =
+      action === 'dispatch'
+        ? result.data.fulfillment.status === 'DISPATCHED'
+          ? 'CUSTOMER_ORDER_DISPATCHED'
+          : 'CUSTOMER_ORDER_DISPATCH_RETRYABLE'
+        : {
+            confirm: 'CUSTOMER_ORDER_CONFIRMED',
+            prepare: 'CUSTOMER_ORDER_PREPARED',
+            ready: 'CUSTOMER_ORDER_READY',
+            deliver: 'CUSTOMER_ORDER_DELIVERED',
+            cancel: 'CUSTOMER_ORDER_CANCELLED',
+          }[action];
     await this.record(request, orderId, auditAction, {
       status: result.data.status,
       version: result.data.version,
       reservationId: result.data.reservation?.id ?? null,
       saleId: result.data.sale?.id ?? null,
       reason: dto.reason ?? null,
+      fulfillment: {
+        method: result.data.fulfillment.method,
+        status: result.data.fulfillment.status,
+        carrierCode: result.data.fulfillment.carrier?.code ?? null,
+        attempts: result.data.fulfillment.carrier?.attempts ?? 0,
+      },
     });
     if (action === 'confirm' && result.data.reservation) {
       await this.recordRelated(
