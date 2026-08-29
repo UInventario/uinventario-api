@@ -1,3 +1,5 @@
+import type { CustomerCreditPaymentData } from '../pos/customer-credit-payment.types';
+
 export interface CustomerData {
   id: string;
   name: string;
@@ -50,6 +52,7 @@ export interface CustomerHistoryItemData {
 
 export interface CustomerHistoryData {
   customer: CustomerData;
+  credit: CustomerCreditStatementData | null;
   summary: {
     currency: string | null;
     salesCount: number;
@@ -59,4 +62,29 @@ export interface CustomerHistoryData {
     voidedAmount: string;
   };
   items: CustomerHistoryItemData[];
+}
+
+export interface CustomerCreditStatementData {
+  currency: string;
+  balance: string;
+  overdueAmount: string;
+  status: 'DISABLED' | 'AVAILABLE' | 'LIMIT_REACHED' | 'OVERDUE';
+  accounts: Array<{
+    id: string;
+    sale: { id: string; receiptNumber: string };
+    originalAmount: string;
+    balance: string;
+    dueDate: string;
+    status: 'OPEN' | 'PARTIAL' | 'PAID' | 'OVERDUE' | 'CANCELLED';
+    installments: Array<{
+      id: string;
+      number: number;
+      dueDate: string;
+      amount: string;
+      paidAmount: string;
+      balance: string;
+      status: 'OPEN' | 'PARTIAL' | 'PAID' | 'OVERDUE' | 'CANCELLED';
+    }>;
+  }>;
+  payments: CustomerCreditPaymentData[];
 }

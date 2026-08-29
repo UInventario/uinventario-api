@@ -66,6 +66,15 @@ export class CustomerService {
     return { data: customer, meta: { apiVersion: '1' as const } };
   }
 
+  async creditStatement(tenantId: string, id: string) {
+    const customer = await this.customers.findById(tenantId, id);
+    if (!customer) throw new NotFoundException();
+    return {
+      data: await this.customers.creditStatement(tenantId, id),
+      meta: { apiVersion: '1' as const },
+    };
+  }
+
   async history(
     tenantId: string,
     branchId: string,

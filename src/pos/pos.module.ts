@@ -38,15 +38,20 @@ import {
   SimulatorPosPeripheralAdapter,
 } from './pos-peripheral.adapter';
 import { PriceListModule } from '../pricing/price-list.module';
+import { CustomerModule } from '../customers/customer.module';
+import { CustomerCreditPaymentController } from './customer-credit-payment.controller';
+import { CustomerCreditPaymentRepository } from './customer-credit-payment.repository';
+import { CustomerCreditPaymentService } from './customer-credit-payment.service';
 
 @Module({
-  imports: [SessionModule, PriceListModule],
+  imports: [SessionModule, PriceListModule, CustomerModule],
   controllers: [
     PosController,
     SaleReceiptController,
     SaleReturnController,
     SuspendedSaleController,
     PosPeripheralController,
+    CustomerCreditPaymentController,
   ],
   providers: [
     PosRepository,
@@ -71,6 +76,8 @@ import { PriceListModule } from '../pricing/price-list.module';
     SuspendedSaleService,
     PosPeripheralRepository,
     PosPeripheralService,
+    CustomerCreditPaymentRepository,
+    CustomerCreditPaymentService,
     SimulatorPosPeripheralAdapter,
     {
       provide: POS_PERIPHERAL_ADAPTER,
