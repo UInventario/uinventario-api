@@ -69,9 +69,6 @@ export class CreatePromotions1788087600000 implements MigrationInterface {
       `UPDATE sales_quotation_lines SET promotions_snapshot = JSON_ARRAY() WHERE promotions_snapshot IS NULL`,
     );
     await queryRunner.query(`
-      ALTER TABLE sales_quotation_lines MODIFY promotions_snapshot JSON NOT NULL
-    `);
-    await queryRunner.query(`
       ALTER TABLE sales
       DROP CHECK ck_sales_discount_amounts,
       ADD COLUMN promotion_discount_total DECIMAL(15,2) NOT NULL DEFAULT 0 AFTER line_discount_total,

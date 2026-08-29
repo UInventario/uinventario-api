@@ -80,7 +80,7 @@ interface QuotationLineRow {
   discount_type: 'PERCENT' | 'AMOUNT' | null;
   discount_value: string | null;
   discount_reason: string | null;
-  promotions_snapshot: string | PosAppliedPromotion[];
+  promotions_snapshot: string | PosAppliedPromotion[] | null;
   subtotal: string;
   tax: string;
   total: string;
@@ -738,7 +738,7 @@ export class SalesQuotationRepository {
       ? value
       : (JSON.parse(value || '[]') as string[]);
   }
-  private jsonArray<T>(value: string | T[]): T[] {
+  private jsonArray<T>(value: string | T[] | null): T[] {
     return Array.isArray(value) ? value : (JSON.parse(value || '[]') as T[]);
   }
   private decimalSum(left: string, right: string): string {
