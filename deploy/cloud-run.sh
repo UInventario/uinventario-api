@@ -114,7 +114,7 @@ gcloud run deploy "$service_name" \
   --max=3 \
   --timeout=60s \
   --labels="app=uinventario,environment=${environment},component=api,owner=uinventario" \
-  --startup-probe=httpGet.path=/health/live,initialDelaySeconds=0,timeoutSeconds=3,periodSeconds=3,failureThreshold=10 \
+  --startup-probe=httpGet.path=/health/live,initialDelaySeconds=0,timeoutSeconds=3,periodSeconds=3,failureThreshold=20 \
   --liveness-probe=httpGet.path=/health/live,initialDelaySeconds=10,timeoutSeconds=3,periodSeconds=30,failureThreshold=3 \
   --readiness-probe=httpGet.path=/health/ready,timeoutSeconds=3,periodSeconds=5,failureThreshold=3 \
   --quiet
