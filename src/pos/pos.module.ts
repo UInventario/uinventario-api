@@ -18,6 +18,9 @@ import { SalesCashReportService } from './sales-cash-report.service';
 import { SaleReceiptController } from './sale-receipt.controller';
 import { SaleReceiptRepository } from './sale-receipt.repository';
 import { SaleReceiptService } from './sale-receipt.service';
+import { SaleFiscalDocumentController } from './sale-fiscal-document.controller';
+import { SaleFiscalDocumentRepository } from './sale-fiscal-document.repository';
+import { SaleFiscalDocumentService } from './sale-fiscal-document.service';
 import { SaleReturnController } from './sale-return.controller';
 import { SaleReturnRepository } from './sale-return.repository';
 import { SaleReturnService } from './sale-return.service';
@@ -63,6 +66,7 @@ import {
   controllers: [
     PosController,
     SaleReceiptController,
+    SaleFiscalDocumentController,
     SaleReturnController,
     SuspendedSaleController,
     PosPeripheralController,
@@ -86,6 +90,8 @@ import {
     PosProfitabilityReportService,
     SaleReceiptRepository,
     SaleReceiptService,
+    SaleFiscalDocumentRepository,
+    SaleFiscalDocumentService,
     SaleReturnRepository,
     SaleReturnSettlementRepository,
     SaleReturnService,

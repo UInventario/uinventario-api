@@ -54,6 +54,7 @@ import { SimulatedFiscalAdapter } from './simulated-fiscal.adapter';
     ExternalAdapterExecutionService,
     ExternalAdapterRepository,
     TransactionalEmailTemplateService,
+    FiscalSimulatorService,
   ],
 })
 export class ExternalAdapterModule {}

@@ -114,10 +114,35 @@ export class SimulatedFiscalAdapter implements VersionedFiscalProviderAdapter {
     documentType: string,
   ) {
     const xml = `<?xml version="1.0" encoding="UTF-8"?><simulated-fiscal-document provider-reference="${providerReference}" country="${countryCode}" type="${documentType}"/>`;
-    const pdf = `%PDF-1.4\n% UInventario simulated fiscal artifact\n1 0 obj<</Type/Catalog>>endobj\n% ${providerReference}\n%%EOF`;
+    const pdf = this.pdf(providerReference);
     return {
       PDF: Buffer.from(pdf).toString('base64'),
       XML: Buffer.from(xml).toString('base64'),
     };
+  }
+
+  private pdf(providerReference: string): string {
+    const stream = `BT /F1 12 Tf 72 720 Td (UInventario fiscal simulator) Tj 0 -20 Td (${providerReference}) Tj ET`;
+    const objects = [
+      '<< /Type /Catalog /Pages 2 0 R >>',
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>',
+      `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
+      '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    ];
+    let content = '%PDF-1.4\n% UInventario simulated fiscal artifact\n';
+    const offsets = [0];
+    objects.forEach((object, index) => {
+      offsets.push(Buffer.byteLength(content));
+      content += `${index + 1} 0 obj\n${object}\nendobj\n`;
+    });
+    const xref = Buffer.byteLength(content);
+    content += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+    content += offsets
+      .slice(1)
+      .map((offset) => `${String(offset).padStart(10, '0')} 00000 n \n`)
+      .join('');
+    content += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+    return content;
   }
 }
