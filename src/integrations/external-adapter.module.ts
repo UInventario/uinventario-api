@@ -19,6 +19,10 @@ import { FiscalContractController } from './fiscal-contract.controller';
 import { FiscalContractRegistry } from './fiscal-contract.registry';
 import { FiscalContractRepository } from './fiscal-contract.repository';
 import { FiscalContractService } from './fiscal-contract.service';
+import { FiscalSimulatorController } from './fiscal-simulator.controller';
+import { FiscalSimulatorRepository } from './fiscal-simulator.repository';
+import { FiscalSimulatorService } from './fiscal-simulator.service';
+import { SimulatedFiscalAdapter } from './simulated-fiscal.adapter';
 
 @Module({
   imports: [SessionModule, AuditModule],
@@ -26,6 +30,7 @@ import { FiscalContractService } from './fiscal-contract.service';
     ExternalAdapterController,
     ResendWebhookController,
     FiscalContractController,
+    FiscalSimulatorController,
   ],
   providers: [
     ExternalAdapterRepository,
@@ -40,6 +45,9 @@ import { FiscalContractService } from './fiscal-contract.service';
     FiscalContractRegistry,
     FiscalContractRepository,
     FiscalContractService,
+    SimulatedFiscalAdapter,
+    FiscalSimulatorRepository,
+    FiscalSimulatorService,
     PermissionGuard,
   ],
   exports: [
