@@ -40,6 +40,7 @@ import { ExternalAdapterModule } from './integrations/external-adapter.module';
 import { emailProviderConfig } from './config/email-provider.config';
 import { LoyaltyModule } from './loyalty/loyalty.module';
 import { CommerceModule } from './commerce/commerce.module';
+import { DemandForecastModule } from './forecasting/demand-forecast.module';
 
 @Module({
   imports: [
@@ -98,6 +99,7 @@ import { CommerceModule } from './commerce/commerce.module';
     ExternalAdapterModule,
     LoyaltyModule,
     CommerceModule,
+    DemandForecastModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: SecurityThrottlerGuard }],
 })
