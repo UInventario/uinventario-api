@@ -1396,6 +1396,7 @@ describe('UInventario API (e2e)', () => {
                   'SALES_CREDIT',
                   'SALES_DISCOUNT',
                   'SALES_MANAGE',
+                  'SALES_PRICE_OVERRIDE',
                   'SALES_RETURN',
                   'SALES_VOID',
                   'SUPPLIERS_MANAGE',
