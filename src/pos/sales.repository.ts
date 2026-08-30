@@ -30,6 +30,7 @@ import { SaleReceiptRepository } from './sale-receipt.repository';
 import { SuspendedSaleStateError } from './suspended-sale.errors';
 import type { SuspendedSaleStatus } from './suspended-sale.types';
 import { LoyaltyRepository } from '../loyalty/loyalty.repository';
+import { PaymentTerminalRepository } from './payment-terminal.repository';
 
 interface SaleRow {
   id: string;
@@ -90,6 +91,7 @@ export class SalesRepository {
     private readonly audit: AuditService,
     private readonly receipts: SaleReceiptRepository,
     private readonly loyalty: LoyaltyRepository,
+    private readonly paymentTerminals: PaymentTerminalRepository,
   ) {}
 
   async listSales(
@@ -578,6 +580,7 @@ export class SalesRepository {
       provider: string;
       providerReference: string | null;
       authorizationCode: string | null;
+      terminalOperationId: string | null;
     }>;
     credit?: { installmentCount: number } | null;
   }): Promise<{ sale: CashSaleData; replay: boolean }> {
@@ -594,6 +597,28 @@ export class SalesRepository {
             if (replay.fingerprint !== input.fingerprint)
               throw new PosIdempotencyConflictError();
             return { sale: replay.sale, replay: true };
+          }
+          const terminalAuthorizations = new Map<
+            string,
+            {
+              provider: string;
+              providerReference: string;
+              authorizationCode: string;
+            }
+          >();
+          for (const payment of input.payments) {
+            if (!payment.terminalOperationId) continue;
+            terminalAuthorizations.set(
+              payment.terminalOperationId,
+              await this.paymentTerminals.reserveCaptured(manager, {
+                tenantId: input.tenantId,
+                branchId: input.quote.context.branch.id,
+                cashRegisterId: input.quote.context.cashRegister.id,
+                operationId: payment.terminalOperationId,
+                amount: payment.amountApplied,
+                currency: input.quote.currency,
+              }),
+            );
           }
           if (input.suspendedSaleId) {
             const [suspended] = await manager.query<
@@ -1356,6 +1381,9 @@ export class SalesRepository {
             );
           }
           for (const payment of input.payments) {
+            const terminal = payment.terminalOperationId
+              ? terminalAuthorizations.get(payment.terminalOperationId)
+              : null;
             await manager.query(
               `INSERT INTO sale_payments
               (id, tenant_id, sale_id, method, provider, external_reference,
@@ -1367,16 +1395,24 @@ export class SalesRepository {
                 input.tenantId,
                 saleId,
                 payment.method,
-                payment.provider,
-                payment.reference,
-                payment.providerReference,
-                payment.authorizationCode,
+                terminal?.provider ?? payment.provider,
+                terminal?.providerReference ?? payment.reference,
+                terminal?.providerReference ?? payment.providerReference,
+                terminal?.authorizationCode ?? payment.authorizationCode,
                 input.quote.currency,
                 payment.amountReceived,
                 payment.amountApplied,
                 payment.change,
               ],
             );
+            if (payment.terminalOperationId) {
+              await this.paymentTerminals.linkSale(
+                manager,
+                input.tenantId,
+                payment.terminalOperationId,
+                saleId,
+              );
+            }
           }
           if (input.quote.loyalty && input.quote.loyalty.pointsRedeemed > 0) {
             await manager.query(

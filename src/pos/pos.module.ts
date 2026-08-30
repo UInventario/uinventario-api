@@ -43,6 +43,13 @@ import { PosProfitabilityReportService } from './pos-profitability-report.servic
 import { ExternalAdapterModule } from '../integrations/external-adapter.module';
 import { PromotionModule } from '../promotions/promotion.module';
 import { LoyaltyModule } from '../loyalty/loyalty.module';
+import { PaymentTerminalController } from './payment-terminal.controller';
+import { PaymentTerminalRepository } from './payment-terminal.repository';
+import { PaymentTerminalService } from './payment-terminal.service';
+import {
+  PAYMENT_TERMINAL_ADAPTER,
+  SimulatorPaymentTerminalAdapter,
+} from './payment-terminal.adapter';
 
 @Module({
   imports: [
@@ -60,6 +67,7 @@ import { LoyaltyModule } from '../loyalty/loyalty.module';
     SuspendedSaleController,
     PosPeripheralController,
     CustomerCreditPaymentController,
+    PaymentTerminalController,
   ],
   providers: [
     PosRepository,
@@ -88,6 +96,13 @@ import { LoyaltyModule } from '../loyalty/loyalty.module';
     PosPeripheralService,
     CustomerCreditPaymentRepository,
     CustomerCreditPaymentService,
+    PaymentTerminalRepository,
+    PaymentTerminalService,
+    SimulatorPaymentTerminalAdapter,
+    {
+      provide: PAYMENT_TERMINAL_ADAPTER,
+      useExisting: SimulatorPaymentTerminalAdapter,
+    },
     SimulatorPosPeripheralAdapter,
     {
       provide: POS_PERIPHERAL_ADAPTER,

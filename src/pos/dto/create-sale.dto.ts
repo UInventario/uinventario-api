@@ -43,6 +43,10 @@ export class SalePaymentDto {
   @MaxLength(120)
   @Matches(/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/)
   reference?: string;
+
+  @IsOptional()
+  @IsUUID()
+  terminalOperationId?: string;
 }
 
 export class SaleCreditDto {
