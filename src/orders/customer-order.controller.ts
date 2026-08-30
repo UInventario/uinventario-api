@@ -182,6 +182,9 @@ export class CustomerOrderController {
         status: result.data.fulfillment.status,
         carrierCode: result.data.fulfillment.carrier?.code ?? null,
         attempts: result.data.fulfillment.carrier?.attempts ?? 0,
+        trackingStatus: result.data.fulfillment.carrier?.trackingStatus ?? null,
+        manualActionRequired:
+          result.data.fulfillment.carrier?.manualActionRequired ?? false,
       },
     });
     if (action === 'confirm' && result.data.reservation) {

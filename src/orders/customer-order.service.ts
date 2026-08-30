@@ -32,6 +32,7 @@ import {
 } from './customer-order-carrier.adapter';
 import type { CustomerOrderFulfillmentDto } from './dto/customer-order-fulfillment.dto';
 import { CustomerOrderEventBus } from './customer-order-event.bus';
+import { CustomerOrderShippingService } from './customer-order-shipping.service';
 
 interface CustomerOrderTransitionInput {
   tenantId: string;
@@ -53,6 +54,7 @@ export class CustomerOrderService {
     @Inject(CUSTOMER_ORDER_CARRIER_ADAPTER)
     private readonly carrier: CustomerOrderCarrierAdapter,
     private readonly events: CustomerOrderEventBus,
+    private readonly shipping: CustomerOrderShippingService,
   ) {}
 
   async create(input: {
@@ -251,13 +253,6 @@ export class CustomerOrderService {
       this.state(current.fulfillment.status);
     if (current.version !== input.dto.version)
       this.rethrow(new CustomerOrderVersionConflictError());
-    const result = await this.carrier.dispatch({
-      carrierCode: current.fulfillment.carrier.code,
-      orderNumber: current.orderNumber,
-      attempt: current.fulfillment.carrier.attempts + 1,
-      windowStart: current.fulfillment.window.start,
-      windowEnd: current.fulfillment.window.end,
-    });
     try {
       const dispatched = await this.orders.dispatch({
         tenantId: input.tenantId,
@@ -266,7 +261,7 @@ export class CustomerOrderService {
         actorUserId: input.userId,
         version: input.dto.version,
         idempotencyKey: input.idempotencyKey!,
-        result,
+        execute: (payload) => this.carrier.createShipment(payload),
       });
       await this.events.publish(input.tenantId, dispatched.order);
       return {
@@ -364,6 +359,20 @@ export class CustomerOrderService {
       )
     )
       this.state(current.status);
+    if (
+      current.status !== 'CANCELLED' &&
+      current.fulfillment.method === 'DELIVERY' &&
+      current.fulfillment.status === 'DISPATCHED' &&
+      current.fulfillment.carrier?.trackingReference
+    ) {
+      await this.shipping.cancel({
+        tenantId: input.tenantId,
+        branchId: input.branchId,
+        orderId: input.orderId,
+        idempotencyKey: `order-carrier-cancel:${input.orderId}`,
+        dto: { scenario: 'SUCCESS' },
+      });
+    }
     if (current.reservation && current.status !== 'CANCELLED') {
       await this.reservations.release({
         tenantId: input.tenantId,
