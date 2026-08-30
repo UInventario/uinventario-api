@@ -287,6 +287,12 @@ describe('UInventario API (e2e)', () => {
             provider: 'SIMULATOR',
             adapterVersion: '1',
           },
+          {
+            capability: 'NOTIFICATION_WHATSAPP',
+            countryCode: 'MX',
+            provider: 'SIMULATOR',
+            adapterVersion: '1',
+          },
         ],
         meta: {
           apiVersion: '1',
