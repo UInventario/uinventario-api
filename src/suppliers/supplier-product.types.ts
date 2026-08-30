@@ -16,6 +16,9 @@ export interface SupplierProductData {
     sku: string;
     catalogCost: string;
     catalogPrice: string;
+    baseUnit: import('../common/quantity-policy').ProductBaseUnit;
+    quantityPrecision: number;
+    minimumQuantity: string;
   };
   supplierCode: string;
   minimumQuantity: string | null;

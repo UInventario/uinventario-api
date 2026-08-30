@@ -7,6 +7,8 @@ import { applyInventorySerialTracking } from '../inventory/inventory-serial-trac
 import {
   PosIdempotencyConflictError,
   PaymentReferenceConflictError,
+  CustomerCreditLimitExceededError,
+  CustomerCreditNotAvailableError,
   PosCustomerNotAvailableError,
   PosInsufficientStockError,
   PosReservationNotAvailableError,
@@ -22,8 +24,13 @@ import {
   SaleDetailData,
   SaleSummaryData,
 } from './pos.types';
-import type { PaymentMethod } from './dto/create-sale.dto';
+import type { PaymentMethod } from './pos.types';
 import { AuditService } from '../audit/audit.service';
+import { SaleReceiptRepository } from './sale-receipt.repository';
+import { SuspendedSaleStateError } from './suspended-sale.errors';
+import type { SuspendedSaleStatus } from './suspended-sale.types';
+import { LoyaltyRepository } from '../loyalty/loyalty.repository';
+import { PaymentTerminalRepository } from './payment-terminal.repository';
 
 interface SaleRow {
   id: string;
@@ -33,8 +40,22 @@ interface SaleRow {
   customer_id: string | null;
   customer_name: string | null;
   customer_identifier: string | null;
+  quotation_id: string | null;
+  quotation_number: string | null;
   currency: string;
   tax_rate: string;
+  gross_total: string;
+  line_discount_total: string;
+  promotion_discount_total: string;
+  loyalty_points_redeemed: number | string;
+  loyalty_value: string;
+  loyalty_points_earned: number | string;
+  loyalty_rule_version: number | string | null;
+  sale_discount_total: string;
+  discount_total: string;
+  discount_type: 'PERCENT' | 'AMOUNT' | null;
+  discount_value: string | null;
+  discount_reason: string | null;
   subtotal: string;
   tax_total: string;
   total: string;
@@ -68,6 +89,9 @@ export class SalesRepository {
   constructor(
     private readonly dataSource: DataSource,
     private readonly audit: AuditService,
+    private readonly receipts: SaleReceiptRepository,
+    private readonly loyalty: LoyaltyRepository,
+    private readonly paymentTerminals: PaymentTerminalRepository,
   ) {}
 
   async listSales(
@@ -188,7 +212,7 @@ export class SalesRepository {
     const movements = await this.dataSource.query<
       Array<{
         id: string;
-        type: 'SALE' | 'SALE_VOID';
+        type: 'SALE' | 'SALE_VOID' | 'SALE_RETURN';
         sale_line_id: string;
         product_id: string;
         product_name: string;
@@ -209,7 +233,8 @@ export class SalesRepository {
        FROM inventory_movements im
        INNER JOIN products p ON p.id = im.product_id AND p.tenant_id = im.tenant_id
        INNER JOIN locations l ON l.id = im.location_id AND l.tenant_id = im.tenant_id
-       WHERE im.tenant_id = ? AND im.sale_id = ? AND im.type IN ('SALE', 'SALE_VOID')
+       WHERE im.tenant_id = ? AND im.sale_id = ?
+         AND im.type IN ('SALE', 'SALE_VOID', 'SALE_RETURN')
        ORDER BY im.created_at, im.id`,
       [tenantId, saleId],
     );
@@ -312,6 +337,12 @@ export class SalesRepository {
             }
             throw new SaleAlreadyVoidedError();
           }
+          const [saleReturn] = await manager.query<Array<{ id: string }>>(
+            `SELECT id FROM sale_returns
+             WHERE tenant_id = ? AND sale_id = ? LIMIT 1 FOR UPDATE`,
+            [input.tenantId, sale.id],
+          );
+          if (saleReturn) throw new SaleVoidNotAllowedError();
 
           const [shift] = await manager.query<
             Array<{ status: 'OPEN' | 'CLOSED' }>
@@ -410,15 +441,67 @@ export class SalesRepository {
             await applyInventoryLotTracking(manager, voidMovementId);
             await applyInventorySerialTracking(manager, voidMovementId);
           }
+          const [creditAccount] = await manager.query<
+            Array<{
+              id: string;
+              customer_id: string;
+              canceled_at: Date | string | null;
+              balance: string;
+            }>
+          >(
+            `SELECT cca.id, cca.customer_id, cca.canceled_at,
+                    COALESCE(SUM(CASE WHEN cdl.entry_type = 'DEBIT'
+                      THEN cdl.amount ELSE -cdl.amount END), 0) AS balance
+             FROM customer_credit_accounts cca
+             LEFT JOIN customer_debt_ledger cdl
+               ON cdl.account_id = cca.id AND cdl.tenant_id = cca.tenant_id
+             WHERE cca.tenant_id = ? AND cca.sale_id = ?
+             GROUP BY cca.id, cca.customer_id, cca.canceled_at
+             LIMIT 1 FOR UPDATE`,
+            [input.tenantId, sale.id],
+          );
+          if (creditAccount && !creditAccount.canceled_at) {
+            const balance = this.toMoney(creditAccount.balance);
+            if (balance > 0n) {
+              await manager.query(
+                `INSERT INTO customer_debt_ledger
+                  (id, tenant_id, customer_id, account_id, sale_id, entry_type,
+                   amount, reference_type, idempotency_key, created_by_user_id)
+                 VALUES (?, ?, ?, ?, ?, 'CREDIT', ?, 'VOID', ?, ?)`,
+                [
+                  randomUUID(),
+                  input.tenantId,
+                  creditAccount.customer_id,
+                  creditAccount.id,
+                  sale.id,
+                  this.money(balance),
+                  `sale-void:${input.idempotencyKey}`,
+                  input.userId,
+                ],
+              );
+            }
+            await manager.query(
+              `UPDATE customer_credit_accounts
+               SET canceled_at = CURRENT_TIMESTAMP(6)
+               WHERE id = ? AND tenant_id = ? AND canceled_at IS NULL`,
+              [creditAccount.id, input.tenantId],
+            );
+          }
           const paymentUpdate = await manager.query<{ affectedRows?: number }>(
             `UPDATE sale_payments
              SET status = 'REVERSED', reversed_by_user_id = ?, reversed_at = CURRENT_TIMESTAMP(6)
-             WHERE tenant_id = ? AND sale_id = ? AND status = 'COMPLETED'`,
+             WHERE tenant_id = ? AND sale_id = ? AND status IN ('COMPLETED', 'PENDING')`,
             [input.userId, input.tenantId, sale.id],
           );
-          if (Number(paymentUpdate.affectedRows ?? 0) !== 1) {
+          if (Number(paymentUpdate.affectedRows ?? 0) < 1) {
             throw new Error('SALE_VOID_PAYMENT_NOT_REVERSED');
           }
+          await this.loyalty.compensateSale(manager, {
+            tenantId: input.tenantId,
+            saleId: sale.id,
+            userId: input.userId,
+            mode: 'VOID',
+          });
           const saleUpdate = await manager.query<{ affectedRows?: number }>(
             `UPDATE sales SET status = 'VOIDED', voided_by_user_id = ?, void_reason = ?,
                void_idempotency_key = ?, void_request_fingerprint = ?,
@@ -444,12 +527,16 @@ export class SalesRepository {
             entityId: sale.id,
             correlationId: input.correlationId,
             deduplicate: true,
-            before: { status: 'COMPLETED', paymentStatus: 'COMPLETED' },
+            before: {
+              status: 'COMPLETED',
+              paymentStatus: creditAccount ? 'PENDING' : 'COMPLETED',
+            },
             after: {
               status: 'VOIDED',
               paymentStatus: 'REVERSED',
               reason: input.reason,
               restoredMovementCount: movements.length,
+              ...(creditAccount ? { creditReversed: true } : {}),
             },
           });
           return { saleId: sale.id, replay: false };
@@ -481,6 +568,8 @@ export class SalesRepository {
     cashRegisterShiftId: string;
     customerId?: string | null;
     reservationId?: string | null;
+    suspendedSaleId?: string | null;
+    quotationId?: string | null;
     quote: PosCartQuoteResponse['data'];
     payments: Array<{
       method: PaymentMethod;
@@ -491,7 +580,9 @@ export class SalesRepository {
       provider: string;
       providerReference: string | null;
       authorizationCode: string | null;
+      terminalOperationId?: string | null;
     }>;
+    credit?: { installmentCount: number } | null;
   }): Promise<{ sale: CashSaleData; replay: boolean }> {
     try {
       return await this.dataSource.transaction(
@@ -507,7 +598,66 @@ export class SalesRepository {
               throw new PosIdempotencyConflictError();
             return { sale: replay.sale, replay: true };
           }
+          const terminalAuthorizations = new Map<
+            string,
+            {
+              provider: string;
+              providerReference: string;
+              authorizationCode: string;
+            }
+          >();
+          for (const payment of input.payments) {
+            if (!payment.terminalOperationId) continue;
+            terminalAuthorizations.set(
+              payment.terminalOperationId,
+              await this.paymentTerminals.reserveCaptured(manager, {
+                tenantId: input.tenantId,
+                branchId: input.quote.context.branch.id,
+                cashRegisterId: input.quote.context.cashRegister.id,
+                operationId: payment.terminalOperationId,
+                amount: payment.amountApplied,
+                currency: input.quote.currency,
+              }),
+            );
+          }
+          if (input.suspendedSaleId) {
+            const [suspended] = await manager.query<
+              Array<{ status: SuspendedSaleStatus; expired: number | boolean }>
+            >(
+              `SELECT status, expires_at <= CURRENT_TIMESTAMP(6) AS expired
+               FROM suspended_sales
+               WHERE id = ? AND tenant_id = ? AND branch_id = ? AND warehouse_id = ?
+                 AND cash_register_id = ? AND created_by_user_id = ? LIMIT 1 FOR UPDATE`,
+              [
+                input.suspendedSaleId,
+                input.tenantId,
+                input.quote.context.branch.id,
+                input.quote.context.warehouse.id,
+                input.quote.context.cashRegister.id,
+                input.userId,
+              ],
+            );
+            if (!suspended) throw new SuspendedSaleStateError('CANCELLED');
+            if (
+              suspended.status === 'ACTIVE' &&
+              Number(suspended.expired) === 1
+            ) {
+              await manager.query(
+                `UPDATE suspended_sales SET status = 'EXPIRED' WHERE id = ? AND tenant_id = ?`,
+                [input.suspendedSaleId, input.tenantId],
+              );
+              throw new SuspendedSaleStateError('EXPIRED');
+            }
+            if (suspended.status !== 'ACTIVE')
+              throw new SuspendedSaleStateError(suspended.status);
+          }
           let effectiveCustomerId = input.customerId ?? null;
+          let creditProfile: {
+            credit_limit: string;
+            currency: string;
+            term_days: number | string;
+            max_installments: number | string;
+          } | null = null;
           let reservedLocationId: string | null = null;
           const reservationLines = new Map<
             string,
@@ -571,13 +721,70 @@ export class SalesRepository {
             )
               throw new PosReservationNotAvailableError('LINES_MISMATCH');
           }
-          if (effectiveCustomerId && !input.reservationId) {
-            const [customer] = await manager.query<Array<{ id: string }>>(
-              `SELECT id FROM customers
-               WHERE id = ? AND tenant_id = ? AND active = TRUE FOR UPDATE`,
+          if (effectiveCustomerId) {
+            const [customer] = await manager.query<
+              Array<{
+                id: string;
+                enabled: number | boolean | null;
+                credit_limit: string | null;
+                currency: string | null;
+                term_days: number | string | null;
+                max_installments: number | string | null;
+              }>
+            >(
+              `SELECT c.id, ccp.enabled, ccp.credit_limit, ccp.currency,
+                      ccp.term_days, ccp.max_installments
+               FROM customers c
+               LEFT JOIN customer_credit_profiles ccp
+                 ON ccp.customer_id = c.id AND ccp.tenant_id = c.tenant_id
+               WHERE c.id = ? AND c.tenant_id = ? AND c.active = TRUE
+                 AND c.privacy_status = 'ACTIVE' FOR UPDATE`,
               [effectiveCustomerId, input.tenantId],
             );
             if (!customer) throw new PosCustomerNotAvailableError();
+            if (input.credit) {
+              if (
+                !customer.enabled ||
+                !customer.credit_limit ||
+                !customer.currency ||
+                customer.term_days === null ||
+                customer.max_installments === null
+              )
+                throw new CustomerCreditNotAvailableError('DISABLED');
+              if (customer.currency !== input.quote.currency)
+                throw new CustomerCreditNotAvailableError('CURRENCY');
+              if (
+                input.credit.installmentCount >
+                Number(customer.max_installments)
+              )
+                throw new CustomerCreditNotAvailableError('INSTALLMENTS');
+              creditProfile = {
+                credit_limit: customer.credit_limit,
+                currency: customer.currency,
+                term_days: customer.term_days,
+                max_installments: customer.max_installments,
+              };
+              const [exposure] = await manager.query<
+                Array<{ balance: string }>
+              >(
+                `SELECT COALESCE(SUM(CASE WHEN entry_type = 'DEBIT'
+                    THEN amount ELSE -amount END), 0) AS balance
+                 FROM customer_debt_ledger
+                 WHERE tenant_id = ? AND customer_id = ?`,
+                [input.tenantId, effectiveCustomerId],
+              );
+              const currentBalance = this.toMoney(exposure?.balance ?? '0');
+              const limit = this.toMoney(customer.credit_limit);
+              const requested = this.toMoney(
+                input.quote.totals.payable ?? input.quote.totals.total,
+              );
+              if (currentBalance + requested > limit) {
+                throw new CustomerCreditLimitExceededError(
+                  this.money(currentBalance),
+                  this.money(limit),
+                );
+              }
+            }
           }
           const [openShift] = await manager.query<Array<{ id: string }>>(
             `SELECT id FROM cash_register_shifts
@@ -594,10 +801,89 @@ export class SalesRepository {
           );
           if (!openShift) throw new CashRegisterShiftRequiredError();
           const allocations = new Map<string, StockAllocation[]>();
+          const derivedAllocations = new Map<string, StockAllocation[]>();
           let insufficientProductId: string | null = null;
+          for (const line of [...input.quote.lines]
+            .filter((item) => item.kit?.stockMode === 'DERIVED')
+            .sort((left, right) =>
+              left.product.id.localeCompare(right.product.id),
+            )) {
+            for (const component of [...line.kit!.components].sort(
+              (left, right) => left.product.id.localeCompare(right.product.id),
+            )) {
+              const balances = await manager.query<
+                Array<{
+                  location_id: string;
+                  quantity: string;
+                  available_quantity: string;
+                  reserved_quantity: string;
+                }>
+              >(
+                `SELECT ib.location_id, ib.quantity, ib.available_quantity,
+                        ib.reserved_quantity
+                 FROM inventory_balances ib
+                 INNER JOIN locations l
+                   ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
+                 WHERE ib.tenant_id = ? AND ib.product_id = ? AND l.warehouse_id = ?
+                 ORDER BY l.created_at, l.id FOR UPDATE`,
+                [
+                  input.tenantId,
+                  component.product.id,
+                  input.quote.context.warehouse.id,
+                ],
+              );
+              let remaining = this.toQuantityUnits(component.totalQuantity);
+              const componentAllocations: StockAllocation[] = [];
+              for (const balance of balances) {
+                if (remaining === 0n) break;
+                const available = this.toQuantityUnits(
+                  balance.available_quantity,
+                );
+                const total = this.toQuantityUnits(balance.quantity);
+                const reserved = this.toQuantityUnits(
+                  balance.reserved_quantity,
+                );
+                const taken = available < remaining ? available : remaining;
+                if (taken === 0n) continue;
+                const allocation = {
+                  locationId: balance.location_id,
+                  quantityChange: this.fromQuantityUnits(-taken),
+                  resultingQuantity: this.fromQuantityUnits(total - taken),
+                  resultingAvailableQuantity: this.fromQuantityUnits(
+                    available - taken,
+                  ),
+                  resultingReservedQuantity: this.fromQuantityUnits(reserved),
+                };
+                componentAllocations.push(allocation);
+                await manager.query(
+                  `UPDATE inventory_balances
+                   SET quantity = ?, available_quantity = ?
+                   WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
+                  [
+                    allocation.resultingQuantity,
+                    allocation.resultingAvailableQuantity,
+                    input.tenantId,
+                    component.product.id,
+                    allocation.locationId,
+                  ],
+                );
+                remaining -= taken;
+              }
+              derivedAllocations.set(
+                `${line.product.id}:${component.product.id}`,
+                componentAllocations,
+              );
+              if (remaining > 0n) insufficientProductId = line.product.id;
+            }
+          }
           for (const line of [...input.quote.lines].sort((left, right) =>
             left.product.id.localeCompare(right.product.id),
           )) {
+            if (line.product.stockBehavior === 'UNTRACKED') {
+              allocations.set(line.product.id, []);
+              continue;
+            }
+            if (line.kit?.stockMode === 'DERIVED') continue;
             const serialsByLocation = new Map<string, string[]>();
             if (line.serialNumbers.length > 0) {
               const placeholders = line.serialNumbers.map(() => '?').join(',');
@@ -635,7 +921,17 @@ export class SalesRepository {
               }>
             >(
               `SELECT ib.location_id, ib.quantity, ib.available_quantity, ib.reserved_quantity,
-                      CASE WHEN ? IS NULL THEN NULL ELSE COALESCE((
+                      CASE WHEN ? IS NULL THEN
+                        CASE WHEN p.track_lots THEN COALESCE((
+                          SELECT SUM(ilb.quantity) FROM inventory_lot_balances ilb
+                          INNER JOIN inventory_lots il
+                            ON il.id = ilb.lot_id AND il.tenant_id = ilb.tenant_id
+                          WHERE ilb.tenant_id = ib.tenant_id
+                            AND ilb.location_id = ib.location_id
+                            AND il.product_id = ib.product_id
+                            AND (il.expires_on IS NULL OR il.expires_on >= ?)
+                        ), 0) ELSE NULL END
+                      ELSE COALESCE((
                         SELECT ilb.quantity FROM inventory_lot_balances ilb
                         INNER JOIN inventory_lots il
                           ON il.id = ilb.lot_id AND il.tenant_id = ilb.tenant_id
@@ -646,11 +942,14 @@ export class SalesRepository {
 
              FROM inventory_balances ib
              INNER JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
+             INNER JOIN products p ON p.id = ib.product_id AND p.tenant_id = ib.tenant_id
              WHERE ib.tenant_id = ? AND ib.product_id = ? AND l.warehouse_id = ?
                AND (? IS NULL OR ib.location_id = ?)
              ORDER BY l.created_at, l.id FOR UPDATE`,
               [
                 line.lotId,
+                input.quote.context.businessDate ??
+                  new Date().toISOString().slice(0, 10),
                 line.lotId,
                 input.tenantId,
                 line.product.id,
@@ -669,7 +968,7 @@ export class SalesRepository {
                   : balance.available_quantity,
               );
               const lotAvailable =
-                line.lotId && balance.lot_quantity !== null
+                balance.lot_quantity !== null
                   ? this.toQuantityUnits(balance.lot_quantity)
                   : available;
               const total = this.toQuantityUnits(balance.quantity);
@@ -740,9 +1039,14 @@ export class SalesRepository {
           await manager.query(
             `INSERT INTO sales
             (id, tenant_id, branch_id, warehouse_id, cash_register_id,
-             cash_register_shift_id, created_by_user_id, customer_id, reservation_id, receipt_number, currency, tax_rate, subtotal,
-             tax_total, total, status, idempotency_key, request_fingerprint)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
+             cash_register_shift_id, created_by_user_id, customer_id, reservation_id, quotation_id,
+             receipt_number, currency, tax_rate, gross_total, line_discount_total,
+             promotion_discount_total, loyalty_points_redeemed, loyalty_value,
+             loyalty_points_earned, loyalty_rule_version, loyalty_rule_snapshot,
+             sale_discount_total, discount_total, discount_type, discount_value,
+             discount_reason, subtotal, tax_total, total, status, idempotency_key,
+             request_fingerprint)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
             [
               saleId,
               input.tenantId,
@@ -753,9 +1057,25 @@ export class SalesRepository {
               input.userId,
               effectiveCustomerId,
               input.reservationId ?? null,
+              input.quotationId ?? null,
               receiptNumber,
               input.quote.currency,
               input.quote.taxRate,
+              input.quote.totals.gross,
+              input.quote.totals.lineDiscount,
+              input.quote.totals.promotionDiscount,
+              input.quote.loyalty?.pointsRedeemed ?? 0,
+              input.quote.loyalty?.redemptionValue ?? '0.00',
+              input.quote.loyalty?.pointsEarned ?? 0,
+              input.quote.loyalty?.rule.version ?? null,
+              input.quote.loyalty
+                ? JSON.stringify(input.quote.loyalty.rule)
+                : null,
+              input.quote.totals.saleDiscount,
+              input.quote.totals.discount,
+              input.quote.discount?.type ?? null,
+              input.quote.discount?.value ?? null,
+              input.quote.discount?.reason ?? null,
               input.quote.totals.subtotal,
               input.quote.totals.tax,
               input.quote.totals.total,
@@ -763,18 +1083,46 @@ export class SalesRepository {
               input.fingerprint,
             ],
           );
+          if (effectiveCustomerId && input.quote.loyalty) {
+            await this.loyalty.applySale(manager, {
+              tenantId: input.tenantId,
+              customerId: effectiveCustomerId,
+              userId: input.userId,
+              saleId,
+              idempotencyKey: input.idempotencyKey,
+              saleTotal: input.quote.totals.total,
+              loyalty: input.quote.loyalty,
+            });
+          }
           for (const [index, line] of input.quote.lines.entries()) {
             const saleLineId = randomUUID();
-            const [productCost] = await manager.query<Array<{ cost: string }>>(
-              `SELECT cost FROM products WHERE id = ? AND tenant_id = ? LIMIT 1`,
-              [line.product.id, input.tenantId],
+            const promotionDiscountTotal = this.money(
+              line.promotions.reduce(
+                (sum, promotion) => sum + this.toMoney(promotion.amount),
+                0n,
+              ),
             );
-            if (!productCost) throw new Error('SALE_PRODUCT_COST_NOT_FOUND');
+            let unitCost = line.kit?.unitCost;
+            if (!unitCost) {
+              const [productCost] = await manager.query<
+                Array<{ cost: string }>
+              >(
+                `SELECT cost FROM products WHERE id = ? AND tenant_id = ? LIMIT 1`,
+                [line.product.id, input.tenantId],
+              );
+              if (!productCost) throw new Error('SALE_PRODUCT_COST_NOT_FOUND');
+              unitCost = productCost.cost;
+            }
             await manager.query(
               `INSERT INTO sale_lines
               (id, tenant_id, sale_id, line_number, product_id, product_name,
-               product_sku, quantity, unit_price, unit_cost, subtotal, tax, total)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               product_sku, without_code, line_note, quantity, unit_price, price_source,
+               price_override_reason, price_list_id,
+               price_list_name, unit_cost, gross_total, line_discount_total,
+               promotion_discount_total, sale_discount_total, discount_total, discount_type, discount_value,
+               discount_reason, expired_lot_override_reason, stock_behavior,
+               tax_behavior, subtotal, tax, total)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 saleLineId,
                 input.tenantId,
@@ -783,78 +1131,259 @@ export class SalesRepository {
                 line.product.id,
                 line.product.name,
                 line.product.sku,
+                line.product.withoutCode,
+                line.note,
                 line.quantity,
                 line.unitPrice,
-                productCost.cost,
+                line.priceSource,
+                line.priceOverrideReason,
+                line.priceList?.id ?? null,
+                line.priceList?.name ?? null,
+                unitCost,
+                line.grossTotal,
+                line.discount.line?.amount ?? '0.00',
+                promotionDiscountTotal,
+                line.discount.sale?.amount ?? '0.00',
+                line.discount.total,
+                line.discount.line?.type ?? null,
+                line.discount.line?.value ?? null,
+                line.discount.line?.reason ?? null,
+                line.expiredLotOverrideReason,
+                line.product.stockBehavior,
+                line.product.taxBehavior,
                 line.subtotal,
                 line.tax,
                 line.total,
               ],
             );
-            for (const [allocationIndex, allocation] of (
-              allocations.get(line.product.id) ?? []
-            ).entries()) {
-              const movementId = randomUUID();
+            for (const promotion of line.promotions) {
               await manager.query(
-                `UPDATE inventory_balances
-                 SET quantity = ?, available_quantity = ?, reserved_quantity = ?
-               WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
+                `INSERT INTO sale_line_promotions
+                   (id, tenant_id, sale_id, sale_line_id, promotion_id,
+                    promotion_name, promotion_type, priority, discount_amount,
+                    explanation, rule_snapshot)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 [
-                  allocation.resultingQuantity,
-                  allocation.resultingAvailableQuantity,
-                  allocation.resultingReservedQuantity,
+                  randomUUID(),
                   input.tenantId,
-                  line.product.id,
-                  allocation.locationId,
+                  saleId,
+                  saleLineId,
+                  promotion.promotion.id,
+                  promotion.promotion.name,
+                  promotion.promotion.type,
+                  promotion.promotion.priority,
+                  promotion.amount,
+                  promotion.explanation,
+                  JSON.stringify(promotion.ruleSnapshot),
                 ],
               );
-              const movementKey = `sale:${saleId}:${index + 1}:${allocationIndex + 1}`;
-              const movementFingerprint = createHash('sha256')
-                .update(
-                  JSON.stringify({
+            }
+            if (line.kit?.stockMode === 'DERIVED') {
+              for (const component of line.kit.components) {
+                await manager.query(
+                  `INSERT INTO sale_kit_components
+                     (id, tenant_id, sale_id, sale_line_id, kit_product_id,
+                      component_product_id, component_name, component_sku,
+                      quantity_per_kit, total_quantity, unit_cost)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                  [
+                    randomUUID(),
+                    input.tenantId,
                     saleId,
                     saleLineId,
-                    productId: line.product.id,
-                    locationId: allocation.locationId,
-                    quantityChange: allocation.quantityChange,
-                  }),
-                )
-                .digest('hex');
-              await manager.query(
-                `INSERT INTO inventory_movements
+                    line.product.id,
+                    component.product.id,
+                    component.product.name,
+                    component.product.sku,
+                    component.quantityPerKit,
+                    component.totalQuantity,
+                    component.unitCost,
+                  ],
+                );
+              }
+            }
+            const inventoryTargets =
+              line.product.stockBehavior === 'UNTRACKED'
+                ? []
+                : line.kit?.stockMode === 'DERIVED'
+                  ? line.kit.components.map((component) => ({
+                      productId: component.product.id,
+                      allocations:
+                        derivedAllocations.get(
+                          `${line.product.id}:${component.product.id}`,
+                        ) ?? [],
+                      derived: true,
+                    }))
+                  : [
+                      {
+                        productId: line.product.id,
+                        allocations: allocations.get(line.product.id) ?? [],
+                        derived: false,
+                      },
+                    ];
+            for (const [targetIndex, target] of inventoryTargets.entries()) {
+              for (const [
+                allocationIndex,
+                allocation,
+              ] of target.allocations.entries()) {
+                const movementId = randomUUID();
+                // Derived component balances were already updated while acquiring
+                // their locks so later direct lines allocate from the reduced stock.
+                // Reapplying an intermediate value here could overwrite a direct
+                // component allocation when the cart order differs.
+                if (!target.derived) {
+                  await manager.query(
+                    `UPDATE inventory_balances
+                     SET quantity = ?, available_quantity = ?, reserved_quantity = ?
+                     WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
+                    [
+                      allocation.resultingQuantity,
+                      allocation.resultingAvailableQuantity,
+                      allocation.resultingReservedQuantity,
+                      input.tenantId,
+                      target.productId,
+                      allocation.locationId,
+                    ],
+                  );
+                }
+                const movementKey = `sale:${saleId}:${index + 1}:${targetIndex + 1}:${allocationIndex + 1}`;
+                const movementFingerprint = createHash('sha256')
+                  .update(
+                    JSON.stringify({
+                      saleId,
+                      saleLineId,
+                      productId: target.productId,
+                      locationId: allocation.locationId,
+                      quantityChange: allocation.quantityChange,
+                    }),
+                  )
+                  .digest('hex');
+                await manager.query(
+                  `INSERT INTO inventory_movements
                 (id, tenant_id, product_id, location_id, type, quantity_change,
                  resulting_quantity, reason, reference, idempotency_key,
                  request_fingerprint, created_by_user_id, sale_id, sale_line_id,
                  reservation_id, reservation_line_id)
                VALUES (?, ?, ?, ?, 'SALE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [
-                  movementId,
-                  input.tenantId,
-                  line.product.id,
-                  allocation.locationId,
-                  allocation.quantityChange,
-                  allocation.resultingQuantity,
-                  `Venta ${receiptNumber}`,
-                  receiptNumber,
-                  movementKey,
-                  movementFingerprint,
-                  input.userId,
-                  saleId,
-                  saleLineId,
-                  input.reservationId ?? null,
-                  allocation.reservationLineId ?? null,
-                ],
-              );
-              await applyInventoryValuation(manager, movementId);
-              await applyInventoryLotTracking(manager, movementId, {
-                preferredLotId: line.lotId ?? undefined,
-              });
-              await applyInventorySerialTracking(manager, movementId, {
-                serialNumbers: allocation.serialNumbers,
-              });
+                  [
+                    movementId,
+                    input.tenantId,
+                    target.productId,
+                    allocation.locationId,
+                    allocation.quantityChange,
+                    allocation.resultingQuantity,
+                    `Venta ${receiptNumber}`,
+                    receiptNumber,
+                    movementKey,
+                    movementFingerprint,
+                    input.userId,
+                    saleId,
+                    saleLineId,
+                    input.reservationId ?? null,
+                    allocation.reservationLineId ?? null,
+                  ],
+                );
+                await applyInventoryValuation(manager, movementId);
+                if (!target.derived) {
+                  await applyInventoryLotTracking(manager, movementId, {
+                    preferredLotId: line.lotId ?? undefined,
+                    allowExpired: Boolean(line.expiredLotOverrideReason),
+                  });
+                  await applyInventorySerialTracking(manager, movementId, {
+                    serialNumbers: allocation.serialNumbers,
+                  });
+                }
+              }
             }
           }
+          let creditAccountId: string | null = null;
+          if (input.credit && effectiveCustomerId && creditProfile) {
+            creditAccountId = randomUUID();
+            const termDays = Number(creditProfile.term_days);
+            await manager.query(
+              `INSERT INTO customer_credit_accounts
+                (id, tenant_id, customer_id, sale_id, currency, original_amount,
+                 installment_count, term_days, due_date, created_by_user_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(CURRENT_DATE(), INTERVAL ? DAY), ?)`,
+              [
+                creditAccountId,
+                input.tenantId,
+                effectiveCustomerId,
+                saleId,
+                creditProfile.currency,
+                input.quote.totals.payable ?? input.quote.totals.total,
+                input.credit.installmentCount,
+                termDays,
+                termDays,
+                input.userId,
+              ],
+            );
+            const totalCents = this.toMoney(
+              input.quote.totals.payable ?? input.quote.totals.total,
+            );
+            const count = BigInt(input.credit.installmentCount);
+            const baseAmount = totalCents / count;
+            const remainder = totalCents % count;
+            for (
+              let index = 0;
+              index < input.credit.installmentCount;
+              index++
+            ) {
+              const amount = baseAmount + (BigInt(index) < remainder ? 1n : 0n);
+              const dueOffset = Math.ceil(
+                (termDays * (index + 1)) / input.credit.installmentCount,
+              );
+              await manager.query(
+                `INSERT INTO customer_credit_installments
+                  (id, tenant_id, account_id, installment_number, due_date, amount)
+                 VALUES (?, ?, ?, ?, DATE_ADD(CURRENT_DATE(), INTERVAL ? DAY), ?)`,
+                [
+                  randomUUID(),
+                  input.tenantId,
+                  creditAccountId,
+                  index + 1,
+                  dueOffset,
+                  this.money(amount),
+                ],
+              );
+            }
+            await manager.query(
+              `INSERT INTO customer_debt_ledger
+                (id, tenant_id, customer_id, account_id, sale_id, entry_type,
+                 amount, reference_type, idempotency_key, created_by_user_id)
+               VALUES (?, ?, ?, ?, ?, 'DEBIT', ?, 'SALE', ?, ?)`,
+              [
+                randomUUID(),
+                input.tenantId,
+                effectiveCustomerId,
+                creditAccountId,
+                saleId,
+                input.quote.totals.payable ?? input.quote.totals.total,
+                `sale-credit:${input.idempotencyKey}`,
+                input.userId,
+              ],
+            );
+            await manager.query(
+              `INSERT INTO sale_payments
+                (id, tenant_id, sale_id, method, provider, external_reference,
+                 provider_reference, authorization_code, authorization_status,
+                 currency, amount_received, amount_applied, change_amount, status)
+               VALUES (?, ?, ?, 'CREDIT', 'CUSTOMER_CREDIT', NULL, ?, NULL,
+                 'PENDING', ?, 0, ?, 0, 'PENDING')`,
+              [
+                randomUUID(),
+                input.tenantId,
+                saleId,
+                creditAccountId,
+                input.quote.currency,
+                input.quote.totals.payable ?? input.quote.totals.total,
+              ],
+            );
+          }
           for (const payment of input.payments) {
+            const terminal = payment.terminalOperationId
+              ? terminalAuthorizations.get(payment.terminalOperationId)
+              : null;
             await manager.query(
               `INSERT INTO sale_payments
               (id, tenant_id, sale_id, method, provider, external_reference,
@@ -866,17 +1395,57 @@ export class SalesRepository {
                 input.tenantId,
                 saleId,
                 payment.method,
-                payment.provider,
-                payment.reference,
-                payment.providerReference,
-                payment.authorizationCode,
+                terminal?.provider ?? payment.provider,
+                terminal?.providerReference ?? payment.reference,
+                terminal?.providerReference ?? payment.providerReference,
+                terminal?.authorizationCode ?? payment.authorizationCode,
                 input.quote.currency,
                 payment.amountReceived,
                 payment.amountApplied,
                 payment.change,
               ],
             );
+            if (payment.terminalOperationId) {
+              await this.paymentTerminals.linkSale(
+                manager,
+                input.tenantId,
+                payment.terminalOperationId,
+                saleId,
+              );
+            }
           }
+          if (input.quote.loyalty && input.quote.loyalty.pointsRedeemed > 0) {
+            await manager.query(
+              `INSERT INTO sale_payments
+                (id, tenant_id, sale_id, method, provider, external_reference,
+                 provider_reference, authorization_code, authorization_status,
+                 currency, amount_received, amount_applied, change_amount)
+               VALUES (?, ?, ?, 'VOUCHER', 'LOYALTY', ?, ?, ?,
+                 'APPROVED', ?, ?, ?, 0)`,
+              [
+                randomUUID(),
+                input.tenantId,
+                saleId,
+                `points:${input.quote.loyalty.pointsRedeemed}`,
+                `loyalty:${saleId}`,
+                `RULE-V${input.quote.loyalty.rule.version}`,
+                input.quote.currency,
+                input.quote.loyalty.redemptionValue,
+                input.quote.loyalty.redemptionValue,
+              ],
+            );
+          }
+          if (input.suspendedSaleId) {
+            const resumed = await manager.query<{ affectedRows?: number }>(
+              `UPDATE suspended_sales
+               SET status = 'RESUMED', resumed_at = CURRENT_TIMESTAMP(6), completed_sale_id = ?
+               WHERE id = ? AND tenant_id = ? AND status = 'ACTIVE'`,
+              [saleId, input.suspendedSaleId, input.tenantId],
+            );
+            if (Number(resumed.affectedRows ?? 0) !== 1)
+              throw new SuspendedSaleStateError('CANCELLED');
+          }
+          await this.receipts.createSnapshot(manager, input.tenantId, saleId);
           if (input.reservationId) {
             const closed = await manager.query<{ affectedRows?: number }>(
               `UPDATE product_reservations
@@ -928,7 +1497,12 @@ export class SalesRepository {
       `SELECT s.id, s.receipt_number, s.status, s.created_by_user_id,
               c.id AS customer_id, c.name AS customer_name,
               c.identifier AS customer_identifier,
-              s.currency, s.tax_rate, s.subtotal, s.tax_total, s.total,
+              q.id AS quotation_id, q.quotation_number,
+              s.currency, s.tax_rate, s.gross_total, s.line_discount_total,
+               s.promotion_discount_total, s.loyalty_points_redeemed, s.loyalty_value,
+               s.loyalty_points_earned, s.loyalty_rule_version,
+               s.sale_discount_total, s.discount_total, s.discount_type,
+              s.discount_value, s.discount_reason, s.subtotal, s.tax_total, s.total,
               s.request_fingerprint, s.created_at, s.voided_by_user_id,
               vu.email AS voided_by_email, s.void_reason, s.voided_at,
               b.id AS branch_id, b.name AS branch_name,
@@ -941,6 +1515,7 @@ export class SalesRepository {
        INNER JOIN cash_registers cr ON cr.id = s.cash_register_id AND cr.tenant_id = s.tenant_id
        LEFT JOIN users vu ON vu.id = s.voided_by_user_id AND vu.tenant_id = s.tenant_id
        LEFT JOIN customers c ON c.id = s.customer_id AND c.tenant_id = s.tenant_id
+       LEFT JOIN sales_quotations q ON q.id = s.quotation_id AND q.tenant_id = s.tenant_id
        WHERE s.tenant_id = ? AND s.idempotency_key = ? LIMIT 1`,
       [tenantId, idempotencyKey],
     );
@@ -948,25 +1523,72 @@ export class SalesRepository {
     const row = rows[0];
     const lines = await manager.query<
       Array<{
+        id: string;
         product_id: string;
         product_name: string;
         product_sku: string;
+        without_code: number | boolean;
+        line_note: string | null;
         quantity: string;
         unit_price: string;
+        price_source: 'BASE' | 'PRICE_LIST' | 'MANUAL';
+        price_override_reason: string | null;
+        price_list_id: string | null;
+        price_list_name: string | null;
+        unit_cost: string;
+        gross_total: string;
+        line_discount_total: string;
+        promotion_discount_total: string;
+        sale_discount_total: string;
+        discount_total: string;
+        discount_type: 'PERCENT' | 'AMOUNT' | null;
+        discount_value: string | null;
+        discount_reason: string | null;
+        expired_lot_override_reason: string | null;
+        stock_behavior: 'TRACKED' | 'UNTRACKED';
+        tax_behavior: 'STANDARD' | 'EXEMPT';
         subtotal: string;
         tax: string;
         total: string;
       }>
     >(
-      `SELECT product_id, product_name, product_sku, quantity, unit_price,
+      `SELECT id, product_id, product_name, product_sku, without_code, line_note, quantity, unit_price,
+              price_source, price_override_reason, price_list_id, price_list_name, unit_cost,
+              gross_total, line_discount_total, promotion_discount_total, sale_discount_total,
+              discount_total, discount_type, discount_value, discount_reason,
+              expired_lot_override_reason, stock_behavior, tax_behavior,
               subtotal, tax, total
        FROM sale_lines WHERE tenant_id = ? AND sale_id = ? ORDER BY line_number`,
       [tenantId, row.id],
     );
+    const promotionRows = await manager.query<
+      Array<{
+        sale_line_id: string;
+        promotion_id: string;
+        promotion_name: string;
+        promotion_type:
+          | 'BUY_X_GET_Y'
+          | 'SECOND_UNIT_PERCENT'
+          | 'BUNDLE_FIXED'
+          | 'QUANTITY_PERCENT';
+        priority: number | string;
+        discount_amount: string;
+        explanation: string;
+        rule_snapshot: string | Record<string, unknown>;
+      }>
+    >(
+      `SELECT sale_line_id, promotion_id, promotion_name, promotion_type,
+              priority, discount_amount, explanation, rule_snapshot
+       FROM sale_line_promotions
+       WHERE tenant_id = ? AND sale_id = ?
+       ORDER BY priority DESC, id`,
+      [tenantId, row.id],
+    );
     const paymentRows = await manager.query<
       Array<{
+        id: string;
         method: PaymentMethod;
-        status: 'COMPLETED' | 'REVERSED';
+        status: 'COMPLETED' | 'PENDING' | 'REVERSED';
         amount_received: string;
         amount_applied: string;
         change_amount: string;
@@ -975,12 +1597,13 @@ export class SalesRepository {
         authorization_code: string | null;
       }>
     >(
-      `SELECT method, status, amount_received, amount_applied, change_amount,
+      `SELECT id, method, status, amount_received, amount_applied, change_amount,
               external_reference, provider, authorization_code
        FROM sale_payments WHERE tenant_id = ? AND sale_id = ? ORDER BY created_at, id`,
       [tenantId, row.id],
     );
     const payments: SalePaymentData[] = paymentRows.map((payment) => ({
+      id: payment.id,
       method: payment.method,
       status: payment.status,
       amountReceived: this.decimal(payment.amount_received, 2),
@@ -991,6 +1614,88 @@ export class SalesRepository {
       authorizationCode: payment.authorization_code,
     }));
     if (!payments[0]) throw new Error('SALE_PAYMENT_NOT_FOUND');
+    const [creditAccount] = await manager.query<
+      Array<{
+        id: string;
+        currency: string;
+        original_amount: string;
+        term_days: number | string;
+        due_date: Date | string;
+        canceled_at: Date | string | null;
+        balance: string;
+        overdue_amount: string;
+      }>
+    >(
+      `SELECT cca.id, cca.currency, cca.original_amount, cca.term_days,
+              cca.due_date, cca.canceled_at,
+              COALESCE((SELECT SUM(CASE WHEN cdl.entry_type = 'DEBIT'
+                THEN cdl.amount ELSE -cdl.amount END)
+                FROM customer_debt_ledger cdl
+                WHERE cdl.account_id = cca.id AND cdl.tenant_id = cca.tenant_id), 0)
+                AS balance,
+              GREATEST(COALESCE((SELECT SUM(cci.amount)
+                FROM customer_credit_installments cci
+                WHERE cci.account_id = cca.id AND cci.tenant_id = cca.tenant_id
+                  AND cci.due_date < CURRENT_DATE()), 0)
+                - GREATEST(cca.original_amount - COALESCE((SELECT SUM(
+                  CASE WHEN cdl.entry_type = 'DEBIT' THEN cdl.amount ELSE -cdl.amount END)
+                  FROM customer_debt_ledger cdl
+                  WHERE cdl.account_id = cca.id AND cdl.tenant_id = cca.tenant_id), 0), 0), 0)
+                AS overdue_amount
+       FROM customer_credit_accounts cca
+       WHERE cca.tenant_id = ? AND cca.sale_id = ?
+       LIMIT 1`,
+      [tenantId, row.id],
+    );
+    const creditInstallments = creditAccount
+      ? await manager.query<
+          Array<{
+            installment_number: number | string;
+            due_date: Date | string;
+            amount: string;
+          }>
+        >(
+          `SELECT installment_number, due_date, amount
+           FROM customer_credit_installments
+           WHERE tenant_id = ? AND account_id = ?
+           ORDER BY installment_number`,
+          [tenantId, creditAccount.id],
+        )
+      : [];
+    const creditBalance = this.toMoney(creditAccount?.balance ?? '0');
+    const creditOverdue = this.toMoney(creditAccount?.overdue_amount ?? '0');
+    const credit = creditAccount
+      ? {
+          accountId: creditAccount.id,
+          originalAmount: this.decimal(creditAccount.original_amount, 2),
+          balance: this.money(creditBalance),
+          currency: creditAccount.currency,
+          termDays: Number(creditAccount.term_days),
+          status: creditAccount.canceled_at
+            ? ('CANCELLED' as const)
+            : creditBalance <= 0n
+              ? ('PAID' as const)
+              : creditOverdue > 0n
+                ? ('OVERDUE' as const)
+                : ('OPEN' as const),
+          dueDate: this.date(creditAccount.due_date),
+          installments: creditInstallments.map((installment) => ({
+            number: Number(installment.installment_number),
+            dueDate: this.date(installment.due_date),
+            amount: this.decimal(installment.amount, 2),
+          })),
+        }
+      : null;
+    const grossProfit = lines.reduce(
+      (sum, line) =>
+        sum +
+        this.toMoney(line.subtotal) -
+        this.roundDivide(
+          this.toMoney(line.unit_cost) * this.toQuantityUnits(line.quantity),
+          1000n,
+        ),
+      0n,
+    );
     return {
       fingerprint: row.request_fingerprint,
       sale: {
@@ -1014,27 +1719,107 @@ export class SalesRepository {
               identifier: row.customer_identifier,
             }
           : null,
+        quotation: row.quotation_id
+          ? { id: row.quotation_id, quotationNumber: row.quotation_number! }
+          : null,
         currency: row.currency,
         taxRate: this.decimal(row.tax_rate, 4),
+        discount: row.discount_type
+          ? {
+              type: row.discount_type,
+              value: this.decimal(row.discount_value!, 2),
+              reason: row.discount_reason!,
+              amount: this.decimal(row.sale_discount_total, 2),
+            }
+          : null,
+        loyalty:
+          Number(row.loyalty_points_redeemed) > 0 ||
+          Number(row.loyalty_points_earned) > 0
+            ? {
+                ruleVersion: Number(row.loyalty_rule_version),
+                pointsRedeemed: Number(row.loyalty_points_redeemed),
+                redemptionValue: this.decimal(row.loyalty_value, 2),
+                pointsEarned: Number(row.loyalty_points_earned),
+              }
+            : null,
         lines: lines.map((line) => ({
+          id: line.id,
           product: {
             id: line.product_id,
             name: line.product_name,
             sku: line.product_sku,
+            withoutCode: Boolean(line.without_code),
+            stockBehavior: line.stock_behavior,
+            taxBehavior: line.tax_behavior,
           },
           quantity: this.decimal(line.quantity, 3),
+          note: line.line_note,
+          expiredLotOverrideReason: line.expired_lot_override_reason,
           unitPrice: this.decimal(line.unit_price, 2),
+          priceSource: line.price_source,
+          priceOverrideReason: line.price_override_reason,
+          priceList: line.price_list_id
+            ? { id: line.price_list_id, name: line.price_list_name! }
+            : null,
+          grossTotal: this.decimal(line.gross_total, 2),
+          discount: {
+            line: line.discount_type
+              ? {
+                  type: line.discount_type,
+                  value: this.decimal(line.discount_value!, 2),
+                  reason: line.discount_reason!,
+                  amount: this.decimal(line.line_discount_total, 2),
+                }
+              : null,
+            sale: row.discount_type
+              ? {
+                  type: row.discount_type,
+                  value: this.decimal(row.discount_value!, 2),
+                  reason: row.discount_reason!,
+                  amount: this.decimal(line.sale_discount_total, 2),
+                }
+              : null,
+            total: this.decimal(line.discount_total, 2),
+          },
+          promotions: promotionRows
+            .filter((promotion) => promotion.sale_line_id === line.id)
+            .map((promotion) => ({
+              promotion: {
+                id: promotion.promotion_id,
+                name: promotion.promotion_name,
+                type: promotion.promotion_type,
+                priority: Number(promotion.priority),
+              },
+              amount: this.decimal(promotion.discount_amount, 2),
+              explanation: promotion.explanation,
+              ruleSnapshot: this.jsonObject(promotion.rule_snapshot),
+            })),
           subtotal: this.decimal(line.subtotal, 2),
           tax: this.decimal(line.tax, 2),
           total: this.decimal(line.total, 2),
+          grossProfit: this.money(
+            this.toMoney(line.subtotal) -
+              this.roundDivide(
+                this.toMoney(line.unit_cost) *
+                  this.toQuantityUnits(line.quantity),
+                1000n,
+              ),
+          ),
         })),
         totals: {
+          gross: this.decimal(row.gross_total, 2),
+          lineDiscount: this.decimal(row.line_discount_total, 2),
+          promotionDiscount: this.decimal(row.promotion_discount_total, 2),
+          saleDiscount: this.decimal(row.sale_discount_total, 2),
+          discount: this.decimal(row.discount_total, 2),
           subtotal: this.decimal(row.subtotal, 2),
           tax: this.decimal(row.tax_total, 2),
           total: this.decimal(row.total, 2),
+          grossProfit: this.money(grossProfit),
         },
         payment: payments[0],
         payments,
+        credit,
         createdAt: new Date(row.created_at).toISOString(),
         void:
           row.voided_by_user_id &&
@@ -1073,6 +1858,22 @@ export class SalesRepository {
     return `${whole}.${fraction.padEnd(scale, '0').slice(0, scale)}`;
   }
 
+  private date(value: Date | string): string {
+    if (value instanceof Date) return value.toISOString().slice(0, 10);
+    return String(value).slice(0, 10);
+  }
+
+  private jsonObject(
+    value: string | Record<string, unknown>,
+  ): Record<string, unknown> {
+    if (typeof value !== 'string') return value;
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('INVALID_PROMOTION_RULE_SNAPSHOT');
+    }
+    return parsed as Record<string, unknown>;
+  }
+
   private toQuantityUnits(value: string): bigint {
     const negative = value.startsWith('-');
     const unsigned = negative ? value.slice(1) : value;
@@ -1085,6 +1886,24 @@ export class SalesRepository {
     const sign = value < 0n ? '-' : '';
     const absolute = value < 0n ? -value : value;
     return `${sign}${absolute / 1000n}.${String(absolute % 1000n).padStart(3, '0')}`;
+  }
+
+  private toMoney(value: string): bigint {
+    const negative = value.startsWith('-');
+    const unsigned = negative ? value.slice(1) : value;
+    const [whole, fraction = ''] = unsigned.split('.');
+    const cents = BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0'));
+    return negative ? -cents : cents;
+  }
+
+  private money(value: bigint): string {
+    const sign = value < 0n ? '-' : '';
+    const absolute = value < 0n ? -value : value;
+    return `${sign}${absolute / 100n}.${String(absolute % 100n).padStart(2, '0')}`;
+  }
+
+  private roundDivide(numerator: bigint, denominator: bigint): bigint {
+    return (numerator + denominator / 2n) / denominator;
   }
 
   private isDuplicate(error: unknown): boolean {

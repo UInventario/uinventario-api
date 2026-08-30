@@ -5,6 +5,7 @@ import {
   IsArray,
   IsIn,
   IsISO8601,
+  IsOptional,
   IsString,
   IsUUID,
   Matches,
@@ -46,6 +47,26 @@ class OfflineCashSaleSnapshotLineDto {
 }
 
 class OfflineCashSaleSnapshotTotalsDto {
+  @IsOptional()
+  @Matches(MONEY)
+  gross?: string;
+
+  @IsOptional()
+  @IsIn(['0.00'])
+  lineDiscount?: '0.00';
+
+  @IsOptional()
+  @IsIn(['0.00'])
+  promotionDiscount?: '0.00';
+
+  @IsOptional()
+  @IsIn(['0.00'])
+  saleDiscount?: '0.00';
+
+  @IsOptional()
+  @IsIn(['0.00'])
+  discount?: '0.00';
+
   @Matches(MONEY)
   subtotal!: string;
 

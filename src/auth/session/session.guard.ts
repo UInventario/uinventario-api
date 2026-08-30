@@ -19,10 +19,24 @@ export class SessionGuard implements CanActivate {
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest<AuthenticatedRequest>();
-    const token = this.readCookie(request.headers.cookie);
+    const token = this.readToken(
+      request.headers.authorization,
+      request.headers.cookie,
+    );
     request.principal = await this.sessions.authenticate(token);
     request.sessionToken = token!;
     return true;
+  }
+
+  private readToken(
+    authorization: string | undefined,
+    cookieHeader: string | undefined,
+  ): string | undefined {
+    if (authorization !== undefined) {
+      const match = /^Bearer ([A-Za-z0-9_-]{32,128})$/.exec(authorization);
+      return match?.[1];
+    }
+    return this.readCookie(cookieHeader);
   }
 
   private readCookie(header: string | undefined): string | undefined {

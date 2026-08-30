@@ -6,8 +6,10 @@ import {
 import { PasswordResetController } from './password-reset.controller';
 import { PasswordResetRepository } from './password-reset.repository';
 import { PasswordResetService } from './password-reset.service';
+import { ExternalAdapterModule } from '../../integrations/external-adapter.module';
 
 @Module({
+  imports: [ExternalAdapterModule],
   controllers: [PasswordResetController],
   providers: [
     PasswordResetRepository,

@@ -23,6 +23,12 @@ import {
   InventoryTransferReceiptData,
   InventoryTransferStatus,
 } from './inventory-transfer.types';
+import {
+  normalizeProductQuantity,
+  ProductBaseUnit,
+  ProductQuantityPolicy,
+  QuantityRoundingMode,
+} from '../common/quantity-policy';
 
 interface TransferHeaderRow {
   id: string;
@@ -145,11 +151,19 @@ export class InventoryTransferRepository {
       throw new InvalidInventoryTransferTargetError();
     }
     this.assertDistinctLines(input.dto);
-    const normalizedLines = input.dto.lines.map((line) => ({
-      ...line,
-      quantity: this.fromUnits(this.toUnits(line.quantity)),
-      serialNumbers: (line.serialNumbers ?? []).map((value) => value.trim()),
-    }));
+    const policies = await this.productQuantityPolicies(
+      input.tenantId,
+      input.dto.lines.map((line) => line.productId),
+    );
+    const normalizedLines = input.dto.lines.map((line) => {
+      const policy = policies.get(line.productId);
+      if (!policy) throw new InvalidInventoryTransferTargetError();
+      return {
+        ...line,
+        quantity: normalizeProductQuantity(line.quantity, policy),
+        serialNumbers: (line.serialNumbers ?? []).map((value) => value.trim()),
+      };
+    });
     const fingerprint = createHash('sha256')
       .update(
         JSON.stringify({
@@ -460,19 +474,42 @@ export class InventoryTransferRepository {
     const lineIds = input.dto.lines.map(({ transferLineId }) => transferLineId);
     if (new Set(lineIds).size !== lineIds.length)
       throw new InvalidInventoryTransferReceiptError();
-    const normalizedLines = input.dto.lines.map((line) => ({
-      transferLineId: line.transferLineId,
-      receivedQuantity: this.fromUnits(this.toUnits(line.receivedQuantity)),
-      discrepancyQuantity: this.fromUnits(
-        this.toUnits(line.discrepancyQuantity),
-      ),
-      receivedSerialNumbers: (line.receivedSerialNumbers ?? []).map((value) =>
-        value.trim(),
-      ),
-      discrepancySerialNumbers: (line.discrepancySerialNumbers ?? []).map(
-        (value) => value.trim(),
-      ),
-    }));
+    const [target] = await this.dataSource.query<Array<{ id: string }>>(
+      `SELECT id FROM inventory_transfers
+       WHERE id = ? AND tenant_id = ? LIMIT 1`,
+      [input.transferId, input.tenantId],
+    );
+    if (!target) throw new InventoryTransferNotFoundError();
+    const policies = await this.transferLineQuantityPolicies(
+      input.tenantId,
+      input.transferId,
+      lineIds,
+    );
+    const normalizedLines = input.dto.lines.map((line) => {
+      const policy = policies.get(line.transferLineId);
+      if (!policy) throw new InvalidInventoryTransferReceiptError();
+      return {
+        transferLineId: line.transferLineId,
+        receivedQuantity: normalizeProductQuantity(
+          line.receivedQuantity,
+          policy,
+          {
+            enforceMinimum: false,
+          },
+        ),
+        discrepancyQuantity: normalizeProductQuantity(
+          line.discrepancyQuantity,
+          policy,
+          { enforceMinimum: false },
+        ),
+        receivedSerialNumbers: (line.receivedSerialNumbers ?? []).map((value) =>
+          value.trim(),
+        ),
+        discrepancySerialNumbers: (line.discrepancySerialNumbers ?? []).map(
+          (value) => value.trim(),
+        ),
+      };
+    });
     if (
       normalizedLines.every(
         (line) =>
@@ -1048,7 +1085,8 @@ export class InventoryTransferRepository {
        INNER JOIN locations destination ON destination.id = ?
          AND destination.tenant_id = p.tenant_id
          AND destination.warehouse_id = ? AND destination.active = TRUE
-       WHERE p.id = ? AND p.tenant_id = ? AND p.active = TRUE LIMIT 1`,
+       WHERE p.id = ? AND p.tenant_id = ? AND p.active = TRUE
+         AND p.variant_schema IS NULL LIMIT 1`,
       [
         sourceLocationId,
         originWarehouseId,
@@ -1273,6 +1311,75 @@ export class InventoryTransferRepository {
     return Array.isArray(parsed)
       ? parsed.filter((item): item is string => typeof item === 'string')
       : [];
+  }
+
+  private async productQuantityPolicies(
+    tenantId: string,
+    productIds: string[],
+  ): Promise<Map<string, ProductQuantityPolicy>> {
+    const uniqueIds = [...new Set(productIds)];
+    const rows = await this.dataSource.query<
+      Array<{
+        id: string;
+        base_unit: ProductBaseUnit;
+        quantity_precision: number;
+        quantity_rounding: QuantityRoundingMode;
+        minimum_quantity: string;
+      }>
+    >(
+      `SELECT id, base_unit, quantity_precision, quantity_rounding, minimum_quantity
+       FROM products WHERE tenant_id = ? AND active = TRUE
+         AND id IN (${uniqueIds.map(() => '?').join(',')})`,
+      [tenantId, ...uniqueIds],
+    );
+    return this.policyMap(rows.map((row) => ({ ...row, key: row.id })));
+  }
+
+  private async transferLineQuantityPolicies(
+    tenantId: string,
+    transferId: string,
+    lineIds: string[],
+  ): Promise<Map<string, ProductQuantityPolicy>> {
+    const rows = await this.dataSource.query<
+      Array<{
+        key: string;
+        base_unit: ProductBaseUnit;
+        quantity_precision: number;
+        quantity_rounding: QuantityRoundingMode;
+        minimum_quantity: string;
+      }>
+    >(
+      `SELECT tl.id AS \`key\`, p.base_unit, p.quantity_precision,
+              p.quantity_rounding, p.minimum_quantity
+       FROM inventory_transfer_lines tl
+       INNER JOIN products p ON p.id = tl.product_id AND p.tenant_id = tl.tenant_id
+       WHERE tl.tenant_id = ? AND tl.transfer_id = ?
+         AND tl.id IN (${lineIds.map(() => '?').join(',')})`,
+      [tenantId, transferId, ...lineIds],
+    );
+    return this.policyMap(rows);
+  }
+
+  private policyMap(
+    rows: Array<{
+      key: string;
+      base_unit: ProductBaseUnit;
+      quantity_precision: number;
+      quantity_rounding: QuantityRoundingMode;
+      minimum_quantity: string;
+    }>,
+  ): Map<string, ProductQuantityPolicy> {
+    return new Map(
+      rows.map((row) => [
+        row.key,
+        {
+          baseUnit: row.base_unit,
+          precision: Number(row.quantity_precision),
+          rounding: row.quantity_rounding,
+          minimumQuantity: row.minimum_quantity,
+        },
+      ]),
+    );
   }
 
   private toUnits(value: string): bigint {

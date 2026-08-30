@@ -15,10 +15,64 @@ import { PermissionGuard } from '../auth/authorization/permission.guard';
 import { PaymentAuthorizationService } from './payment-authorization.service';
 import { SalesCashReportRepository } from './sales-cash-report.repository';
 import { SalesCashReportService } from './sales-cash-report.service';
+import { SaleReceiptController } from './sale-receipt.controller';
+import { SaleReceiptRepository } from './sale-receipt.repository';
+import { SaleReceiptService } from './sale-receipt.service';
+import { SaleFiscalDocumentController } from './sale-fiscal-document.controller';
+import { SaleFiscalDocumentRepository } from './sale-fiscal-document.repository';
+import { SaleFiscalDocumentService } from './sale-fiscal-document.service';
+import { SaleReturnController } from './sale-return.controller';
+import { SaleReturnRepository } from './sale-return.repository';
+import { SaleReturnService } from './sale-return.service';
+import { SaleReturnSettlementRepository } from './sale-return-settlement.repository';
+import { PaymentRefundService } from './payment-refund.service';
+import { SuspendedSaleController } from './suspended-sale.controller';
+import { SuspendedSaleRepository } from './suspended-sale.repository';
+import { SuspendedSaleService } from './suspended-sale.service';
+import { PosPeripheralController } from './pos-peripheral.controller';
+import { PosPeripheralRepository } from './pos-peripheral.repository';
+import { PosPeripheralService } from './pos-peripheral.service';
+import {
+  POS_PERIPHERAL_ADAPTER,
+  SimulatorPosPeripheralAdapter,
+} from './pos-peripheral.adapter';
+import { PriceListModule } from '../pricing/price-list.module';
+import { CustomerModule } from '../customers/customer.module';
+import { CustomerCreditPaymentController } from './customer-credit-payment.controller';
+import { CustomerCreditPaymentRepository } from './customer-credit-payment.repository';
+import { CustomerCreditPaymentService } from './customer-credit-payment.service';
+import { PosProfitabilityReportRepository } from './pos-profitability-report.repository';
+import { PosProfitabilityReportService } from './pos-profitability-report.service';
+import { ExternalAdapterModule } from '../integrations/external-adapter.module';
+import { PromotionModule } from '../promotions/promotion.module';
+import { LoyaltyModule } from '../loyalty/loyalty.module';
+import { PaymentTerminalController } from './payment-terminal.controller';
+import { PaymentTerminalRepository } from './payment-terminal.repository';
+import { PaymentTerminalService } from './payment-terminal.service';
+import {
+  PAYMENT_TERMINAL_ADAPTER,
+  SimulatorPaymentTerminalAdapter,
+} from './payment-terminal.adapter';
 
 @Module({
-  imports: [SessionModule],
-  controllers: [PosController],
+  imports: [
+    SessionModule,
+    PriceListModule,
+    CustomerModule,
+    ExternalAdapterModule,
+    PromotionModule,
+    LoyaltyModule,
+  ],
+  controllers: [
+    PosController,
+    SaleReceiptController,
+    SaleFiscalDocumentController,
+    SaleReturnController,
+    SuspendedSaleController,
+    PosPeripheralController,
+    CustomerCreditPaymentController,
+    PaymentTerminalController,
+  ],
   providers: [
     PosRepository,
     SalesRepository,
@@ -32,6 +86,34 @@ import { SalesCashReportService } from './sales-cash-report.service';
     PaymentAuthorizationService,
     SalesCashReportRepository,
     SalesCashReportService,
+    PosProfitabilityReportRepository,
+    PosProfitabilityReportService,
+    SaleReceiptRepository,
+    SaleReceiptService,
+    SaleFiscalDocumentRepository,
+    SaleFiscalDocumentService,
+    SaleReturnRepository,
+    SaleReturnSettlementRepository,
+    SaleReturnService,
+    PaymentRefundService,
+    SuspendedSaleRepository,
+    SuspendedSaleService,
+    PosPeripheralRepository,
+    PosPeripheralService,
+    CustomerCreditPaymentRepository,
+    CustomerCreditPaymentService,
+    PaymentTerminalRepository,
+    PaymentTerminalService,
+    SimulatorPaymentTerminalAdapter,
+    {
+      provide: PAYMENT_TERMINAL_ADAPTER,
+      useExisting: SimulatorPaymentTerminalAdapter,
+    },
+    SimulatorPosPeripheralAdapter,
+    {
+      provide: POS_PERIPHERAL_ADAPTER,
+      useExisting: SimulatorPosPeripheralAdapter,
+    },
     PosService,
     PosAccessGuard,
   ],

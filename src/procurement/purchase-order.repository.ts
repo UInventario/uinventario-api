@@ -1,4 +1,9 @@
 import { Injectable } from '@nestjs/common';
+import {
+  normalizeProductQuantity,
+  ProductBaseUnit,
+  QuantityRoundingMode,
+} from '../common/quantity-policy';
 import { randomUUID } from 'node:crypto';
 import type { ResultSetHeader } from 'mysql2';
 import { DataSource, EntityManager, QueryFailedError } from 'typeorm';
@@ -65,6 +70,9 @@ interface LineRow {
   product_id: string;
   product_name: string;
   product_sku: string;
+  base_unit: ProductBaseUnit;
+  quantity_precision: number;
+  minimum_quantity: string;
   supplier_code: string;
   quantity: string;
   received_quantity: string;
@@ -92,6 +100,8 @@ interface ReceiptLineRow {
   purchase_order_line_id: string;
   received_quantity: string;
   lot_code: string | null;
+  manufactured_on: string | Date | null;
+  expires_on: string | Date | null;
   overage_quantity: string;
   unit_cost: string;
   total_cost: string;
@@ -134,6 +144,10 @@ interface LineReferenceRow {
   product_sku: string;
   supplier_code: string;
   price_currency: string | null;
+  base_unit: ProductBaseUnit;
+  quantity_precision: number;
+  quantity_rounding: QuantityRoundingMode;
+  minimum_quantity: string;
 }
 
 interface PersistedLine {
@@ -385,7 +399,8 @@ export class PurchaseOrderRepository {
     const ids = dto.lines.map((line) => line.supplierProductId);
     const references = await manager.query<LineReferenceRow[]>(
       `SELECT sp.id, sp.product_id, p.name AS product_name, p.sku AS product_sku,
-              sp.supplier_code,
+              sp.supplier_code, p.base_unit, p.quantity_precision,
+              p.quantity_rounding, p.minimum_quantity,
               (SELECT spp.currency FROM supplier_product_prices spp
                WHERE spp.tenant_id = sp.tenant_id AND spp.supplier_product_id = sp.id
                ORDER BY spp.valid_from DESC, spp.created_at DESC, spp.id DESC LIMIT 1
@@ -393,7 +408,13 @@ export class PurchaseOrderRepository {
        FROM supplier_products sp
        INNER JOIN products p ON p.id = sp.product_id AND p.tenant_id = sp.tenant_id
        WHERE sp.tenant_id = ? AND sp.supplier_id = ? AND sp.active = TRUE
-         AND p.active = TRUE AND sp.id IN (${ids.map(() => '?').join(',')})`,
+         AND p.active = TRUE AND p.variant_schema IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM product_kits pk
+           WHERE pk.tenant_id = p.tenant_id AND pk.product_id = p.id
+             AND pk.stock_mode = 'DERIVED'
+         )
+         AND sp.id IN (${ids.map(() => '?').join(',')})`,
       [tenantId, dto.supplierId, ...ids],
     );
     const byId = new Map(
@@ -405,10 +426,16 @@ export class PurchaseOrderRepository {
       if (reference.price_currency !== dto.currency) {
         throw new PurchaseOrderReferenceError('CURRENCY');
       }
+      const quantity = normalizeProductQuantity(input.quantity, {
+        baseUnit: reference.base_unit,
+        precision: Number(reference.quantity_precision),
+        rounding: reference.quantity_rounding,
+        minimumQuantity: reference.minimum_quantity,
+      });
       return {
-        input,
+        input: { ...input, quantity },
         reference,
-        subtotal: this.lineSubtotal(input.quantity, input.unitCost),
+        subtotal: this.lineSubtotal(quantity, input.unitCost),
       };
     });
   }
@@ -492,12 +519,14 @@ export class PurchaseOrderRepository {
     const parameters = [tenantId, ...rows.map((row) => row.id)];
     const [lines, transitions, receipts, returns] = await Promise.all([
       manager.query<LineRow[]>(
-        `SELECT id, purchase_order_id, supplier_product_id, product_id,
-                product_name, product_sku, supplier_code, quantity,
+        `SELECT pol.id, pol.purchase_order_id, pol.supplier_product_id, pol.product_id,
+                pol.product_name, pol.product_sku, pol.supplier_code, pol.quantity,
+                p.base_unit, p.quantity_precision, p.minimum_quantity,
                 received_quantity, unit_cost, subtotal, notes
-         FROM purchase_order_lines
-         WHERE tenant_id = ? AND purchase_order_id IN (${placeholders})
-         ORDER BY purchase_order_id, position`,
+         FROM purchase_order_lines pol
+         INNER JOIN products p ON p.id = pol.product_id AND p.tenant_id = pol.tenant_id
+         WHERE pol.tenant_id = ? AND pol.purchase_order_id IN (${placeholders})
+         ORDER BY pol.purchase_order_id, pol.position`,
         parameters,
       ),
       manager.query<TransitionRow[]>(
@@ -538,7 +567,8 @@ export class PurchaseOrderRepository {
     const receiptLines = receipts.length
       ? await manager.query<ReceiptLineRow[]>(
           `SELECT prl.id, prl.receipt_id, prl.purchase_order_line_id,
-                  prl.received_quantity, prl.lot_code, prl.overage_quantity, prl.unit_cost,
+                  prl.received_quantity, prl.lot_code, prl.manufactured_on,
+                  prl.expires_on, prl.overage_quantity, prl.unit_cost,
                   prl.total_cost, prl.previous_catalog_cost,
                   prl.resulting_catalog_cost,
                   COALESCE((SELECT SUM(returned_quantity)
@@ -634,6 +664,8 @@ export class PurchaseOrderRepository {
               purchaseOrderLineId: line.purchase_order_line_id,
               receivedQuantity: line.received_quantity,
               lotCode: line.lot_code,
+              manufacturedOn: this.dateOnly(line.manufactured_on),
+              expiresOn: this.dateOnly(line.expires_on),
               overageQuantity: line.overage_quantity,
               unitCost: line.unit_cost,
               totalCost: line.total_cost,
@@ -689,6 +721,9 @@ export class PurchaseOrderRepository {
             productId: line.product_id,
             productName: line.product_name,
             productSku: line.product_sku,
+            baseUnit: line.base_unit,
+            quantityPrecision: Number(line.quantity_precision),
+            minimumQuantity: line.minimum_quantity,
             supplierCode: line.supplier_code,
             quantity: line.quantity,
             receivedQuantity: line.received_quantity,
@@ -800,5 +835,12 @@ export class PurchaseOrderRepository {
 
   private dateTime(value: Date | string | null): string | null {
     return value ? new Date(value).toISOString() : null;
+  }
+
+  private dateOnly(value: Date | string | null): string | null {
+    if (!value) return null;
+    return value instanceof Date
+      ? value.toISOString().slice(0, 10)
+      : value.slice(0, 10);
   }
 }

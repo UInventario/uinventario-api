@@ -9,11 +9,17 @@ import {
   ProductIdentifierConflictError,
   ProductVersionConflictError,
   ProductLotTrackingLockedError,
+  ProductQuantityPolicyLockedError,
+  ProductVariantConfigurationError,
+  ProductVariantsRequireZeroStockError,
+  ProductKitConfigurationError,
+  ProductSaleBehaviorError,
 } from './catalog.errors';
 import {
   CatalogClassificationData,
   CatalogOptionsResponse,
   ProductData,
+  ProductKitData,
 } from './catalog.types';
 import { ListProductsDto, ProductStatusFilter } from './dto/list-products.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
@@ -21,13 +27,32 @@ import {
   CatalogClassificationKind,
   UpdateCatalogClassificationDto,
 } from './dto/catalog-classification.dto';
+import { UpdateProductVariantsDto } from './dto/update-product-variants.dto';
+import { UpdateProductKitDto } from './dto/update-product-kit.dto';
+import {
+  assertProductQuantityPolicy,
+  normalizeProductQuantity,
+  quantityToUnits,
+  ProductBaseUnit,
+  QuantityRoundingMode,
+} from '../common/quantity-policy';
 
 interface ProductRow {
   id: string;
   name: string;
   sku: string;
   barcode: string | null;
+  code_mode: 'EXPLICIT' | 'GENERATED';
+  stock_behavior: 'TRACKED' | 'UNTRACKED';
+  tax_behavior: 'STANDARD' | 'EXEMPT';
+  base_unit: ProductBaseUnit;
+  quantity_precision: number;
+  quantity_rounding: QuantityRoundingMode;
+  minimum_quantity: string;
   track_lots: number | boolean;
+  lot_expiration_policy: 'NONE' | 'OPTIONAL' | 'REQUIRED';
+  lot_expiration_alert_days: number;
+  allow_expired_stock_override: number | boolean;
   track_serials: number | boolean;
   cost: string;
   price: string;
@@ -37,6 +62,9 @@ interface ProductRow {
   category_name: string | null;
   brand_id: string | null;
   brand_name: string | null;
+  parent_product_id: string | null;
+  variant_schema: string | Array<{ name: string; values: string[] }> | null;
+  variant_values: string | Array<{ attribute: string; value: string }> | null;
 }
 
 @Injectable()
@@ -70,19 +98,39 @@ export class CatalogRepository {
             )
           : null;
         const id = randomUUID();
+        const withoutCode = dto.withoutCode ?? false;
+        const sku = withoutCode
+          ? `NC-${id.replaceAll('-', '').slice(0, 12).toUpperCase()}`
+          : dto.sku!;
         await manager.query(
           `INSERT INTO products
-            (id, tenant_id, name, sku, normalized_sku, barcode, track_lots,
-             track_serials, category_id, brand_id, cost, price)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            (id, tenant_id, name, sku, normalized_sku, barcode, code_mode,
+             stock_behavior, tax_behavior, base_unit,
+             quantity_precision, quantity_rounding, minimum_quantity, track_lots,
+             lot_expiration_policy, lot_expiration_alert_days,
+             allow_expired_stock_override, track_serials, category_id, brand_id,
+             cost, price)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             id,
             tenantId,
             dto.name,
-            dto.sku,
-            this.normalize(dto.sku),
+            sku,
+            this.normalize(sku),
             dto.barcode ?? null,
-            specificLotPolicy || (dto.trackLots ?? false),
+            withoutCode ? 'GENERATED' : 'EXPLICIT',
+            dto.stockBehavior ?? 'TRACKED',
+            dto.taxBehavior ?? 'STANDARD',
+            dto.baseUnit ?? 'UNIT',
+            dto.quantityPrecision ?? (dto.trackSerials ? 0 : 3),
+            dto.quantityRounding ?? 'HALF_UP',
+            dto.minimumQuantity ?? (dto.trackSerials ? '1.000' : '0.001'),
+            dto.stockBehavior === 'UNTRACKED'
+              ? false
+              : specificLotPolicy || (dto.trackLots ?? false),
+            dto.lotExpirationPolicy ?? 'NONE',
+            dto.lotExpirationAlertDays ?? 30,
+            dto.allowExpiredStockOverride ?? false,
             dto.trackSerials ?? false,
             categoryId,
             brandId,
@@ -129,22 +177,65 @@ export class CatalogRepository {
       return await this.dataSource.transaction(async (manager) => {
         const [currentTracking] = await manager.query<
           Array<{
+            sku: string;
+            code_mode: 'EXPLICIT' | 'GENERATED';
+            stock_behavior: 'TRACKED' | 'UNTRACKED';
+            tax_behavior: 'STANDARD' | 'EXEMPT';
             track_lots: number | boolean;
+            lot_expiration_policy: 'NONE' | 'OPTIONAL' | 'REQUIRED';
+            lot_expiration_alert_days: number;
+            allow_expired_stock_override: number | boolean;
             track_serials: number | boolean;
+            base_unit: ProductBaseUnit;
+            quantity_precision: number;
+            quantity_rounding: QuantityRoundingMode;
+            minimum_quantity: string;
             has_movements: number | string;
             specific_lot_policy: number | string;
+            is_kit: number | string;
           }>
         >(
-          `SELECT p.track_lots, p.track_serials,
+          `SELECT p.sku, p.code_mode, p.stock_behavior, p.tax_behavior,
+                  p.track_lots, p.track_serials, p.base_unit,
+                  p.quantity_precision, p.quantity_rounding, p.minimum_quantity,
                   EXISTS(SELECT 1 FROM inventory_movements im
-                         WHERE im.tenant_id = p.tenant_id AND im.product_id = p.id) AS has_movements,
+                         WHERE im.tenant_id = p.tenant_id
+                           AND (im.product_id = p.id OR im.product_id IN (
+                             SELECT child.id FROM products child
+                             WHERE child.tenant_id = p.tenant_id
+                               AND child.parent_product_id = p.id
+                           ))) AS has_movements,
                   EXISTS(SELECT 1 FROM inventory_valuation_policies ivp
                          WHERE ivp.tenant_id = p.tenant_id
-                           AND ivp.method = 'SPECIFIC_LOT') AS specific_lot_policy
+                           AND ivp.method = 'SPECIFIC_LOT') AS specific_lot_policy,
+                  EXISTS(SELECT 1 FROM product_kits pk
+                         WHERE pk.tenant_id = p.tenant_id
+                           AND pk.product_id = p.id) AS is_kit
            FROM products p WHERE p.id = ? AND p.tenant_id = ? LIMIT 1 FOR UPDATE`,
           [id, tenantId],
         );
         if (!currentTracking) return null;
+        const nextStockBehavior =
+          dto.stockBehavior ?? currentTracking.stock_behavior;
+        const nextTrackLots =
+          dto.trackLots ?? Boolean(currentTracking.track_lots);
+        const nextTrackSerials =
+          dto.trackSerials ?? Boolean(currentTracking.track_serials);
+        if (
+          nextStockBehavior === 'UNTRACKED' &&
+          (nextTrackLots || nextTrackSerials)
+        ) {
+          throw new ProductSaleBehaviorError(
+            'Un producto sin control de stock no puede usar lotes ni series.',
+          );
+        }
+        if (
+          dto.stockBehavior !== undefined &&
+          dto.stockBehavior !== currentTracking.stock_behavior &&
+          Number(currentTracking.has_movements) === 1
+        ) {
+          throw new ProductQuantityPolicyLockedError();
+        }
         if (
           dto.trackLots !== undefined &&
           dto.trackLots !== Boolean(currentTracking.track_lots) &&
@@ -159,6 +250,51 @@ export class CatalogRepository {
           Number(currentTracking.has_movements) === 1
         ) {
           throw new ProductLotTrackingLockedError();
+        }
+        const nextQuantityPolicy = {
+          baseUnit:
+            dto.baseUnit ??
+            (dto.trackSerials === true ? 'UNIT' : currentTracking.base_unit),
+          precision:
+            dto.quantityPrecision ??
+            (dto.trackSerials === true
+              ? 0
+              : Number(currentTracking.quantity_precision)),
+          rounding: dto.quantityRounding ?? currentTracking.quantity_rounding,
+          minimumQuantity:
+            dto.minimumQuantity ??
+            (dto.trackSerials === true
+              ? '1.000'
+              : currentTracking.minimum_quantity),
+        };
+        assertProductQuantityPolicy(
+          nextQuantityPolicy,
+          dto.trackSerials ?? Boolean(currentTracking.track_serials),
+        );
+        if (
+          Number(currentTracking.is_kit) === 1 &&
+          (nextQuantityPolicy.baseUnit !== 'UNIT' ||
+            nextQuantityPolicy.precision !== 0 ||
+            quantityToUnits(nextQuantityPolicy.minimumQuantity) !== 1000n ||
+            (dto.trackLots ?? Boolean(currentTracking.track_lots)) ||
+            (dto.trackSerials ?? Boolean(currentTracking.track_serials)))
+        ) {
+          throw new ProductKitConfigurationError(
+            'El producto debe conservar unidades enteras y no controlar lotes ni series mientras sea un kit.',
+          );
+        }
+        const quantityPolicyChanged =
+          nextQuantityPolicy.baseUnit !== currentTracking.base_unit ||
+          nextQuantityPolicy.precision !==
+            Number(currentTracking.quantity_precision) ||
+          nextQuantityPolicy.rounding !== currentTracking.quantity_rounding ||
+          quantityToUnits(nextQuantityPolicy.minimumQuantity) !==
+            quantityToUnits(currentTracking.minimum_quantity);
+        if (
+          quantityPolicyChanged &&
+          Number(currentTracking.has_movements) === 1
+        ) {
+          throw new ProductQuantityPolicyLockedError();
         }
         const categoryId = dto.categoryName
           ? await this.findOrCreateClassification(
@@ -176,20 +312,46 @@ export class CatalogRepository {
               dto.brandName,
             )
           : null;
+        const withoutCode =
+          dto.withoutCode ?? currentTracking.code_mode === 'GENERATED';
+        const sku = withoutCode
+          ? currentTracking.code_mode === 'GENERATED'
+            ? currentTracking.sku
+            : `NC-${randomUUID().replaceAll('-', '').slice(0, 12).toUpperCase()}`
+          : dto.sku!;
         const result = await manager.query<ResultSetHeader>(
           `UPDATE products
-           SET name = ?, sku = ?, normalized_sku = ?, barcode = ?,
+           SET name = ?, sku = ?, normalized_sku = ?, barcode = ?, code_mode = ?,
+               stock_behavior = COALESCE(?, stock_behavior),
+               tax_behavior = COALESCE(?, tax_behavior),
                track_lots = COALESCE(?, track_lots),
+               lot_expiration_policy = COALESCE(?, lot_expiration_policy),
+               lot_expiration_alert_days = COALESCE(?, lot_expiration_alert_days),
+               allow_expired_stock_override = COALESCE(?, allow_expired_stock_override),
                track_serials = COALESCE(?, track_serials),
+               base_unit = COALESCE(?, base_unit),
+               quantity_precision = COALESCE(?, quantity_precision),
+               quantity_rounding = COALESCE(?, quantity_rounding),
+               minimum_quantity = COALESCE(?, minimum_quantity),
                category_id = ?, brand_id = ?, cost = ?, price = ?, version = version + 1
            WHERE id = ? AND tenant_id = ? AND version = ?`,
           [
             dto.name,
-            dto.sku,
-            this.normalize(dto.sku),
+            sku,
+            this.normalize(sku),
             dto.barcode ?? null,
+            withoutCode ? 'GENERATED' : 'EXPLICIT',
+            dto.stockBehavior ?? null,
+            dto.taxBehavior ?? null,
             dto.trackLots ?? null,
+            dto.lotExpirationPolicy ?? null,
+            dto.lotExpirationAlertDays ?? null,
+            dto.allowExpiredStockOverride ?? null,
             dto.trackSerials ?? null,
+            dto.baseUnit ?? (dto.trackSerials === true ? 'UNIT' : null),
+            dto.quantityPrecision ?? (dto.trackSerials === true ? 0 : null),
+            dto.quantityRounding ?? null,
+            dto.minimumQuantity ?? (dto.trackSerials === true ? '1.000' : null),
             categoryId,
             brandId,
             dto.cost,
@@ -204,6 +366,25 @@ export class CatalogRepository {
           if (!current) return null;
           throw new ProductVersionConflictError(current.version);
         }
+        await manager.query(
+          `UPDATE products child
+           INNER JOIN products parent
+             ON parent.id = child.parent_product_id
+            AND parent.tenant_id = child.tenant_id
+           SET child.track_lots = parent.track_lots,
+               child.stock_behavior = parent.stock_behavior,
+               child.tax_behavior = parent.tax_behavior,
+               child.lot_expiration_policy = parent.lot_expiration_policy,
+               child.lot_expiration_alert_days = parent.lot_expiration_alert_days,
+               child.allow_expired_stock_override = parent.allow_expired_stock_override,
+               child.base_unit = parent.base_unit,
+               child.quantity_precision = parent.quantity_precision,
+               child.quantity_rounding = parent.quantity_rounding,
+               child.minimum_quantity = parent.minimum_quantity,
+               child.version = child.version + 1
+           WHERE child.tenant_id = ? AND parent.id = ?`,
+          [tenantId, id],
+        );
         return this.findProduct(manager, tenantId, id);
       });
     } catch (error) {
@@ -243,6 +424,7 @@ export class CatalogRepository {
       conditions.push('p.brand_id = ?');
       parameters.push(query.brandId);
     }
+    if (query.sellableOnly) conditions.push('p.variant_schema IS NULL');
     const where = conditions.join(' AND ');
     const offset = (query.page - 1) * query.pageSize;
     const [rows, countRows] = await Promise.all([
@@ -267,7 +449,217 @@ export class CatalogRepository {
       `${this.productSelect()} WHERE p.id = ? AND p.tenant_id = ? LIMIT 1`,
       [id, tenantId],
     );
-    return rows[0] ? this.toProduct(rows[0]) : null;
+    if (!rows[0]) return null;
+    const product = this.toProduct(rows[0]);
+    if (product.variantAttributes.length > 0) {
+      const variants = await this.dataSource.query<ProductRow[]>(
+        `${this.productSelect()} WHERE p.parent_product_id = ? AND p.tenant_id = ?
+         ORDER BY p.created_at, p.id`,
+        [id, tenantId],
+      );
+      product.variants = variants.map((row) => this.toProduct(row));
+    }
+    product.kit = await this.findKit(this.dataSource, tenantId, id);
+    return product;
+  }
+
+  async updateProductKit(
+    tenantId: string,
+    productId: string,
+    dto: UpdateProductKitDto,
+  ): Promise<ProductData | null> {
+    return this.dataSource.transaction(async (manager) => {
+      const [product] = await manager.query<
+        Array<{
+          id: string;
+          version: number;
+          variant_schema: string | null;
+          base_unit: ProductBaseUnit;
+          quantity_precision: number;
+          minimum_quantity: string;
+          track_lots: number | boolean;
+          track_serials: number | boolean;
+          existing_kit_stock_mode: 'DERIVED' | 'ASSEMBLED' | null;
+          existing_stock: string;
+        }>
+      >(
+        `SELECT p.id, p.version, p.variant_schema, p.base_unit, p.quantity_precision,
+                p.minimum_quantity, p.track_lots, p.track_serials,
+                (SELECT pk.stock_mode FROM product_kits pk
+                 WHERE pk.tenant_id = p.tenant_id AND pk.product_id = p.id
+                 LIMIT 1) AS existing_kit_stock_mode,
+                (SELECT COALESCE(SUM(ib.quantity), 0) FROM inventory_balances ib
+                 WHERE ib.tenant_id = p.tenant_id AND ib.product_id = p.id) AS existing_stock
+         FROM products p WHERE p.id = ? AND p.tenant_id = ? LIMIT 1 FOR UPDATE`,
+        [productId, tenantId],
+      );
+      if (!product) return null;
+      if (Number(product.version) !== dto.version) {
+        throw new ProductVersionConflictError(Number(product.version));
+      }
+      const hasOwnStock = quantityToUnits(product.existing_stock) !== 0n;
+      if (!dto.enabled) {
+        if (hasOwnStock && product.existing_kit_stock_mode) {
+          throw new ProductKitConfigurationError(
+            'Deja la existencia del kit en cero antes de eliminar su configuración.',
+          );
+        }
+        await manager.query(
+          'DELETE FROM product_kits WHERE product_id = ? AND tenant_id = ?',
+          [productId, tenantId],
+        );
+      } else {
+        if (
+          hasOwnStock &&
+          (!product.existing_kit_stock_mode ||
+            product.existing_kit_stock_mode !== dto.stockMode)
+        ) {
+          throw new ProductKitConfigurationError(
+            'Deja la existencia propia en cero antes de crear el kit o cambiar su modo de stock.',
+          );
+        }
+        if (
+          product.variant_schema !== null ||
+          product.base_unit !== 'UNIT' ||
+          Number(product.quantity_precision) !== 0 ||
+          quantityToUnits(product.minimum_quantity) !== 1000n ||
+          Boolean(product.track_lots) ||
+          Boolean(product.track_serials)
+        ) {
+          throw new ProductKitConfigurationError(
+            'El kit debe ser vendible por unidades enteras y no controlar lotes ni series.',
+          );
+        }
+        const requested = dto.components ?? [];
+        const componentIds = requested.map(({ productId: id }) => id);
+        if (
+          new Set(componentIds).size !== componentIds.length ||
+          componentIds.includes(productId)
+        ) {
+          throw new ProductKitConfigurationError(
+            'Los componentes no pueden repetirse ni incluir al propio kit.',
+          );
+        }
+        const components = await manager.query<
+          Array<{
+            id: string;
+            base_unit: ProductBaseUnit;
+            quantity_precision: number;
+            quantity_rounding: QuantityRoundingMode;
+            minimum_quantity: string;
+            track_lots: number | boolean;
+            track_serials: number | boolean;
+            nested_kit: number | string;
+          }>
+        >(
+          `SELECT p.id, p.base_unit, p.quantity_precision, p.quantity_rounding,
+                  p.minimum_quantity, p.track_lots, p.track_serials,
+                  EXISTS(SELECT 1 FROM product_kits pk
+                         WHERE pk.tenant_id = p.tenant_id AND pk.product_id = p.id) AS nested_kit
+           FROM products p
+           WHERE p.tenant_id = ? AND p.active = TRUE AND p.variant_schema IS NULL
+             AND p.id IN (${componentIds.map(() => '?').join(',')})`,
+          [tenantId, ...componentIds],
+        );
+        if (components.length !== componentIds.length) {
+          throw new ProductKitConfigurationError(
+            'Todos los componentes deben existir, estar activos y ser vendibles.',
+          );
+        }
+        const byId = new Map(
+          components.map((component) => [component.id, component]),
+        );
+        const normalized = requested.map((item, position) => {
+          const component = byId.get(item.productId)!;
+          if (
+            Number(component.nested_kit) === 1 ||
+            Boolean(component.track_lots) ||
+            Boolean(component.track_serials)
+          ) {
+            throw new ProductKitConfigurationError(
+              'Los kits anidados y componentes con lotes o series no están permitidos.',
+            );
+          }
+          return {
+            ...item,
+            position,
+            quantity: normalizeProductQuantity(item.quantity, {
+              baseUnit: component.base_unit,
+              precision: Number(component.quantity_precision),
+              rounding: component.quantity_rounding,
+              minimumQuantity: component.minimum_quantity,
+            }),
+          };
+        });
+        if (hasOwnStock) {
+          const currentComponents = await manager.query<
+            Array<{ component_product_id: string; quantity: string }>
+          >(
+            `SELECT component_product_id, quantity FROM product_kit_components
+             WHERE tenant_id = ? AND kit_product_id = ? ORDER BY component_product_id`,
+            [tenantId, productId],
+          );
+          const currentSignature = currentComponents
+            .map(
+              ({ component_product_id, quantity }) =>
+                `${component_product_id}:${quantity}`,
+            )
+            .join('|');
+          const nextSignature = normalized
+            .map(({ productId: id, quantity }) => `${id}:${quantity}`)
+            .sort()
+            .join('|');
+          if (currentSignature !== nextSignature) {
+            throw new ProductKitConfigurationError(
+              'Desensambla la existencia actual antes de cambiar los componentes del kit.',
+            );
+          }
+        }
+        await manager.query(
+          `INSERT INTO product_kits
+             (product_id, tenant_id, stock_mode, price_rule, effective_from, effective_to)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE stock_mode = VALUES(stock_mode),
+             price_rule = VALUES(price_rule), effective_from = VALUES(effective_from),
+             effective_to = VALUES(effective_to)`,
+          [
+            productId,
+            tenantId,
+            dto.stockMode,
+            dto.priceRule,
+            dto.effectiveFrom ?? null,
+            dto.effectiveTo ?? null,
+          ],
+        );
+        await manager.query(
+          'DELETE FROM product_kit_components WHERE tenant_id = ? AND kit_product_id = ?',
+          [tenantId, productId],
+        );
+        for (const component of normalized) {
+          await manager.query(
+            `INSERT INTO product_kit_components
+               (id, tenant_id, kit_product_id, component_product_id, quantity, position)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [
+              randomUUID(),
+              tenantId,
+              productId,
+              component.productId,
+              component.quantity,
+              component.position,
+            ],
+          );
+        }
+      }
+      await manager.query(
+        'UPDATE products SET version = version + 1 WHERE id = ? AND tenant_id = ?',
+        [productId, tenantId],
+      );
+      const updated = await this.findProduct(manager, tenantId, productId);
+      if (!updated) throw new Error('UPDATED_PRODUCT_NOT_FOUND');
+      updated.kit = await this.findKit(manager, tenantId, productId);
+      return updated;
+    });
   }
 
   async resolveCode(
@@ -276,12 +668,230 @@ export class CatalogRepository {
   ): Promise<ProductData | null> {
     const rows = await this.dataSource.query<ProductRow[]>(
       `${this.productSelect()} WHERE p.tenant_id = ?
+         AND p.variant_schema IS NULL
          AND (p.normalized_sku = ? OR p.barcode = ?)
        ORDER BY p.id LIMIT 2`,
       [tenantId, this.normalize(code), code],
     );
     if (rows.length > 1) throw new ProductCodeAmbiguousError();
     return rows[0] ? this.toProduct(rows[0]) : null;
+  }
+
+  async updateProductVariants(
+    tenantId: string,
+    parentId: string,
+    dto: UpdateProductVariantsDto,
+  ): Promise<ProductData | null> {
+    try {
+      return await this.dataSource.transaction(async (manager) => {
+        const [parent] = await manager.query<
+          Array<{
+            id: string;
+            name: string;
+            category_id: string | null;
+            brand_id: string | null;
+            stock_behavior: 'TRACKED' | 'UNTRACKED';
+            tax_behavior: 'STANDARD' | 'EXEMPT';
+            track_lots: number | boolean;
+            lot_expiration_policy: 'NONE' | 'OPTIONAL' | 'REQUIRED';
+            lot_expiration_alert_days: number;
+            allow_expired_stock_override: number | boolean;
+            track_serials: number | boolean;
+            base_unit: ProductBaseUnit;
+            quantity_precision: number;
+            quantity_rounding: QuantityRoundingMode;
+            minimum_quantity: string;
+            active: number | boolean;
+            version: number;
+            parent_product_id: string | null;
+            variant_schema: unknown;
+            is_kit: number | string;
+          }>
+        >(
+          `SELECT id, name, category_id, brand_id, stock_behavior, tax_behavior,
+                  track_lots, base_unit,
+                  quantity_precision, quantity_rounding, minimum_quantity,
+                  lot_expiration_policy, lot_expiration_alert_days,
+                  allow_expired_stock_override, track_serials, active,
+                  version, parent_product_id, variant_schema,
+                  EXISTS(SELECT 1 FROM product_kits pk
+                         WHERE pk.tenant_id = products.tenant_id
+                           AND pk.product_id = products.id) AS is_kit
+           FROM products WHERE id = ? AND tenant_id = ? LIMIT 1 FOR UPDATE`,
+          [parentId, tenantId],
+        );
+        if (!parent) return null;
+        if (Number(parent.is_kit) === 1) {
+          throw new ProductVariantConfigurationError(
+            'Elimina la configuración del kit antes de crear variantes.',
+          );
+        }
+        if (parent.parent_product_id) {
+          throw new ProductVariantConfigurationError(
+            'Una variante no puede contener otras variantes.',
+          );
+        }
+        if (!parent.active) {
+          throw new ProductVariantConfigurationError(
+            'Activa el producto padre antes de modificar sus variantes.',
+          );
+        }
+        if (Number(parent.version) !== dto.version) {
+          throw new ProductVersionConflictError(Number(parent.version));
+        }
+
+        const attributes = this.validateVariantConfiguration(dto);
+        if (parent.variant_schema === null) {
+          const [stock] = await manager.query<
+            Array<{ has_stock: number | string }>
+          >(
+            `SELECT EXISTS(
+               SELECT 1 FROM inventory_balances
+               WHERE tenant_id = ? AND product_id = ? AND quantity <> 0
+             ) AS has_stock`,
+            [tenantId, parentId],
+          );
+          if (Number(stock.has_stock) === 1) {
+            throw new ProductVariantsRequireZeroStockError();
+          }
+        }
+
+        const existing = await manager.query<
+          Array<{
+            id: string;
+            version: number;
+            active: number | boolean;
+            variant_values: unknown;
+          }>
+        >(
+          `SELECT id, version, active, variant_values FROM products
+           WHERE tenant_id = ? AND parent_product_id = ? FOR UPDATE`,
+          [tenantId, parentId],
+        );
+        const existingById = new Map(existing.map((row) => [row.id, row]));
+        const retainedIds = new Set<string>();
+        for (const input of dto.variants) {
+          const variantValues = attributes.map((attribute, index) => ({
+            attribute: attribute.name,
+            value: input.values[index],
+          }));
+          const name = `${parent.name} · ${input.values.join(' / ')}`;
+          if (input.id) {
+            if (retainedIds.has(input.id)) {
+              throw new ProductVariantConfigurationError(
+                'Una variante existente no puede asignarse a dos combinaciones.',
+              );
+            }
+            const current = existingById.get(input.id);
+            if (!current || input.version === undefined) {
+              throw new ProductVariantConfigurationError(
+                'La variante indicada no pertenece a este producto.',
+              );
+            }
+            if (Number(current.version) !== input.version) {
+              throw new ProductVersionConflictError(Number(current.version));
+            }
+            await manager.query(
+              `UPDATE products SET name = ?, sku = ?, normalized_sku = ?, barcode = ?,
+                 variant_values = ?, cost = ?, price = ?, active = ?, version = version + 1
+               WHERE id = ? AND tenant_id = ? AND parent_product_id = ?`,
+              [
+                name,
+                input.sku,
+                this.normalize(input.sku),
+                input.barcode ?? null,
+                JSON.stringify(variantValues),
+                input.cost,
+                input.price,
+                input.active,
+                input.id,
+                tenantId,
+                parentId,
+              ],
+            );
+            retainedIds.add(input.id);
+          } else {
+            const id = randomUUID();
+            await manager.query(
+              `INSERT INTO products
+                (id, tenant_id, parent_product_id, name, sku, normalized_sku, barcode,
+                 variant_values, stock_behavior, tax_behavior,
+                 track_lots, track_serials, base_unit,
+                 quantity_precision, quantity_rounding, minimum_quantity,
+                 category_id, brand_id,
+                 lot_expiration_policy, lot_expiration_alert_days,
+                 allow_expired_stock_override, cost, price, active)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                id,
+                tenantId,
+                parentId,
+                name,
+                input.sku,
+                this.normalize(input.sku),
+                input.barcode ?? null,
+                JSON.stringify(variantValues),
+                parent.stock_behavior,
+                parent.tax_behavior,
+                parent.track_lots,
+                parent.track_serials,
+                parent.base_unit,
+                parent.quantity_precision,
+                parent.quantity_rounding,
+                parent.minimum_quantity,
+                parent.category_id,
+                parent.brand_id,
+                parent.lot_expiration_policy,
+                parent.lot_expiration_alert_days,
+                parent.allow_expired_stock_override,
+                input.cost,
+                input.price,
+                input.active,
+              ],
+            );
+            retainedIds.add(id);
+          }
+        }
+
+        const removedIds = existing
+          .map(({ id }) => id)
+          .filter(
+            (id) =>
+              !retainedIds.has(id) && Boolean(existingById.get(id)?.active),
+          );
+        if (removedIds.length > 0) {
+          await manager.query(
+            `UPDATE products SET active = FALSE, version = version + 1
+             WHERE tenant_id = ? AND parent_product_id = ?
+               AND id IN (${removedIds.map(() => '?').join(',')})`,
+            [tenantId, parentId, ...removedIds],
+          );
+        }
+        await manager.query(
+          `UPDATE products SET variant_schema = ?, version = version + 1
+           WHERE id = ? AND tenant_id = ? AND version = ?`,
+          [JSON.stringify(attributes), parentId, tenantId, dto.version],
+        );
+        const product = await this.findProduct(manager, tenantId, parentId);
+        if (!product) throw new Error('UPDATED_PRODUCT_NOT_FOUND');
+        const variantRows = await manager.query<ProductRow[]>(
+          `${this.productSelect()} WHERE p.parent_product_id = ? AND p.tenant_id = ?
+           ORDER BY p.created_at, p.id`,
+          [parentId, tenantId],
+        );
+        product.variants = variantRows.map((row) => this.toProduct(row));
+        return product;
+      });
+    } catch (error) {
+      const constraint = this.duplicateConstraint(error);
+      if (constraint?.includes('uq_products_tenant_sku')) {
+        throw new ProductIdentifierConflictError('sku');
+      }
+      if (constraint?.includes('uq_products_tenant_barcode')) {
+        throw new ProductIdentifierConflictError('barcode');
+      }
+      throw error;
+    }
   }
 
   async retireProduct(
@@ -316,26 +926,28 @@ export class CatalogRepository {
           has_movements: number | string;
           has_sales: number | string;
           has_stock: number | string;
+          has_variants: number | string;
         }>
       >(
         `SELECT
            EXISTS(SELECT 1 FROM inventory_movements WHERE tenant_id = ? AND product_id = ?) AS has_movements,
            EXISTS(SELECT 1 FROM sale_lines WHERE tenant_id = ? AND product_id = ?) AS has_sales,
-           EXISTS(SELECT 1 FROM inventory_balances WHERE tenant_id = ? AND product_id = ? AND quantity <> 0) AS has_stock`,
-        [tenantId, id, tenantId, id, tenantId, id],
+           EXISTS(SELECT 1 FROM inventory_balances WHERE tenant_id = ? AND product_id = ? AND quantity <> 0) AS has_stock,
+           EXISTS(SELECT 1 FROM products WHERE tenant_id = ? AND parent_product_id = ?) AS has_variants`,
+        [tenantId, id, tenantId, id, tenantId, id, tenantId, id],
       );
       const mustPreserve =
         Number(references.has_movements) === 1 ||
         Number(references.has_sales) === 1 ||
-        Number(references.has_stock) === 1;
+        Number(references.has_stock) === 1 ||
+        Number(references.has_variants) === 1;
       if (mustPreserve) {
-        if (products[0].active) {
-          await manager.query(
-            `UPDATE products SET active = FALSE, version = version + 1
-             WHERE id = ? AND tenant_id = ?`,
-            [id, tenantId],
-          );
-        }
+        await manager.query(
+          `UPDATE products SET active = FALSE, version = version + 1
+           WHERE tenant_id = ? AND active = TRUE
+             AND (id = ? OR parent_product_id = ?)`,
+          [tenantId, id, id],
+        );
         return {
           outcome: 'DEACTIVATED',
           product: await this.findProduct(manager, tenantId, id),
@@ -539,8 +1151,67 @@ export class CatalogRepository {
     return row ? this.toProduct(row) : null;
   }
 
+  private async findKit(
+    source: DataSource | EntityManager,
+    tenantId: string,
+    productId: string,
+  ): Promise<ProductKitData | null> {
+    const rows = await source.query<
+      Array<{
+        stock_mode: ProductKitData['stockMode'];
+        price_rule: ProductKitData['priceRule'];
+        effective_from: string | Date | null;
+        effective_to: string | Date | null;
+        component_product_id: string;
+        component_name: string;
+        component_sku: string;
+        quantity: string;
+      }>
+    >(
+      `SELECT pk.stock_mode, pk.price_rule, pk.effective_from, pk.effective_to,
+              c.component_product_id, p.name AS component_name,
+              p.sku AS component_sku, c.quantity
+       FROM product_kits pk
+       INNER JOIN product_kit_components c
+         ON c.kit_product_id = pk.product_id AND c.tenant_id = pk.tenant_id
+       INNER JOIN products p
+         ON p.id = c.component_product_id AND p.tenant_id = c.tenant_id
+       WHERE pk.tenant_id = ? AND pk.product_id = ?
+       ORDER BY c.position, c.id`,
+      [tenantId, productId],
+    );
+    if (!rows[0]) return null;
+    const date = (value: string | Date | null) =>
+      value === null
+        ? null
+        : value instanceof Date
+          ? value.toISOString().slice(0, 10)
+          : value.slice(0, 10);
+    return {
+      stockMode: rows[0].stock_mode,
+      priceRule: rows[0].price_rule,
+      effectiveFrom: date(rows[0].effective_from),
+      effectiveTo: date(rows[0].effective_to),
+      components: rows.map((row) => ({
+        product: {
+          id: row.component_product_id,
+          name: row.component_name,
+          sku: row.component_sku,
+        },
+        quantity: row.quantity,
+      })),
+    };
+  }
+
   private productSelect(): string {
-    return `SELECT p.id, p.name, p.sku, p.barcode, p.track_lots, p.track_serials, p.cost, p.price, p.active, p.version,
+    return `SELECT p.id, p.name, p.sku, p.barcode, p.code_mode,
+                   p.stock_behavior, p.tax_behavior, p.base_unit,
+                   p.quantity_precision, p.quantity_rounding, p.minimum_quantity,
+                   p.track_lots,
+                   p.lot_expiration_policy, p.lot_expiration_alert_days,
+                   p.allow_expired_stock_override, p.track_serials,
+                   p.cost, p.price, p.active, p.version,
+                   p.parent_product_id, p.variant_schema, p.variant_values,
                    c.id AS category_id, c.name AS category_name,
                    b.id AS brand_id, b.name AS brand_name
             FROM products p
@@ -605,7 +1276,17 @@ export class CatalogRepository {
       name: row.name,
       sku: row.sku,
       barcode: row.barcode,
+      withoutCode: row.code_mode === 'GENERATED',
+      stockBehavior: row.stock_behavior,
+      taxBehavior: row.tax_behavior,
+      baseUnit: row.base_unit,
+      quantityPrecision: Number(row.quantity_precision),
+      quantityRounding: row.quantity_rounding,
+      minimumQuantity: row.minimum_quantity,
       trackLots: Boolean(row.track_lots),
+      lotExpirationPolicy: row.lot_expiration_policy,
+      lotExpirationAlertDays: Number(row.lot_expiration_alert_days),
+      allowExpiredStockOverride: Boolean(row.allow_expired_stock_override),
       trackSerials: Boolean(row.track_serials),
       category:
         row.category_id && row.category_name
@@ -619,7 +1300,89 @@ export class CatalogRepository {
       price: row.price,
       active: Boolean(row.active),
       version: Number(row.version),
+      parentProductId: row.parent_product_id,
+      variantAttributes: this.jsonValue(row.variant_schema),
+      variantValues: this.jsonValue(row.variant_values),
+      sellable: row.variant_schema === null,
+      variants: [],
+      kit: null,
     };
+  }
+
+  private validateVariantConfiguration(dto: UpdateProductVariantsDto) {
+    const normalizedNames = new Set<string>();
+    const attributes = dto.attributes.map((attribute) => {
+      const normalizedName = this.normalize(attribute.name);
+      if (normalizedNames.has(normalizedName)) {
+        throw new ProductVariantConfigurationError(
+          'Los nombres de atributo no pueden repetirse.',
+        );
+      }
+      normalizedNames.add(normalizedName);
+      const normalizedValues = new Set<string>();
+      for (const value of attribute.values) {
+        const normalized = this.normalize(value);
+        if (normalizedValues.has(normalized)) {
+          throw new ProductVariantConfigurationError(
+            `El atributo ${attribute.name} contiene valores repetidos.`,
+          );
+        }
+        normalizedValues.add(normalized);
+      }
+      return { name: attribute.name, values: attribute.values };
+    });
+    const combinationCount = attributes.reduce(
+      (total, attribute) => total * attribute.values.length,
+      1,
+    );
+    if (combinationCount > 100) {
+      throw new ProductVariantConfigurationError(
+        'La configuración genera más de 100 combinaciones.',
+      );
+    }
+    if (dto.variants.length !== combinationCount) {
+      throw new ProductVariantConfigurationError(
+        'Debes configurar exactamente una variante por combinación.',
+      );
+    }
+    const expected = new Set(
+      this.cartesian(attributes.map(({ values }) => values)),
+    );
+    const received = new Set<string>();
+    for (const variant of dto.variants) {
+      if (variant.values.length !== attributes.length) {
+        throw new ProductVariantConfigurationError(
+          'Cada variante debe seleccionar un valor por atributo.',
+        );
+      }
+      const key = variant.values
+        .map((value) => this.normalize(value))
+        .join('\u0000');
+      if (!expected.has(key) || received.has(key)) {
+        throw new ProductVariantConfigurationError(
+          'Las combinaciones son inválidas o están repetidas.',
+        );
+      }
+      received.add(key);
+    }
+    return attributes;
+  }
+
+  private cartesian(values: string[][]): string[] {
+    return values
+      .reduce<string[][]>(
+        (combinations, options) =>
+          combinations.flatMap((combination) =>
+            options.map((option) => [...combination, this.normalize(option)]),
+          ),
+        [[]],
+      )
+      .map((combination) => combination.join('\u0000'));
+  }
+
+  private jsonValue<T>(value: string | T | null): T {
+    if (value === null) return [] as T;
+    return (typeof value === 'string' ? JSON.parse(value) : value) as T;
   }
 
   private normalize(value: string): string {

@@ -17,12 +17,14 @@ case "$environment" in
     project_number="624020863656"
     branch="develop"
     database_secret="uinventario-dev-database-url"
+    email_secret="uinventario-dev-resend-config"
     ;;
   prod)
     project_id="software-inventario-prod"
     project_number="356622377746"
     branch="master"
     database_secret="uinventario-prod-database-url"
+    email_secret="uinventario-prod-resend-config"
     ;;
   *)
     echo "Environment must be dev or prod." >&2
@@ -49,7 +51,6 @@ if ! gcloud artifacts repositories describe "$artifact_repository" --project="$p
     --location="$region" \
     --repository-format=docker \
     --description="UInventario deployment images" \
-    --immutable-tags \
     --quiet
 fi
 
@@ -67,6 +68,21 @@ if gcloud secrets describe "$database_secret" --project="$project_id" >/dev/null
     --condition=None \
     --quiet >/dev/null
   gcloud secrets add-iam-policy-binding "$database_secret" \
+    --project="$project_id" \
+    --member="$build_member" \
+    --role=roles/secretmanager.viewer \
+    --condition=None \
+    --quiet >/dev/null
+fi
+
+if gcloud secrets describe "$email_secret" --project="$project_id" >/dev/null 2>&1; then
+  gcloud secrets add-iam-policy-binding "$email_secret" \
+    --project="$project_id" \
+    --member="serviceAccount:uinventario-api-runtime@${project_id}.iam.gserviceaccount.com" \
+    --role=roles/secretmanager.secretAccessor \
+    --condition=None \
+    --quiet >/dev/null
+  gcloud secrets add-iam-policy-binding "$email_secret" \
     --project="$project_id" \
     --member="$build_member" \
     --role=roles/secretmanager.viewer \

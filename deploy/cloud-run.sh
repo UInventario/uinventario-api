@@ -17,11 +17,13 @@ case "$environment" in
   dev)
     project_id="software-inventario-dev"
     database_secret="uinventario-dev-database-url"
+    email_secret="uinventario-dev-resend-config"
     observability_success_sample_rate="0.20"
     ;;
   prod)
     project_id="software-inventario-prod"
     database_secret="uinventario-prod-database-url"
+    email_secret="uinventario-prod-resend-config"
     observability_success_sample_rate="0.05"
     ;;
   *) usage ;;
@@ -54,6 +56,19 @@ if [ "$database_secret_state" != "ENABLED" ]; then
   exit 3
 fi
 
+email_secret_state="$(gcloud secrets versions describe latest \
+  --secret="$email_secret" \
+  --project="$project_id" \
+  --format='value(state)' 2>/dev/null || true)"
+runtime_secrets="DATABASE_URL=${database_secret}:latest"
+password_reset_delivery="disabled"
+if [ "$email_secret_state" = "ENABLED" ]; then
+  runtime_secrets="${runtime_secrets},RESEND_CONFIG=${email_secret}:latest"
+  password_reset_delivery="adapter"
+else
+  echo "Email provider secret $email_secret is unavailable; deploying with simulator/disabled recovery delivery. Resolve the linked USER ACTION to activate Resend."
+fi
+
 if ! gcloud artifacts docker images describe "$image" --project="$project_id" >/dev/null 2>&1; then
   echo "Container image $image is unavailable in $project_id." >&2
   exit 4
@@ -73,7 +88,7 @@ gcloud run jobs deploy "$migration_job" \
   --task-timeout=10m \
   --cpu=1 \
   --memory=512Mi \
-  --labels="app=uinventario,environment=${environment},component=migrations" \
+  --labels="app=uinventario,environment=${environment},component=migrations,owner=uinventario" \
   --quiet
 
 gcloud run jobs execute "$migration_job" \
@@ -87,8 +102,8 @@ gcloud run deploy "$service_name" \
   --region="$region" \
   --image="$image" \
   --service-account="$runtime_service_account" \
-  --set-secrets="DATABASE_URL=${database_secret}:latest" \
-  --set-env-vars="NODE_ENV=production,DEPLOY_ENV=${environment},DB_MIGRATIONS_RUN=false,CORS_ORIGINS=${web_origin},PASSWORD_RESET_PUBLIC_URL=${web_origin}/restablecer,PASSWORD_RESET_DELIVERY=disabled,OBSERVABILITY_SUCCESS_SAMPLE_RATE=${observability_success_sample_rate}" \
+  --set-secrets="$runtime_secrets" \
+  --set-env-vars="NODE_ENV=production,DEPLOY_ENV=${environment},DB_MIGRATIONS_RUN=false,CORS_ORIGINS=${web_origin},PASSWORD_RESET_PUBLIC_URL=${web_origin}/restablecer,PASSWORD_RESET_DELIVERY=${password_reset_delivery},EMAIL_PROVIDER_SECRET_REFERENCE=${email_secret},OBSERVABILITY_SUCCESS_SAMPLE_RATE=${observability_success_sample_rate}" \
   --allow-unauthenticated \
   --port=8080 \
   --cpu=1 \
@@ -98,7 +113,7 @@ gcloud run deploy "$service_name" \
   --min=0 \
   --max=3 \
   --timeout=60s \
-  --labels="app=uinventario,environment=${environment},component=api" \
+  --labels="app=uinventario,environment=${environment},component=api,owner=uinventario" \
   --startup-probe=httpGet.path=/health/live,initialDelaySeconds=0,timeoutSeconds=3,periodSeconds=3,failureThreshold=10 \
   --liveness-probe=httpGet.path=/health/live,initialDelaySeconds=10,timeoutSeconds=3,periodSeconds=30,failureThreshold=3 \
   --readiness-probe=httpGet.path=/health/ready,timeoutSeconds=3,periodSeconds=5,failureThreshold=3 \

@@ -8,6 +8,7 @@ import {
   ParseUUIDPipe,
   Patch,
   Post,
+  Put,
   Query,
   Req,
   UploadedFile,
@@ -30,6 +31,8 @@ import {
   ProductImportService,
   type ProductImportFile,
 } from './product-import.service';
+import { UpdateProductVariantsDto } from './dto/update-product-variants.dto';
+import { UpdateProductKitDto } from './dto/update-product-kit.dto';
 
 @Controller('products')
 @UseGuards(SessionGuard, ProductAccessGuard)
@@ -174,6 +177,61 @@ export class CatalogController {
       entityType: 'PRODUCT',
       entityId: result.data.id,
       correlationId: request.requestId!,
+    });
+    return result;
+  }
+
+  @Put(':id/variants')
+  async updateProductVariants(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Body() dto: UpdateProductVariantsDto,
+  ) {
+    const result = await this.catalog.updateProductVariants(
+      request.principal.tenant.id,
+      id,
+      dto,
+    );
+    await this.audit.record({
+      tenantId: request.principal.tenant.id,
+      actorUserId: request.principal.user.id,
+      action: 'PRODUCT_VARIANTS_UPDATED',
+      entityType: 'PRODUCT',
+      entityId: id,
+      correlationId: request.requestId!,
+      after: {
+        attributes: result.data.variantAttributes,
+        variants: result.data.variants.map(
+          ({ id: variantId, sku, active }) => ({
+            id: variantId,
+            sku,
+            active,
+          }),
+        ),
+      },
+    });
+    return result;
+  }
+
+  @Put(':id/kit')
+  async updateProductKit(
+    @Req() request: AuthenticatedRequest,
+    @Param('id', new ParseUUIDPipe()) id: string,
+    @Body() dto: UpdateProductKitDto,
+  ) {
+    const result = await this.catalog.updateProductKit(
+      request.principal.tenant.id,
+      id,
+      dto,
+    );
+    await this.audit.record({
+      tenantId: request.principal.tenant.id,
+      actorUserId: request.principal.user.id,
+      action: 'PRODUCT_KIT_UPDATED',
+      entityType: 'PRODUCT',
+      entityId: id,
+      correlationId: request.requestId!,
+      after: result.data.kit ? { ...result.data.kit } : { enabled: false },
     });
     return result;
   }

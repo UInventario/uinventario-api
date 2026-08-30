@@ -5,15 +5,20 @@ import {
   ArrayUnique,
   IsArray,
   IsIn,
+  IsInt,
   IsOptional,
   IsString,
   IsUUID,
   Matches,
   MaxLength,
   MinLength,
+  Max,
+  Min,
   ValidateNested,
 } from 'class-validator';
-import { QuoteCartLineDto } from './quote-cart.dto';
+import { QuoteCartLineDto, SaleDiscountDto } from './quote-cart.dto';
+import { PRICE_CHANNELS } from '../../pricing/price-list.types';
+import type { PriceChannel } from '../../pricing/price-list.types';
 
 export const PAYMENT_METHODS = ['CASH', 'CARD', 'TRANSFER', 'VOUCHER'] as const;
 export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
@@ -38,9 +43,29 @@ export class SalePaymentDto {
   @MaxLength(120)
   @Matches(/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/)
   reference?: string;
+
+  @IsOptional()
+  @IsUUID()
+  terminalOperationId?: string;
+}
+
+export class SaleCreditDto {
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(36)
+  installmentCount!: number;
 }
 
 export class CreateSaleDto {
+  @IsOptional()
+  @IsIn(PRICE_CHANNELS)
+  channel?: PriceChannel;
+
+  @IsOptional()
+  @IsUUID()
+  suspendedSaleId?: string;
+
   @IsOptional()
   @IsUUID()
   customerId?: string;
@@ -49,12 +74,24 @@ export class CreateSaleDto {
   @IsUUID()
   reservationId?: string;
 
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(10_000_000)
+  loyaltyPointsToRedeem?: number;
+
   @IsArray()
   @ArrayMinSize(1)
   @ArrayMaxSize(100)
   @ValidateNested({ each: true })
   @Type(() => QuoteCartLineDto)
   lines!: QuoteCartLineDto[];
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => SaleDiscountDto)
+  discount?: SaleDiscountDto;
 
   @IsOptional()
   @ValidateNested()
@@ -69,4 +106,9 @@ export class CreateSaleDto {
   @ValidateNested({ each: true })
   @Type(() => SalePaymentDto)
   payments?: SalePaymentDto[];
+
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => SaleCreditDto)
+  credit?: SaleCreditDto;
 }

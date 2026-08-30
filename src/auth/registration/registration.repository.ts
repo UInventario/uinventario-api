@@ -83,7 +83,11 @@ export class RegistrationRepository {
       `INSERT INTO role_permissions (role_id, tenant_id, permission) VALUES
         (?, ?, 'TENANT_MANAGE'), (?, ?, 'PRODUCTS_MANAGE'),
         (?, ?, 'SALES_MANAGE'), (?, ?, 'SALES_VOID'),
-        (?, ?, 'SALES_DISCOUNT'), (?, ?, 'SALE_REPRINT'),
+        (?, ?, 'SALES_RETURN'),
+        (?, ?, 'SALES_DISCOUNT'), (?, ?, 'SALES_PRICE_OVERRIDE'),
+        (?, ?, 'SALES_CREDIT'),
+        (?, ?, 'SALE_REPRINT'),
+        (?, ?, 'CASH_DRAWER_OPEN'),
         (?, ?, 'CASH_REGISTER_OPEN'), (?, ?, 'CASH_REGISTER_CLOSE'),
         (?, ?, 'CASH_REGISTER_MOVE'),
         (?, ?, 'ACCESS_MANAGE'),
@@ -96,8 +100,10 @@ export class RegistrationRepository {
         (?, ?, 'INVENTORY_VIEW'), (?, ?, 'INVENTORY_ADJUST'),
         (?, ?, 'INVENTORY_TRANSFER'), (?, ?, 'INVENTORY_COUNT'),
         (?, ?, 'INVENTORY_APPROVE'),
-        (?, ?, 'INVENTORY_VALUATION_MANAGE')`,
-      Array.from({ length: 23 }, () => [role.id, tenant.id]).flat(),
+        (?, ?, 'INVENTORY_VALUATION_MANAGE'),
+        (?, ?, 'INVENTORY_EXPIRED_STOCK_OVERRIDE'),
+        (?, ?, 'NOTIFICATIONS_VIEW'), (?, ?, 'NOTIFICATIONS_MANAGE')`,
+      Array.from({ length: 30 }, () => [role.id, tenant.id]).flat(),
     );
     await manager.query(
       `INSERT INTO privacy_policies

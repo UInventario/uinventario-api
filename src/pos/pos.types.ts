@@ -2,12 +2,40 @@ export interface PosProductSnapshot {
   id: string;
   name: string;
   sku: string;
+  withoutCode: boolean;
+  stockBehavior: 'TRACKED' | 'UNTRACKED';
+  taxBehavior: 'STANDARD' | 'EXEMPT';
   price: string;
   active: boolean;
   trackLots: boolean;
+  allowExpiredStockOverride?: boolean;
   trackSerials: boolean;
+  baseUnit?: import('../common/quantity-policy').ProductBaseUnit;
+  quantityPrecision?: number;
+  quantityRounding?: import('../common/quantity-policy').QuantityRoundingMode;
+  minimumQuantity?: string;
   availableQuantity: string;
+  kit?: {
+    stockMode: 'DERIVED' | 'ASSEMBLED';
+    priceRule: 'FIXED' | 'COMPONENT_SUM';
+    components: Array<{
+      product: { id: string; name: string; sku: string };
+      quantity: string;
+      availableQuantity: string;
+      unitCost: string;
+    }>;
+  };
 }
+
+export interface PosAppliedDiscount {
+  type: 'PERCENT' | 'AMOUNT';
+  value: string;
+  reason: string;
+  amount: string;
+}
+
+export type PosAppliedPromotion =
+  import('../promotions/promotion.types').AppliedPromotion;
 
 export interface PosCartQuoteResponse {
   data: {
@@ -15,21 +43,66 @@ export interface PosCartQuoteResponse {
       branch: { id: string; name: string };
       warehouse: { id: string; name: string };
       cashRegister: { id: string; name: string; code: string };
+      businessDate?: string;
     };
     currency: string;
     taxRate: string;
+    discount: PosAppliedDiscount | null;
+    loyalty?: import('../loyalty/loyalty.types').LoyaltyQuoteData | null;
     lines: Array<{
-      product: { id: string; name: string; sku: string };
+      product: {
+        id: string;
+        name: string;
+        sku: string;
+        withoutCode: boolean;
+        stockBehavior: 'TRACKED' | 'UNTRACKED';
+        taxBehavior: 'STANDARD' | 'EXEMPT';
+        baseUnit?: import('../common/quantity-policy').ProductBaseUnit;
+        quantityPrecision?: number;
+        minimumQuantity?: string;
+      };
       quantity: string;
+      note: string | null;
       lotId: string | null;
+      expiredLotOverrideReason?: string | null;
       serialNumbers: string[];
       availableQuantity: string;
+      kit?: null | {
+        stockMode: 'DERIVED' | 'ASSEMBLED';
+        components: Array<{
+          product: { id: string; name: string; sku: string };
+          quantityPerKit: string;
+          totalQuantity: string;
+          unitCost: string;
+        }>;
+        unitCost: string;
+      };
       unitPrice: string;
+      priceSource: 'BASE' | 'PRICE_LIST' | 'MANUAL';
+      priceOverrideReason: string | null;
+      priceList: { id: string; name: string } | null;
+      grossTotal: string;
+      discount: {
+        line: PosAppliedDiscount | null;
+        sale: PosAppliedDiscount | null;
+        total: string;
+      };
+      promotions: PosAppliedPromotion[];
       subtotal: string;
       tax: string;
       total: string;
     }>;
-    totals: { subtotal: string; tax: string; total: string };
+    totals: {
+      gross: string;
+      lineDiscount: string;
+      promotionDiscount: string;
+      saleDiscount: string;
+      discount: string;
+      subtotal: string;
+      tax: string;
+      total: string;
+      payable?: string;
+    };
   };
   meta: { apiVersion: '1'; recalculatedAt: string };
 }
@@ -53,14 +126,24 @@ export interface OfflineCashSaleSnapshot {
     tax: string;
     total: string;
   }>;
-  totals: { subtotal: string; tax: string; total: string };
+  totals: {
+    gross?: string;
+    lineDiscount?: '0.00';
+    promotionDiscount?: '0.00';
+    saleDiscount?: '0.00';
+    discount?: '0.00';
+    subtotal: string;
+    tax: string;
+    total: string;
+  };
 }
 
-export type PaymentMethod = 'CASH' | 'CARD' | 'TRANSFER' | 'VOUCHER';
+export type PaymentMethod = 'CASH' | 'CARD' | 'TRANSFER' | 'VOUCHER' | 'CREDIT';
 
 export interface SalePaymentData {
+  id: string;
   method: PaymentMethod;
-  status: 'COMPLETED' | 'REVERSED';
+  status: 'COMPLETED' | 'PENDING' | 'REVERSED';
   amountReceived: string;
   amountApplied: string;
   change: string;
@@ -76,25 +159,72 @@ export interface CashSaleData {
   context: PosCartQuoteResponse['data']['context'];
   userId: string;
   customer: { id: string; name: string; identifier: string | null } | null;
+  quotation: { id: string; quotationNumber: string } | null;
   currency: string;
   taxRate: string;
+  discount: PosAppliedDiscount | null;
+  loyalty?: {
+    ruleVersion: number;
+    pointsRedeemed: number;
+    redemptionValue: string;
+    pointsEarned: number;
+  } | null;
   lines: Array<{
-    product: { id: string; name: string; sku: string };
+    id: string;
+    product: {
+      id: string;
+      name: string;
+      sku: string;
+      withoutCode: boolean;
+      stockBehavior: 'TRACKED' | 'UNTRACKED';
+      taxBehavior: 'STANDARD' | 'EXEMPT';
+    };
     quantity: string;
+    note: string | null;
+    expiredLotOverrideReason: string | null;
     unitPrice: string;
+    priceSource: 'BASE' | 'PRICE_LIST' | 'MANUAL';
+    priceOverrideReason: string | null;
+    priceList: { id: string; name: string } | null;
+    grossTotal: string;
+    discount: {
+      line: PosAppliedDiscount | null;
+      sale: PosAppliedDiscount | null;
+      total: string;
+    };
+    promotions: PosAppliedPromotion[];
     subtotal: string;
     tax: string;
     total: string;
+    grossProfit: string | null;
   }>;
-  totals: PosCartQuoteResponse['data']['totals'];
+  totals: PosCartQuoteResponse['data']['totals'] & {
+    grossProfit: string | null;
+  };
   payment: SalePaymentData;
   payments: SalePaymentData[];
+  credit: SaleCreditPlanData | null;
   createdAt: string;
   void: {
     reason: string;
     user: { id: string; email: string };
     voidedAt: string;
   } | null;
+}
+
+export interface SaleCreditPlanData {
+  accountId: string;
+  originalAmount: string;
+  balance: string;
+  currency: string;
+  termDays: number;
+  status: 'OPEN' | 'OVERDUE' | 'PAID' | 'CANCELLED';
+  dueDate: string;
+  installments: Array<{
+    number: number;
+    dueDate: string;
+    amount: string;
+  }>;
 }
 
 export interface CashSaleResponse {
@@ -119,7 +249,7 @@ export interface SaleDetailData extends Omit<CashSaleData, 'userId'> {
   user: { id: string; email: string };
   movements: Array<{
     id: string;
-    type: 'SALE' | 'SALE_VOID';
+    type: 'SALE' | 'SALE_VOID' | 'SALE_RETURN';
     saleLineId: string;
     product: { id: string; name: string; sku: string };
     location: { id: string; name: string; code: string };

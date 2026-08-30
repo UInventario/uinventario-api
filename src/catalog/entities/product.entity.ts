@@ -20,6 +20,58 @@ export class ProductEntity {
   @Column({ type: 'varchar', length: 64, nullable: true })
   barcode!: string | null;
 
+  @Column({
+    name: 'code_mode',
+    type: 'varchar',
+    length: 12,
+    default: 'EXPLICIT',
+  })
+  codeMode!: 'EXPLICIT' | 'GENERATED';
+
+  @Column({
+    name: 'stock_behavior',
+    type: 'varchar',
+    length: 12,
+    default: 'TRACKED',
+  })
+  stockBehavior!: 'TRACKED' | 'UNTRACKED';
+
+  @Column({
+    name: 'tax_behavior',
+    type: 'varchar',
+    length: 12,
+    default: 'STANDARD',
+  })
+  taxBehavior!: 'STANDARD' | 'EXEMPT';
+
+  @Column({ name: 'base_unit', type: 'varchar', length: 16, default: 'UNIT' })
+  baseUnit!: string;
+
+  @Column({
+    name: 'quantity_precision',
+    type: 'tinyint',
+    unsigned: true,
+    default: 3,
+  })
+  quantityPrecision!: number;
+
+  @Column({
+    name: 'quantity_rounding',
+    type: 'varchar',
+    length: 12,
+    default: 'HALF_UP',
+  })
+  quantityRounding!: string;
+
+  @Column({
+    name: 'minimum_quantity',
+    type: 'decimal',
+    precision: 15,
+    scale: 3,
+    default: '0.001',
+  })
+  minimumQuantity!: string;
+
   @Column({ name: 'category_id', type: 'char', length: 36, nullable: true })
   categoryId!: string | null;
 

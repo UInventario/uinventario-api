@@ -16,6 +16,21 @@ export class PosCustomerNotAvailableError extends Error {
   }
 }
 
+export class CustomerCreditNotAvailableError extends Error {
+  constructor(readonly reason: 'DISABLED' | 'CURRENCY' | 'INSTALLMENTS') {
+    super('CUSTOMER_CREDIT_NOT_AVAILABLE');
+  }
+}
+
+export class CustomerCreditLimitExceededError extends Error {
+  constructor(
+    readonly balance: string,
+    readonly limit: string,
+  ) {
+    super('CUSTOMER_CREDIT_LIMIT_EXCEEDED');
+  }
+}
+
 export class PosReservationNotAvailableError extends Error {
   constructor(readonly status?: string) {
     super('POS_RESERVATION_NOT_AVAILABLE');

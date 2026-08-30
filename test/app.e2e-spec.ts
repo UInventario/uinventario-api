@@ -18,6 +18,7 @@ import { SupplierProductData } from '../src/suppliers/supplier-product.types';
 import type { OfflineBootstrapResponseV1 } from '../src/offline-sync/offline-sync-v1.contract';
 import type { OfflineChangesResponseV1 } from '../src/offline-sync/offline-sync-v1.contract';
 import { StructuredTelemetryService } from '../src/observability/structured-telemetry.service';
+import type { CustomerOrderData } from '../src/orders/customer-order.types';
 
 jest.setTimeout(15_000);
 
@@ -30,7 +31,7 @@ describe('UInventario API (e2e)', () => {
       imports: [AppModule],
     }).compile();
 
-    app = moduleFixture.createNestApplication();
+    app = moduleFixture.createNestApplication({ rawBody: true });
     configureApp(app);
     await app.init();
     dataSource = app.get(DataSource);
@@ -41,6 +42,19 @@ describe('UInventario API (e2e)', () => {
   async function resetIdentityData(): Promise<void> {
     await dataSource.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const table of [
+      'commerce_webhook_deliveries',
+      'commerce_external_orders',
+      'commerce_api_usage_windows',
+      'commerce_api_credentials',
+      'loyalty_point_allocations',
+      'loyalty_point_entries',
+      'loyalty_rules',
+      'external_email_events',
+      'external_adapter_executions',
+      'external_adapter_configs',
+      'notification_deliveries',
+      'notifications',
+      'notification_preferences',
       'audit_events',
       'audit_chain_heads',
       'privacy_requests',
@@ -49,6 +63,8 @@ describe('UInventario API (e2e)', () => {
       'inventory_reconciliation_guards',
       'inventory_reconciliation_findings',
       'inventory_reconciliation_runs',
+      'inventory_stock_alert_states',
+      'inventory_stock_thresholds',
       'inventory_valuation_policy_history',
       'inventory_valuation_policies',
       'offline_commands',
@@ -56,9 +72,41 @@ describe('UInventario API (e2e)', () => {
       'offline_devices',
       'offline_sync_tombstones',
       'password_reset_tokens',
+      'pos_peripheral_operations',
+      'pos_peripheral_profiles',
+      'sale_line_promotions',
+      'promotion_quantity_tiers',
+      'promotion_products',
+      'price_list_items',
+      'sale_receipt_snapshots',
+      'customer_credit_ledger',
+      'customer_credit_payment_allocations',
+      'customer_debt_ledger',
+      'customer_credit_payments',
+      'customer_credit_installments',
+      'customer_credit_accounts',
+      'customer_credit_profiles',
+      'sale_return_settlements',
+      'sale_return_lines',
+      'sale_returns',
+      'suspended_sale_lines',
+      'suspended_sales',
+      'customer_order_shipping_actions',
+      'customer_order_carrier_events',
+      'customer_order_dispatch_attempts',
+      'customer_order_transitions',
+      'customer_order_payments',
+      'customer_order_lines',
+      'customer_order_fulfillments',
+      'customer_orders',
+      'sales_quotation_operations',
+      'sales_quotation_lines',
       'sale_payments',
       'sale_lines',
       'sales',
+      'sales_quotations',
+      'promotions',
+      'price_lists',
       'cash_register_movements',
       'cash_register_shifts',
       'product_reservation_lines',
@@ -188,6 +236,609 @@ describe('UInventario API (e2e)', () => {
           error: {},
           details: { database: { status: 'up' } },
         });
+    });
+  });
+
+  describe('versioned external adapters', () => {
+    beforeEach(resetIdentityData);
+
+    it('configures tenant adapters and observes idempotent retry, rejection and timeout', async () => {
+      await registerAccount('adapter-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Adapters SA',
+          tradeName: 'Adapters',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega',
+          locationName: 'General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja' })
+        .expect(200);
+      const configurations = await request(app.getHttpServer())
+        .get('/api/v1/integrations/adapters')
+        .set('Cookie', cookie)
+        .expect(200);
+      expect(configurations.body).toMatchObject({
+        data: [
+          {
+            capability: 'NOTIFICATION_EMAIL',
+            countryCode: 'MX',
+            provider: 'SIMULATOR',
+            adapterVersion: '1',
+          },
+          {
+            capability: 'NOTIFICATION_PUSH',
+            countryCode: 'MX',
+            provider: 'SIMULATOR',
+            adapterVersion: '1',
+          },
+        ],
+        meta: {
+          apiVersion: '1',
+          secrets: { valuesAcceptedByApi: false },
+        },
+      });
+
+      await request(app.getHttpServer())
+        .put('/api/v1/integrations/adapters/NOTIFICATION_EMAIL')
+        .set('Cookie', cookie)
+        .send({
+          countryCode: 'CL',
+          provider: 'SIMULATOR',
+          adapterVersion: '1',
+          enabled: true,
+          timeoutMs: 50,
+          maxAttempts: 2,
+          secretReference: 'uinventario-email-provider-key',
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: {
+              capability: 'NOTIFICATION_EMAIL',
+              countryCode: 'CL',
+              timeoutMs: 50,
+              maxAttempts: 2,
+              secretReference: 'uinventario-email-provider-key',
+            },
+          }),
+        );
+
+      const retry = await request(app.getHttpServer())
+        .post('/api/v1/integrations/adapters/NOTIFICATION_EMAIL/diagnostics')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'adapter-retry-001')
+        .send({ scenario: 'RETRY' })
+        .expect(201);
+      const retryBody = retry.body as {
+        data: {
+          id: string;
+          status: string;
+          attemptCount: number;
+          errorCode: string | null;
+        };
+      };
+      expect(retryBody).toMatchObject({
+        data: { status: 'SUCCEEDED', attemptCount: 2, errorCode: null },
+      });
+      const replay = await request(app.getHttpServer())
+        .post('/api/v1/integrations/adapters/NOTIFICATION_EMAIL/diagnostics')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'adapter-retry-001')
+        .send({ scenario: 'REJECT' })
+        .expect(201);
+      const replayBody = replay.body as {
+        data: { id: string; status: string; attemptCount: number };
+      };
+      expect(replayBody.data).toMatchObject({
+        id: retryBody.data.id,
+        status: 'SUCCEEDED',
+        attemptCount: 2,
+      });
+      await request(app.getHttpServer())
+        .post('/api/v1/integrations/adapters/NOTIFICATION_EMAIL/diagnostics')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'adapter-reject-001')
+        .send({ scenario: 'REJECT' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: {
+              status: 'REJECTED',
+              attemptCount: 1,
+              errorCode: 'SIMULATED_REJECTED',
+            },
+          }),
+        );
+      await request(app.getHttpServer())
+        .post('/api/v1/integrations/adapters/NOTIFICATION_EMAIL/diagnostics')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'adapter-timeout-001')
+        .send({ scenario: 'TIMEOUT' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: {
+              status: 'TIMED_OUT',
+              attemptCount: 2,
+              errorCode: 'ADAPTER_TIMEOUT',
+            },
+          }),
+        );
+      await request(app.getHttpServer())
+        .get('/api/v1/integrations/adapters/executions')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) =>
+          expect(body.data).toHaveLength(3),
+        );
+
+      const secondary = {
+        organizationName: 'Tenant de adaptadores B',
+        email: 'adapter-secondary@example.com',
+        password: 'Correcta-2026!',
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'adapter-secondary-registration')
+        .send(secondary)
+        .expect(201);
+      const secondaryCookie = await createPersistedSession(secondary.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', secondaryCookie)
+        .send({
+          legalName: 'Adapters B SA',
+          tradeName: 'Adapters B',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', secondaryCookie)
+        .send({
+          branchName: 'Principal B',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega B',
+          locationName: 'General B',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', secondaryCookie)
+        .send({ name: 'Caja B' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/integrations/adapters/executions')
+        .set('Cookie', secondaryCookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({ data: [] }),
+        );
+      await request(app.getHttpServer())
+        .post('/api/v1/integrations/adapters/NOTIFICATION_EMAIL/diagnostics')
+        .set('Cookie', secondaryCookie)
+        .set('Idempotency-Key', 'adapter-retry-001')
+        .send({ scenario: 'SUCCESS' })
+        .expect(201)
+        .expect(({ body }: { body: { data: { id: string } } }) =>
+          expect(body.data.id).not.toBe(retryBody.data.id),
+        );
+
+      const [identity] = await dataSource.query<
+        Array<{ role_id: string; tenant_id: string }>
+      >(
+        `SELECT role.id AS role_id, role.tenant_id FROM users user
+         INNER JOIN user_roles user_role ON user_role.user_id = user.id
+         INNER JOIN roles role ON role.id = user_role.role_id
+         WHERE user.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions WHERE role_id = ? AND tenant_id = ?
+           AND permission = 'TENANT_MANAGE'`,
+        [identity.role_id, identity.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/integrations/adapters')
+        .set('Cookie', cookie)
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'TENANT_MANAGE')`,
+        [identity.role_id, identity.tenant_id],
+      );
+    });
+
+    it('exposes Resend v1 but fails safely until its external secret is activated', async () => {
+      await registerAccount('resend-adapter-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Resend SA',
+          tradeName: 'Resend',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega',
+          locationName: 'General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/integrations/adapters')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { meta: { catalog: unknown[] } } }) =>
+          expect(body.meta.catalog).toEqual(
+            expect.arrayContaining([
+              {
+                capability: 'NOTIFICATION_EMAIL',
+                provider: 'RESEND',
+                version: '1',
+                mode: 'LIVE',
+              },
+            ]),
+          ),
+        );
+      await request(app.getHttpServer())
+        .put('/api/v1/integrations/adapters/NOTIFICATION_EMAIL')
+        .set('Cookie', cookie)
+        .send({
+          countryCode: 'MX',
+          provider: 'RESEND',
+          adapterVersion: '1',
+          enabled: true,
+          timeoutMs: 1000,
+          maxAttempts: 2,
+          secretReference: 'uinventario-local-resend-config',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post('/api/v1/integrations/adapters/NOTIFICATION_EMAIL/diagnostics')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'resend-not-configured-001')
+        .send({ scenario: 'SUCCESS' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: {
+              provider: 'RESEND',
+              status: 'REJECTED',
+              attemptCount: 1,
+              errorCode: 'EMAIL_PROVIDER_NOT_CONFIGURED',
+            },
+          }),
+        );
+      await request(app.getHttpServer())
+        .get('/api/v1/integrations/adapters/email-events')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({ data: [] }),
+        );
+    });
+  });
+
+  describe('commerce API v1', () => {
+    beforeEach(resetIdentityData);
+
+    it('publishes safe incremental stock and reserves an idempotent external order', async () => {
+      await registerAccount('commerce-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Commerce SA',
+          tradeName: 'Commerce',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Central',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'General',
+          locationName: 'Piso',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja' })
+        .expect(200);
+      await openCurrentCashRegister(cookie, 'commerce-shift-opening');
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto marketplace',
+          sku: 'MKT-1',
+          cost: '10',
+          price: '25',
+        })
+        .expect(201);
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Cliente e-commerce',
+          identifier: 'ECOMMERCE-1',
+          dataProcessingConsent: false,
+        })
+        .expect(201);
+      const [context] = await dataSource.query<
+        Array<{
+          tenant_id: string;
+          branch_id: string;
+          warehouse_id: string;
+          location_id: string;
+          cash_register_id: string;
+        }>
+      >(
+        `SELECT b.tenant_id, b.id AS branch_id, w.id AS warehouse_id,
+                l.id AS location_id, cr.id AS cash_register_id
+         FROM branches b JOIN warehouses w ON w.branch_id = b.id
+         JOIN locations l ON l.warehouse_id = w.id
+         JOIN cash_registers cr ON cr.branch_id = b.id LIMIT 1`,
+      );
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      const customerId = (customerResponse.body as { data: { id: string } })
+        .data.id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'commerce-opening-stock')
+        .send({
+          productId,
+          locationId: context.location_id,
+          type: 'INITIAL',
+          quantity: '5',
+          reason: 'Apertura e-commerce',
+        })
+        .expect(201);
+      const secondProductResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Segundo producto marketplace',
+          sku: 'MKT-2',
+          cost: '11',
+          price: '30',
+        })
+        .expect(201);
+      const secondProductId = (
+        secondProductResponse.body as { data: { id: string } }
+      ).data.id;
+      const credentialResponse = await request(app.getHttpServer())
+        .post('/api/v1/integrations/commerce/credentials')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Marketplace principal',
+          scopes: ['CATALOG_READ', 'STOCK_READ', 'ORDERS_WRITE', 'ORDERS_READ'],
+          branchId: context.branch_id,
+          warehouseId: context.warehouse_id,
+          cashRegisterId: context.cash_register_id,
+          locationId: context.location_id,
+          customerId,
+          rateLimitPerMinute: 60,
+          webhookUrl: 'https://retry.example.test/order-events',
+          webhookEvents: ['ORDER_CONFIRMED'],
+          webhookEnabled: true,
+        })
+        .expect(201);
+      const apiKey = (
+        credentialResponse.body as {
+          data: { apiKey: string; keyHash?: string };
+        }
+      ).data.apiKey;
+      expect(apiKey).toMatch(/^uic_[A-Za-z0-9]{8}_[A-Za-z0-9_-]{32,128}$/);
+      expect(JSON.stringify(credentialResponse.body)).not.toContain('keyHash');
+
+      const catalog = await request(app.getHttpServer())
+        .get('/api/v1/external/v1/catalog?limit=1')
+        .set('Authorization', `Bearer ${apiKey}`)
+        .expect(200);
+      const catalogPage = catalog.body as {
+        data: Array<{
+          id: string;
+          price: string;
+          currency: string;
+          stock: { onHand: string; available: string };
+        }>;
+        meta: { apiVersion: '1'; hasMore: boolean; nextCursor: string };
+      };
+      expect(catalogPage.data).toHaveLength(1);
+      expect(catalogPage.data[0].currency).toBe('MXN');
+      expect(typeof catalogPage.data[0].price).toBe('string');
+      expect(typeof catalogPage.data[0].stock.onHand).toBe('string');
+      expect(typeof catalogPage.data[0].stock.available).toBe('string');
+      expect(catalogPage.meta).toMatchObject({
+        apiVersion: '1',
+        hasMore: true,
+      });
+      expect(JSON.stringify(catalog.body)).not.toContain('cost');
+      expect(JSON.stringify(catalog.body)).not.toContain(
+        registrationPayload.email,
+      );
+      const secondCatalogPage = await request(app.getHttpServer())
+        .get('/api/v1/external/v1/catalog')
+        .query({ limit: 1, cursor: catalogPage.meta.nextCursor })
+        .set('Authorization', `Bearer ${apiKey}`)
+        .expect(200);
+      const secondCatalogData = secondCatalogPage.body as {
+        data: Array<{ id: string }>;
+        meta: { hasMore: boolean; nextCursor: null };
+      };
+      expect(
+        new Set([catalogPage.data[0].id, secondCatalogData.data[0].id]),
+      ).toEqual(new Set([productId, secondProductId]));
+      expect(secondCatalogData.meta).toEqual(
+        expect.objectContaining({ hasMore: false, nextCursor: null }),
+      );
+
+      const orderInput = {
+        externalOrderId: 'market-1001',
+        expiresInHours: 24,
+        fulfillment: {
+          method: 'PICKUP',
+          windowStart: new Date(Date.now() + 60_000).toISOString(),
+          windowEnd: new Date(Date.now() + 3_600_000).toISOString(),
+          deliveryCost: '0',
+        },
+        lines: [{ productId, quantity: '1' }],
+        payment: { method: 'TRANSFER', reference: 'market-payment-1001' },
+      };
+      const created = await request(app.getHttpServer())
+        .post('/api/v1/external/v1/orders')
+        .set('Authorization', `Bearer ${apiKey}`)
+        .send(orderInput)
+        .expect(201);
+      expect(created.body).toMatchObject({
+        data: {
+          externalOrderId: 'market-1001',
+          status: 'CONFIRMED',
+          reservationStatus: 'ACTIVE',
+          paymentStatus: 'PLANNED',
+        },
+        meta: { idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .post('/api/v1/external/v1/orders')
+        .set('Authorization', `Bearer ${apiKey}`)
+        .send(orderInput)
+        .expect(201)
+        .expect(
+          ({ body }: { body: { meta: { idempotentReplay: boolean } } }) => {
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+      const [balance] = await dataSource.query<
+        Array<{ available_quantity: string; reserved_quantity: string }>
+      >(
+        `SELECT available_quantity, reserved_quantity FROM inventory_balances
+         WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
+        [context.tenant_id, productId, context.location_id],
+      );
+      expect(balance).toEqual({
+        available_quantity: '4.000',
+        reserved_quantity: '1.000',
+      });
+      const deliveries = await request(app.getHttpServer())
+        .get('/api/v1/integrations/commerce/webhook-deliveries')
+        .set('Cookie', cookie)
+        .expect(200);
+      expect(deliveries.body).toMatchObject({
+        data: [
+          {
+            eventType: 'ORDER_CONFIRMED',
+            status: 'SUCCEEDED',
+            attemptCount: 2,
+          },
+        ],
+      });
+    });
+
+    it('enforces scopes and the credential-specific minute limit', async () => {
+      await registerAccount('commerce-limit-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Limits SA',
+          tradeName: 'Limits',
+          countryCode: 'MX',
+        });
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Central',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'General',
+          locationName: 'Piso',
+        });
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja' });
+      const customer = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({ name: 'Cliente API', dataProcessingConsent: false });
+      const [context] = await dataSource.query<
+        Array<{
+          branch_id: string;
+          warehouse_id: string;
+          location_id: string;
+          cash_register_id: string;
+        }>
+      >(
+        `SELECT b.id AS branch_id, w.id AS warehouse_id, l.id AS location_id,
+                cr.id AS cash_register_id FROM branches b
+         JOIN warehouses w ON w.branch_id = b.id JOIN locations l ON l.warehouse_id = w.id
+         JOIN cash_registers cr ON cr.branch_id = b.id LIMIT 1`,
+      );
+      const credential = await request(app.getHttpServer())
+        .post('/api/v1/integrations/commerce/credentials')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Catálogo limitado',
+          scopes: ['CATALOG_READ'],
+          branchId: context.branch_id,
+          warehouseId: context.warehouse_id,
+          cashRegisterId: context.cash_register_id,
+          locationId: context.location_id,
+          customerId: (customer.body as { data: { id: string } }).data.id,
+          rateLimitPerMinute: 10,
+          webhookEvents: [],
+          webhookEnabled: false,
+        })
+        .expect(201);
+      const key = (credential.body as { data: { apiKey: string } }).data.apiKey;
+      await request(app.getHttpServer())
+        .post('/api/v1/external/v1/orders')
+        .set('Authorization', `Bearer ${key}`)
+        .send({})
+        .expect(403);
+      for (let index = 0; index < 11; index += 1) {
+        await request(app.getHttpServer())
+          .get('/api/v1/external/v1/catalog')
+          .set('Authorization', `Bearer ${key}`)
+          .expect(index < 10 ? 200 : 429);
+      }
     });
   });
 
@@ -661,6 +1312,97 @@ describe('UInventario API (e2e)', () => {
         .set('Cookie', cookie)
         .expect(401);
     });
+
+    it('supports a rotating bearer session and tenant-bound bootstrap for Mobile', async () => {
+      await registerAccount('mobile-session-registration');
+
+      const login = await request(app.getHttpServer())
+        .post('/api/v1/auth/mobile/sessions')
+        .send({
+          email: registrationPayload.email,
+          password: registrationPayload.password,
+        })
+        .expect(200);
+      expect(login.headers['set-cookie']).toBeUndefined();
+      expect(login.headers['cache-control']).toContain('no-store');
+      expect(login.body).toMatchObject({
+        data: {
+          user: { email: registrationPayload.email, roles: ['ADMIN'] },
+          tenant: { name: registrationPayload.organizationName },
+        },
+        meta: { apiVersion: '1' },
+        auth: { tokenType: 'Bearer' },
+      });
+
+      const originalToken = (
+        login.body as {
+          auth: { accessToken: string };
+        }
+      ).auth.accessToken;
+      expect(originalToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+      const current = await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Authorization', `Bearer ${originalToken}`)
+        .set('X-Tenant-Id', '00000000-0000-0000-0000-000000000000')
+        .expect(200);
+      const tenantId = (current.body as { data: { tenant: { id: string } } })
+        .data.tenant.id;
+      const currentUserId = (current.body as { data: { user: { id: string } } })
+        .data.user.id;
+
+      await request(app.getHttpServer())
+        .get('/api/v1/offline/bootstrap')
+        .set('Authorization', `Bearer ${originalToken}`)
+        .query({
+          protocolVersion: '1.0',
+          deviceId: '11111111-1111-4111-8111-111111111111',
+          pageSize: 500,
+        })
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: {
+                scope: { tenantId: string; userId: string };
+                identity: { tenant: { id: string } };
+              };
+            };
+          }) => {
+            expect(body.data.scope.tenantId).toBe(tenantId);
+            expect(body.data.identity.tenant.id).toBe(tenantId);
+            expect(body.data.scope.userId).toBe(currentUserId);
+          },
+        );
+
+      const refresh = await request(app.getHttpServer())
+        .post('/api/v1/auth/mobile/sessions/refresh')
+        .set('Authorization', `Bearer ${originalToken}`)
+        .expect(200);
+      const rotatedToken = (
+        refresh.body as {
+          auth: { accessToken: string };
+        }
+      ).auth.accessToken;
+      expect(refresh.headers['cache-control']).toContain('no-store');
+      expect(rotatedToken).not.toBe(originalToken);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Authorization', `Bearer ${originalToken}`)
+        .expect(401);
+
+      await request(app.getHttpServer())
+        .delete('/api/v1/auth/sessions/current')
+        .set('Authorization', `Bearer ${rotatedToken}`)
+        .expect(204);
+      await request(app.getHttpServer())
+        .get('/api/v1/auth/sessions/current')
+        .set('Authorization', `Bearer ${rotatedToken}`)
+        .expect(401);
+    });
   });
 
   describe('company onboarding', () => {
@@ -934,23 +1676,30 @@ describe('UInventario API (e2e)', () => {
                   'ACCESS_MANAGE',
                   'AUDIT_EXPORT',
                   'AUDIT_VIEW',
+                  'CASH_DRAWER_OPEN',
                   'CASH_REGISTER_CLOSE',
                   'CASH_REGISTER_MOVE',
                   'CASH_REGISTER_OPEN',
                   'INVENTORY_ADJUST',
                   'INVENTORY_APPROVE',
                   'INVENTORY_COUNT',
+                  'INVENTORY_EXPIRED_STOCK_OVERRIDE',
                   'INVENTORY_TRANSFER',
                   'INVENTORY_VALUATION_MANAGE',
                   'INVENTORY_VIEW',
+                  'NOTIFICATIONS_MANAGE',
+                  'NOTIFICATIONS_VIEW',
                   'PRIVACY_MANAGE',
                   'PRODUCTS_MANAGE',
                   'PURCHASE_ORDERS_APPROVE',
                   'PURCHASE_ORDERS_MANAGE',
                   'PURCHASE_RECEIPTS_OVERAGE',
                   'SALE_REPRINT',
+                  'SALES_CREDIT',
                   'SALES_DISCOUNT',
                   'SALES_MANAGE',
+                  'SALES_PRICE_OVERRIDE',
+                  'SALES_RETURN',
                   'SALES_VOID',
                   'SUPPLIERS_MANAGE',
                   'TENANT_MANAGE',
@@ -2438,6 +3187,9 @@ describe('UInventario API (e2e)', () => {
                     sku: 'RECEIPTS-1',
                     active: true,
                     trackLots: false,
+                    baseUnit: 'UNIT',
+                    quantityPrecision: 3,
+                    minimumQuantity: '0.001',
                   },
                   totalQuantity: '7.000',
                   averageUnitCost: '80.7714',
@@ -3824,6 +4576,10 @@ describe('UInventario API (e2e)', () => {
         brandName: 'Casa',
         cost: '85.40',
         price: '119.90',
+        baseUnit: 'KILOGRAM',
+        quantityPrecision: 3,
+        quantityRounding: 'HALF_UP',
+        minimumQuantity: '0.050',
       };
       await request(app.getHttpServer())
         .post('/api/v1/products')
@@ -3845,6 +4601,10 @@ describe('UInventario API (e2e)', () => {
               brand: { name: product.brandName },
               cost: product.cost,
               price: product.price,
+              baseUnit: product.baseUnit,
+              quantityPrecision: product.quantityPrecision,
+              quantityRounding: product.quantityRounding,
+              minimumQuantity: product.minimumQuantity,
               active: true,
             },
           });
@@ -4404,6 +5164,299 @@ describe('UInventario API (e2e)', () => {
         .query({ code: 'SCAN-SKU-1' })
         .expect(404);
     });
+
+    it('generates sellable variants with independent stock and preserves retired combinations', async () => {
+      await registerAccount('product-variant-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeOnboarding(registrationPayload.email, cookie);
+      const created = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Playera básica',
+          sku: 'PLAYERA',
+          barcode: '7500000000300',
+          categoryName: 'Ropa',
+          cost: '80.00',
+          price: '149.00',
+        })
+        .expect(201);
+      const parent = (created.body as { data: { id: string; version: number } })
+        .data;
+      const [location] = await dataSource.query<
+        Array<{ id: string; tenant_id: string }>
+      >(
+        `SELECT l.id, l.tenant_id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'variant-parent-initial-stock')
+        .send({
+          productId: parent.id,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '1',
+          reason: 'Validar conversión con stock',
+        })
+        .expect(201);
+
+      const attributes = [
+        { name: 'Color', values: ['Rojo', 'Azul'] },
+        { name: 'Talla', values: ['CH', 'M'] },
+      ];
+      const variant = (color: string, size: string, suffix: string) => ({
+        values: [color, size],
+        sku: `PLAYERA-${suffix}`,
+        barcode: `75000000003${
+          (
+            {
+              'R-CH': '11',
+              'R-M': '12',
+              'A-CH': '13',
+              'A-M': '14',
+              'N-CH': '15',
+              'N-M': '16',
+            } as Record<string, string>
+          )[suffix]
+        }`,
+        cost: '80.00',
+        price: '149.00',
+        active: true,
+      });
+      const initialVariants = [
+        variant('Rojo', 'CH', 'R-CH'),
+        variant('Rojo', 'M', 'R-M'),
+        variant('Azul', 'CH', 'A-CH'),
+        variant('Azul', 'M', 'A-M'),
+      ];
+      await request(app.getHttpServer())
+        .put(`/api/v1/products/${parent.id}/variants`)
+        .set('Cookie', cookie)
+        .send({
+          version: parent.version,
+          attributes,
+          variants: initialVariants,
+        })
+        .expect(409)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            code: 'PRODUCT_VARIANTS_REQUIRE_ZERO_STOCK',
+          }),
+        );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'variant-parent-clear-stock')
+        .send({
+          productId: parent.id,
+          locationId: location.id,
+          type: 'ADJUSTMENT',
+          quantity: '-1',
+          reason: 'Dejar padre sin stock',
+          reference: 'UIN-110-CONVERSION',
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .put(`/api/v1/products/${parent.id}/variants`)
+        .set('Cookie', cookie)
+        .send({
+          version: parent.version,
+          attributes,
+          variants: initialVariants.map((item) => ({
+            ...item,
+            sku: 'DUPLICADO',
+          })),
+        })
+        .expect(409)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({ code: 'SKU_ALREADY_EXISTS' }),
+        );
+
+      const configured = await request(app.getHttpServer())
+        .put(`/api/v1/products/${parent.id}/variants`)
+        .set('Cookie', cookie)
+        .send({
+          version: parent.version,
+          attributes,
+          variants: initialVariants,
+        })
+        .expect(200);
+      const configuredData = configured.body as {
+        data: {
+          id: string;
+          version: number;
+          sellable: boolean;
+          variantAttributes: typeof attributes;
+          variants: Array<{
+            id: string;
+            sku: string;
+            version: number;
+            active: boolean;
+            variantValues: Array<{ attribute: string; value: string }>;
+          }>;
+        };
+      };
+      expect(configuredData.data).toMatchObject({
+        id: parent.id,
+        version: 2,
+        sellable: false,
+        variantAttributes: attributes,
+      });
+      expect(configuredData.data.variants).toHaveLength(4);
+      const redSmall = configuredData.data.variants.find(
+        ({ sku }) => sku === 'PLAYERA-R-CH',
+      )!;
+
+      await request(app.getHttpServer())
+        .put(`/api/v1/products/${parent.id}/variants`)
+        .set('Cookie', cookie)
+        .send({
+          version: configuredData.data.version,
+          attributes,
+          variants: configuredData.data.variants.map((item, index) => ({
+            id: index === 1 ? configuredData.data.variants[0].id : item.id,
+            version:
+              index === 1
+                ? configuredData.data.variants[0].version
+                : item.version,
+            values: item.variantValues.map(({ value }) => value),
+            sku: item.sku,
+            cost: '80.00',
+            price: '149.00',
+            active: true,
+          })),
+        })
+        .expect(400)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            code: 'PRODUCT_VARIANT_CONFIGURATION_INVALID',
+          }),
+        );
+
+      await request(app.getHttpServer())
+        .get('/api/v1/products')
+        .set('Cookie', cookie)
+        .query({ q: 'PLAYERA', sellableOnly: true, pageSize: 10 })
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: Array<{ id: string; parentProductId: string }> };
+          }) => {
+            expect(body.data).toHaveLength(4);
+            expect(
+              body.data.every((item) => item.parentProductId === parent.id),
+            ).toBe(true);
+          },
+        );
+      await request(app.getHttpServer())
+        .get('/api/v1/products/resolve-code')
+        .set('Cookie', cookie)
+        .query({ code: 'PLAYERA' })
+        .expect(404);
+      await request(app.getHttpServer())
+        .get('/api/v1/products/resolve-code')
+        .set('Cookie', cookie)
+        .query({ code: redSmall.sku })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: { id: redSmall.id, parentProductId: parent.id },
+          }),
+        );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'variant-independent-stock')
+        .send({
+          productId: redSmall.id,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '3',
+          reason: 'Stock de variante',
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'parent-stock-rejected')
+        .send({
+          productId: parent.id,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '1',
+          reason: 'No debe aceptar padre',
+        })
+        .expect(404);
+
+      const blueVariants = configuredData.data.variants.filter(({ sku }) =>
+        sku.includes('-A-'),
+      );
+      const changed = await request(app.getHttpServer())
+        .put(`/api/v1/products/${parent.id}/variants`)
+        .set('Cookie', cookie)
+        .send({
+          version: configuredData.data.version,
+          attributes: [
+            { name: 'Color', values: ['Negro', 'Azul'] },
+            attributes[1],
+          ],
+          variants: [
+            variant('Negro', 'CH', 'N-CH'),
+            variant('Negro', 'M', 'N-M'),
+            ...blueVariants.map((item) => ({
+              id: item.id,
+              version: item.version,
+              values: item.variantValues.map(({ value }) => value),
+              sku: item.sku,
+              cost: '80.00',
+              price: '149.00',
+              active: true,
+            })),
+          ],
+        })
+        .expect(200);
+      expect(
+        (
+          changed.body as {
+            data: { variants: Array<{ sku: string; active: boolean }> };
+          }
+        ).data.variants,
+      ).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ sku: 'PLAYERA-R-CH', active: false }),
+        ]),
+      );
+      const [history] = await dataSource.query<
+        Array<{ total: number | string }>
+      >(
+        'SELECT COUNT(*) AS total FROM inventory_movements WHERE product_id = ?',
+        [redSmall.id],
+      );
+      expect(Number(history.total)).toBe(1);
+
+      await request(app.getHttpServer())
+        .delete(`/api/v1/products/${parent.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: { outcome: 'DEACTIVATED', product: { active: false } },
+          }),
+        );
+      const activeFamily = await dataSource.query<Array<{ id: string }>>(
+        `SELECT id FROM products
+         WHERE tenant_id = ? AND active = TRUE
+           AND (id = ? OR parent_product_id = ?)`,
+        [location.tenant_id, parent.id, parent.id],
+      );
+      expect(activeFamily).toEqual([]);
+    });
   });
 
   describe('inventory stock', () => {
@@ -4778,6 +5831,337 @@ describe('UInventario API (e2e)', () => {
         Array<{ movements: number | string }>
       >('SELECT COUNT(*) AS movements FROM inventory_movements');
       expect(Number(counts.movements)).toBe(5);
+    });
+
+    it('transitions low, depleted and recovered alerts once per tenant location', async () => {
+      await registerAccount('inventory-alert-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeInventoryOnboarding(registrationPayload.email, cookie);
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto con alerta',
+          sku: 'ALERT-1',
+          cost: '5.00',
+          price: '9.00',
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      const [location] = await dataSource.query<
+        Array<{ id: string; tenant_id: string }>
+      >(
+        `SELECT location.id, location.tenant_id FROM locations location
+         INNER JOIN users user ON user.tenant_id = location.tenant_id
+         WHERE user.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      const movement = (
+        key: string,
+        type: 'INITIAL' | 'ENTRY' | 'EXIT',
+        quantity: string,
+      ) =>
+        request(app.getHttpServer())
+          .post('/api/v1/inventory/movements')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', key)
+          .send({
+            productId,
+            locationId: location.id,
+            type,
+            quantity,
+            reason: 'Prueba de transición de alerta',
+            reference: `REF-${key}`,
+          });
+
+      await movement('stock-alert-initial', 'INITIAL', '8').expect(201);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock-alerts')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[]; meta: unknown } }) => {
+          expect(body.data).toEqual([]);
+          expect(body.meta).toMatchObject({ defaultThreshold: '5.000' });
+        });
+
+      const low = await request(app.getHttpServer())
+        .put(
+          `/api/v1/inventory/stock-alerts/products/${productId}/locations/${location.id}/threshold`,
+        )
+        .set('Cookie', cookie)
+        .send({ threshold: '10' })
+        .expect(200);
+      expect(low.body).toMatchObject({
+        data: {
+          product: { id: productId, sku: 'ALERT-1' },
+          location: { id: location.id },
+          status: 'LOW',
+          availableQuantity: '8.000',
+          threshold: '10.000',
+        },
+      });
+      const lowTransitionedAt = (
+        low.body as { data: { transitionedAt: string } }
+      ).data.transitionedAt;
+      const repeated = await request(app.getHttpServer())
+        .put(
+          `/api/v1/inventory/stock-alerts/products/${productId}/locations/${location.id}/threshold`,
+        )
+        .set('Cookie', cookie)
+        .send({ threshold: '10' })
+        .expect(200);
+      expect(
+        (repeated.body as { data: { transitionedAt: string } }).data
+          .transitionedAt,
+      ).toBe(lowTransitionedAt);
+
+      await movement('stock-alert-recovery', 'ENTRY', '5').expect(201);
+      const recovered = await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock-alerts')
+        .query({ status: 'RECOVERED', q: ' alert-1 ' })
+        .set('Cookie', cookie)
+        .expect(200);
+      expect(recovered.body).toMatchObject({
+        data: [
+          {
+            status: 'RECOVERED',
+            availableQuantity: '13.000',
+            threshold: '10.000',
+          },
+        ],
+        meta: { pagination: { total: 1 } },
+      });
+      const recoveredAt = (
+        recovered.body as { data: Array<{ transitionedAt: string }> }
+      ).data[0].transitionedAt;
+      await movement('stock-alert-remains-recovered', 'ENTRY', '1').expect(201);
+      const stillRecovered = await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock-alerts')
+        .query({ status: 'RECOVERED' })
+        .set('Cookie', cookie)
+        .expect(200);
+      expect(
+        (stillRecovered.body as { data: Array<{ transitionedAt: string }> })
+          .data[0].transitionedAt,
+      ).toBe(recoveredAt);
+
+      await movement('stock-alert-low-again', 'EXIT', '10').expect(201);
+      await movement('stock-alert-depleted', 'EXIT', '4').expect(201);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock-alerts')
+        .query({ status: 'OUT_OF_STOCK' })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              {
+                product: { id: productId },
+                status: 'OUT_OF_STOCK',
+                availableQuantity: '0.000',
+              },
+            ],
+          });
+        });
+
+      const secondary = {
+        organizationName: 'Alertas aisladas',
+        email: 'stock-alert-other@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'stock-alert-secondary-registration')
+        .send(secondary)
+        .expect(201);
+      const secondaryCookie = await createPersistedSession(secondary.email);
+      await completeInventoryOnboarding(secondary.email, secondaryCookie);
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/stock-alerts')
+        .set('Cookie', secondaryCookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toEqual([]);
+        });
+    });
+
+    it('configures, deduplicates and authorizes tenant notification delivery', async () => {
+      await registerAccount('notification-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await completeInventoryOnboarding(registrationPayload.email, cookie);
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto notificable',
+          sku: 'NOTIFY-1',
+          cost: '5.00',
+          price: '9.00',
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      const [identity] = await dataSource.query<
+        Array<{
+          user_id: string;
+          tenant_id: string;
+          role_id: string;
+          location_id: string;
+        }>
+      >(
+        `SELECT user.id AS user_id, user.tenant_id, role.id AS role_id,
+                location.id AS location_id
+         FROM users user
+         INNER JOIN user_roles user_role ON user_role.user_id = user.id
+         INNER JOIN roles role ON role.id = user_role.role_id
+         INNER JOIN locations location ON location.tenant_id = user.tenant_id
+         WHERE user.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'notification-stock')
+        .send({
+          productId,
+          locationId: identity.location_id,
+          type: 'INITIAL',
+          quantity: '2',
+          reason: 'Stock para notificación',
+          reference: 'NOTIFY-STOCK',
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .put(
+          `/api/v1/inventory/stock-alerts/products/${productId}/locations/${identity.location_id}/threshold`,
+        )
+        .set('Cookie', cookie)
+        .send({ threshold: '5' })
+        .expect(200);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/notifications/refresh')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { reconciliation: { created: 1 } },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/notifications/refresh')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { reconciliation: { deduplicated: 1 } },
+          });
+        });
+      const inbox = await request(app.getHttpServer())
+        .get('/api/v1/notifications')
+        .set('Cookie', cookie)
+        .expect(200);
+      expect(inbox.body).toMatchObject({
+        data: [{ eventType: 'STOCK_LOW', title: 'Stock bajo', readAt: null }],
+        meta: { unread: 1, pagination: { total: 1 } },
+      });
+
+      const settings = await request(app.getHttpServer())
+        .get('/api/v1/notifications/preferences')
+        .set('Cookie', cookie)
+        .expect(200);
+      const preferences = (
+        settings.body as {
+          data: { preferences: Array<Record<string, unknown>> };
+        }
+      ).data.preferences;
+      expect(preferences).toHaveLength(6);
+      await request(app.getHttpServer())
+        .put('/api/v1/notifications/preferences')
+        .set('Cookie', cookie)
+        .send({
+          preferences: preferences.map((preference) => ({
+            recipientUserId: (preference.recipient as { id: string }).id,
+            eventType: preference.eventType,
+            enabled: preference.enabled,
+            inApp: (preference.channels as { inApp: boolean }).inApp,
+            email:
+              preference.eventType === 'STOCK_LOW' ||
+              (preference.channels as { email: boolean }).email,
+            push: (preference.channels as { push: boolean }).push,
+            frequency: preference.frequency,
+          })),
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post('/api/v1/notifications/refresh')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { delivery: { sent: 1, failed: 0 } },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/notifications/deliveries')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [
+              {
+                channel: 'EMAIL',
+                adapter: 'SIMULATOR',
+                status: 'SENT',
+                attemptCount: 1,
+              },
+            ],
+          });
+        });
+
+      const notificationId = (inbox.body as { data: Array<{ id: string }> })
+        .data[0].id;
+      await request(app.getHttpServer())
+        .post(`/api/v1/notifications/${notificationId}/read`)
+        .set('Cookie', cookie)
+        .expect(200);
+      await request(app.getHttpServer())
+        .post('/api/v1/notifications/read-all')
+        .set('Cookie', cookie)
+        .expect(200);
+      await request(app.getHttpServer())
+        .get('/api/v1/notifications')
+        .query({ unreadOnly: true })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: [], meta: { unread: 0 } });
+        });
+
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'NOTIFICATIONS_VIEW'`,
+        [identity.role_id, identity.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/notifications')
+        .set('Cookie', cookie)
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'NOTIFICATIONS_VIEW')`,
+        [identity.role_id, identity.tenant_id],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'NOTIFICATIONS_MANAGE'`,
+        [identity.role_id, identity.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/notifications/preferences')
+        .set('Cookie', cookie)
+        .expect(403);
     });
 
     it('applies operational movement directions and rolls back invalid exits', async () => {
@@ -6693,6 +8077,10 @@ describe('UInventario API (e2e)', () => {
           barcode: '7501234500000',
           cost: '80.00',
           price: '119.90',
+          baseUnit: 'KILOGRAM',
+          quantityPrecision: 2,
+          quantityRounding: 'HALF_UP',
+          minimumQuantity: '0.250',
         })
         .expect(201);
       const productId = (productResponse.body as { data: { id: string } }).data
@@ -6720,6 +8108,830 @@ describe('UInventario API (e2e)', () => {
       }
       return { cookie, productId, locationId: location.id };
     }
+
+    it('normalizes weighed quantities before calculating money', async () => {
+      const { cookie, productId } = await preparePos();
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [{ productId, quantity: '1.235' }] })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  quantity: '1.240',
+                  product: {
+                    baseUnit: 'KILOGRAM',
+                    quantityPrecision: 2,
+                    minimumQuantity: '0.250',
+                  },
+                  total: '148.68',
+                },
+              ],
+            },
+          });
+        });
+    });
+
+    it('derives kit availability, sells components atomically and restores them on return', async () => {
+      const { cookie, productId: coffeeId, locationId } = await preparePos();
+      const cupResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Vaso',
+          sku: 'VASO-KIT',
+          cost: '2.00',
+          price: '10.00',
+          quantityPrecision: 0,
+          minimumQuantity: '1.000',
+        })
+        .expect(201);
+      const cupId = (cupResponse.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'kit-cups-initial')
+        .send({
+          productId: cupId,
+          locationId,
+          type: 'INITIAL',
+          quantity: '10',
+          reason: 'Vasos para kits',
+        })
+        .expect(201);
+      const kitResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Combo café',
+          sku: 'COMBO-CAFE',
+          cost: '42.00',
+          price: '79.00',
+          quantityPrecision: 0,
+          minimumQuantity: '1.000',
+        })
+        .expect(201);
+      const kitId = (kitResponse.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .put(`/api/v1/products/${kitId}/kit`)
+        .set('Cookie', cookie)
+        .send({
+          version: 1,
+          enabled: true,
+          stockMode: 'DERIVED',
+          priceRule: 'COMPONENT_SUM',
+          components: [
+            { productId: coffeeId, quantity: '0.5' },
+            { productId: cupId, quantity: '1' },
+          ],
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              version: 2,
+              kit: {
+                stockMode: 'DERIVED',
+                priceRule: 'COMPONENT_SUM',
+                components: [
+                  { product: { id: coffeeId }, quantity: '0.500' },
+                  { product: { id: cupId }, quantity: '1.000' },
+                ],
+              },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [{ productId: kitId, quantity: '2' }] })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  product: { id: kitId },
+                  quantity: '2.000',
+                  availableQuantity: '10.000',
+                  unitPrice: '69.95',
+                  kit: { stockMode: 'DERIVED' },
+                },
+              ],
+              totals: { total: '139.90' },
+            },
+          });
+        });
+      const sale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'derived-kit-sale')
+        .send({
+          lines: [
+            { productId: cupId, quantity: '1' },
+            { productId: kitId, quantity: '2' },
+          ],
+          cashReceived: '200.00',
+        })
+        .expect(201);
+      const saleData = sale.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+      const balancesAfterSale = await dataSource.query<
+        Array<{ product_id: string; quantity: string }>
+      >(
+        `SELECT product_id, quantity FROM inventory_balances
+         WHERE location_id = ? AND product_id IN (?, ?) ORDER BY product_id`,
+        [locationId, coffeeId, cupId],
+      );
+      expect(
+        new Map(balancesAfterSale.map((row) => [row.product_id, row.quantity])),
+      ).toEqual(
+        new Map([
+          [coffeeId, '4.000'],
+          [cupId, '7.000'],
+        ]),
+      );
+      const [trace] = await dataSource.query<
+        Array<{ components: number | string; movements: number | string }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM sale_kit_components WHERE sale_id = ?) AS components,
+           (SELECT COUNT(*) FROM inventory_movements
+             WHERE sale_id = ? AND sale_line_id = ? AND type = 'SALE') AS movements`,
+        [saleData.data.id, saleData.data.id, saleData.data.lines[1].id],
+      );
+      expect({
+        components: Number(trace.components),
+        movements: Number(trace.movements),
+      }).toEqual({
+        components: 2,
+        movements: 2,
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleData.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'derived-kit-return')
+        .send({
+          reason: 'Combo devuelto completo',
+          lines: [
+            {
+              saleLineId: saleData.data.lines[1].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201);
+      const balancesAfterReturn = await dataSource.query<
+        Array<{ product_id: string; quantity: string }>
+      >(
+        `SELECT product_id, quantity FROM inventory_balances
+         WHERE location_id = ? AND product_id IN (?, ?) ORDER BY product_id`,
+        [locationId, coffeeId, cupId],
+      );
+      expect(
+        new Map(
+          balancesAfterReturn.map((row) => [row.product_id, row.quantity]),
+        ),
+      ).toEqual(
+        new Map([
+          [coffeeId, '4.500'],
+          [cupId, '8.000'],
+        ]),
+      );
+    });
+
+    it('assembles and disassembles configured kit stock idempotently', async () => {
+      const { cookie, productId: componentId, locationId } = await preparePos();
+      const kitResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Paquete armado',
+          sku: 'KIT-ARMADO',
+          cost: '40.00',
+          price: '70.00',
+          quantityPrecision: 0,
+          minimumQuantity: '1.000',
+        })
+        .expect(201);
+      const kitId = (kitResponse.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .put(`/api/v1/products/${kitId}/kit`)
+        .set('Cookie', cookie)
+        .send({
+          version: 1,
+          enabled: true,
+          stockMode: 'ASSEMBLED',
+          priceRule: 'FIXED',
+          components: [{ productId: componentId, quantity: '0.5' }],
+        })
+        .expect(200);
+      const payload = {
+        operationType: 'ASSEMBLE',
+        locationId,
+        quantity: '2',
+      };
+      const assembled = await request(app.getHttpServer())
+        .post(`/api/v1/inventory/kits/${kitId}/operations`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'kit-assemble-once')
+        .send(payload)
+        .expect(201);
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/kits/${kitId}/operations`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'kit-assemble-once')
+        .send(payload)
+        .expect(201)
+        .expect(
+          ({ body }: { body: { meta: { idempotentReplay: boolean } } }) => {
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+      expect(assembled.body).toMatchObject({
+        data: { operationType: 'ASSEMBLE', quantity: '2.000' },
+        meta: { idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .put(`/api/v1/products/${kitId}/kit`)
+        .set('Cookie', cookie)
+        .send({
+          version: 2,
+          enabled: true,
+          stockMode: 'ASSEMBLED',
+          priceRule: 'FIXED',
+          components: [{ productId: componentId, quantity: '1' }],
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PRODUCT_KIT_CONFIGURATION_INVALID');
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/kits/${kitId}/operations`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'kit-disassemble-once')
+        .send({ operationType: 'DISASSEMBLE', locationId, quantity: '1' })
+        .expect(201);
+      const balances = await dataSource.query<
+        Array<{ product_id: string; quantity: string }>
+      >(
+        `SELECT product_id, quantity FROM inventory_balances
+         WHERE location_id = ? AND product_id IN (?, ?) ORDER BY product_id`,
+        [locationId, componentId, kitId],
+      );
+      expect(
+        new Map(balances.map((row) => [row.product_id, row.quantity])),
+      ).toEqual(
+        new Map([
+          [componentId, '4.500'],
+          [kitId, '1.000'],
+        ]),
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/inventory/kits/${kitId}/operations`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'kit-assemble-insufficient')
+        .send({ operationType: 'ASSEMBLE', locationId, quantity: '100' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INSUFFICIENT_STOCK');
+        });
+      const afterRollback = await dataSource.query<
+        Array<{ product_id: string; quantity: string }>
+      >(
+        `SELECT product_id, quantity FROM inventory_balances
+         WHERE location_id = ? AND product_id IN (?, ?) ORDER BY product_id`,
+        [locationId, componentId, kitId],
+      );
+      expect(afterRollback).toEqual(balances);
+    });
+
+    it('resolves scoped price lists deterministically and snapshots the sale price', async () => {
+      const { cookie, productId } = await preparePos();
+      const [branch] = await dataSource.query<Array<{ id: string }>>(
+        'SELECT id FROM branches LIMIT 1',
+      );
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Cliente preferente',
+          identifier: 'PREFERENTE-1',
+          dataProcessingConsent: false,
+        })
+        .expect(201);
+      const customerId = (customerResponse.body as { data: { id: string } })
+        .data.id;
+      const validFrom = new Date(Date.now() - 60_000).toISOString();
+      const validTo = new Date(Date.now() + 86_400_000).toISOString();
+      const createList = (body: Record<string, unknown>) =>
+        request(app.getHttpServer())
+          .post('/api/v1/price-lists')
+          .set('Cookie', cookie)
+          .send({
+            currency: 'MXN',
+            priority: 10,
+            validFrom,
+            validTo,
+            active: true,
+            items: [{ productId, price: '109.00' }],
+            ...body,
+          });
+      await createList({ name: 'General POS' }).expect(201);
+      await createList({
+        name: 'Sucursal POS',
+        branchId: branch.id,
+        items: [{ productId, price: '108.00' }],
+      }).expect(201);
+      const preferredResponse = await createList({
+        name: 'Preferentes',
+        customerId,
+        channel: 'POS',
+        priority: 20,
+        items: [{ productId, price: '99.99' }],
+      }).expect(201);
+      const preferred = preferredResponse.body as {
+        data: { id: string; version: number };
+      };
+      await createList({
+        name: 'Expirada',
+        priority: 100,
+        validFrom: new Date(Date.now() - 172_800_000).toISOString(),
+        validTo: new Date(Date.now() - 86_400_000).toISOString(),
+        items: [{ productId, price: '1.00' }],
+      }).expect(201);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/offline/bootstrap')
+        .set('Cookie', cookie)
+        .query({ deviceId: randomUUID(), pageSize: 500 })
+        .expect(200)
+        .expect(({ body }: { body: { data: OfflineBootstrapResponseV1 } }) => {
+          expect(body.data.page.entities).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                kind: 'PRICE_LIST',
+                id: preferred.data.id,
+                customerId,
+                items: [{ productId, price: '99.99' }],
+              }),
+            ]),
+          );
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ channel: 'POS', lines: [{ productId, quantity: '1' }] })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                { unitPrice: '108.00', priceList: { name: 'Sucursal POS' } },
+              ],
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({
+          channel: 'POS',
+          customerId,
+          lines: [{ productId, quantity: '1.5' }],
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  unitPrice: '99.99',
+                  total: '149.99',
+                  priceSource: 'PRICE_LIST',
+                  priceList: { id: preferred.data.id },
+                },
+              ],
+            },
+          });
+        });
+      const saleResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'price-list-sale-001')
+        .send({
+          channel: 'POS',
+          customerId,
+          lines: [{ productId, quantity: '1' }],
+          payments: [
+            { method: 'CASH', amount: '99.99', amountReceived: '100.00' },
+          ],
+        })
+        .expect(201);
+      const sale = saleResponse.body as { data: { id: string } };
+      await request(app.getHttpServer())
+        .put(`/api/v1/price-lists/${preferred.data.id}`)
+        .set('Cookie', cookie)
+        .send({
+          name: 'Preferentes',
+          currency: 'MXN',
+          customerId,
+          channel: 'POS',
+          priority: 20,
+          validFrom,
+          validTo,
+          active: true,
+          version: preferred.data.version,
+          items: [{ productId, price: '89.99' }],
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${sale.data.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  unitPrice: '99.99',
+                  priceSource: 'PRICE_LIST',
+                  priceList: { id: preferred.data.id, name: 'Preferentes' },
+                },
+              ],
+            },
+          });
+        });
+    });
+
+    it('applies scoped promotions deterministically and preserves their sale snapshot on update and return', async () => {
+      const { cookie, productId } = await preparePos();
+      const [branch] = await dataSource.query<Array<{ id: string }>>(
+        'SELECT id FROM branches LIMIT 1',
+      );
+      const past = new Date(Date.now() - 60_000).toISOString();
+      const future = new Date(Date.now() + 86_400_000).toISOString();
+      const expiredFrom = new Date(Date.now() - 172_800_000).toISOString();
+      const expiredTo = new Date(Date.now() - 86_400_000).toISOString();
+      const promotionBody = {
+        type: 'BUY_X_GET_Y',
+        branchId: branch.id,
+        channel: 'POS',
+        priority: 100,
+        stackable: false,
+        validFrom: past,
+        validTo: future,
+        active: true,
+        discountPercent: '100',
+        buyQuantity: '1',
+        rewardQuantity: '1',
+        products: [{ productId, quantity: '1' }],
+        tiers: [],
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/promotions')
+        .set('Cookie', cookie)
+        .send({
+          ...promotionBody,
+          name: '2x1 expirado',
+          priority: 1000,
+          validFrom: expiredFrom,
+          validTo: expiredTo,
+        })
+        .expect(201);
+      const createdResponse = await request(app.getHttpServer())
+        .post('/api/v1/promotions')
+        .set('Cookie', cookie)
+        .send({ ...promotionBody, name: '2x1 vigente' })
+        .expect(201);
+      const created = createdResponse.body as {
+        data: { id: string; version: number };
+      };
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ channel: 'POS', lines: [{ productId, quantity: '2' }] })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  promotions: [
+                    {
+                      promotion: {
+                        id: created.data.id,
+                        name: '2x1 vigente',
+                        type: 'BUY_X_GET_Y',
+                      },
+                      amount: '119.90',
+                      ruleSnapshot: { discountPercent: '100.0000' },
+                    },
+                  ],
+                  total: '119.90',
+                },
+              ],
+              totals: {
+                gross: '239.80',
+                promotionDiscount: '119.90',
+                discount: '119.90',
+                total: '119.90',
+              },
+            },
+          });
+        });
+
+      const createSale = () =>
+        request(app.getHttpServer())
+          .post('/api/v1/pos/sales')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', 'promotion-sale-001')
+          .send({
+            channel: 'POS',
+            lines: [{ productId, quantity: '2' }],
+            payments: [
+              {
+                method: 'CASH',
+                amount: '119.90',
+                amountReceived: '120.00',
+              },
+            ],
+          });
+      const saleResponse = await createSale()
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [{ promotions: [{ amount: '119.90' }] }],
+              totals: { promotionDiscount: '119.90', total: '119.90' },
+            },
+            meta: { idempotentReplay: false },
+          });
+        });
+      await createSale()
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { idempotentReplay: true } });
+        });
+      const sale = saleResponse.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+
+      await request(app.getHttpServer())
+        .put(`/api/v1/promotions/${created.data.id}`)
+        .set('Cookie', cookie)
+        .send({
+          ...promotionBody,
+          name: '2x1 vigente modificado',
+          discountPercent: '50',
+          version: created.data.version,
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${sale.data.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  promotions: [
+                    {
+                      promotion: { name: '2x1 vigente' },
+                      amount: '119.90',
+                      ruleSnapshot: { discountPercent: '100.0000' },
+                    },
+                  ],
+                },
+              ],
+              totals: { promotionDiscount: '119.90' },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${sale.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'promotion-return-001')
+        .send({
+          reason: 'Devolución parcial con promoción histórica',
+          lines: [
+            {
+              saleLineId: sale.data.lines[0].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { totals: { total: '59.95' } } });
+        });
+    });
+
+    it('accrues, redeems and compensates versioned loyalty points through sale history', async () => {
+      const { cookie, productId } = await preparePos();
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Cliente fiel',
+          identifier: 'LOYAL-1',
+          dataProcessingConsent: false,
+        })
+        .expect(201);
+      const customer = customerResponse.body as { data: { id: string } };
+      await request(app.getHttpServer())
+        .put('/api/v1/loyalty/rules/current')
+        .set('Cookie', cookie)
+        .send({
+          active: true,
+          earnAmount: '1.00',
+          earnPoints: 1,
+          redeemPoints: 100,
+          redeemAmount: '10.00',
+          expirationDays: 365,
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { version: 1, active: true } });
+        });
+
+      const firstSaleResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'loyalty-earn-sale-001')
+        .send({
+          customerId: customer.data.id,
+          lines: [{ productId, quantity: '1' }],
+          payments: [
+            { method: 'CASH', amount: '119.90', amountReceived: '120.00' },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { loyalty: { pointsEarned: 119, pointsRedeemed: 0 } },
+          });
+        });
+      const firstSale = firstSaleResponse.body as { data: { id: string } };
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({
+          customerId: customer.data.id,
+          loyaltyPointsToRedeem: 100,
+          lines: [{ productId, quantity: '1' }],
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              loyalty: {
+                balanceBefore: 119,
+                pointsRedeemed: 100,
+                redemptionValue: '10.00',
+                pointsEarned: 109,
+                balanceAfter: 128,
+              },
+              totals: { total: '119.90', payable: '109.90' },
+            },
+          });
+        });
+
+      const redeemedSaleResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'loyalty-sale-b')
+        .send({
+          customerId: customer.data.id,
+          loyaltyPointsToRedeem: 100,
+          lines: [{ productId, quantity: '1' }],
+          payments: [
+            { method: 'CASH', amount: '109.90', amountReceived: '110.00' },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          const response = body as {
+            data: {
+              loyalty: {
+                ruleVersion: number;
+                pointsRedeemed: number;
+                redemptionValue: string;
+                pointsEarned: number;
+              };
+              payments: Array<{ method: string; provider: string }>;
+            };
+          };
+          expect(response).toMatchObject({
+            data: {
+              loyalty: {
+                ruleVersion: 1,
+                pointsRedeemed: 100,
+                redemptionValue: '10.00',
+                pointsEarned: 109,
+              },
+            },
+          });
+          expect(
+            response.data.payments.some(
+              ({ method, provider }) =>
+                method === 'VOUCHER' && provider === 'LOYALTY',
+            ),
+          ).toBe(true);
+        });
+      const redeemedSale = redeemedSaleResponse.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${redeemedSale.data.id}/receipt/reprints`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              loyalty: {
+                pointsRedeemed: 100,
+                redemptionValue: '10.00',
+                pointsEarned: 109,
+              },
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${redeemedSale.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'loyalty-return-a')
+        .send({
+          reason: 'Devolución total con restitución de puntos',
+          lines: [
+            {
+              saleLineId: redeemedSale.data.lines[0].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              refundableAmount: '109.90',
+              loyaltyValueRestored: '10.00',
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${firstSale.data.id}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'loyalty-void-001')
+        .send({ reason: 'Anulación completa de prueba de fidelización' })
+        .expect(201);
+
+      await request(app.getHttpServer())
+        .get(`/api/v1/loyalty/customers/${customer.data.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          const response = body as {
+            data: {
+              balance: number;
+              entries: Array<{ type: string; points: number }>;
+            };
+          };
+          expect(response.data.balance).toBe(0);
+          expect(response.data.entries).toContainEqual(
+            expect.objectContaining({
+              type: 'RETURN_REDEEM_RESTORE',
+              points: 100,
+            }),
+          );
+          expect(response.data.entries).toContainEqual(
+            expect.objectContaining({
+              type: 'RETURN_EARN_REVERSAL',
+              points: -109,
+            }),
+          );
+          expect(response.data.entries).toContainEqual(
+            expect.objectContaining({
+              type: 'VOID_EARN_REVERSAL',
+              points: -119,
+            }),
+          );
+        });
+    });
 
     it('accepts the unified sale contract with one cash payment', async () => {
       const { cookie, productId } = await preparePos();
@@ -6759,6 +8971,561 @@ describe('UInventario API (e2e)', () => {
             },
           });
         });
+    });
+
+    it('applies authorized line and sale discounts with exact snapshots, limits and returns', async () => {
+      const { cookie, productId } = await preparePos();
+      const discountedLines = [
+        {
+          productId,
+          quantity: '1',
+          discount: {
+            type: 'PERCENT',
+            value: '10',
+            reason: 'Empaque deteriorado',
+          },
+        },
+      ];
+      const discount = {
+        type: 'AMOUNT',
+        value: '7.91',
+        reason: 'Cortesía autorizada',
+      };
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: discountedLines, discount })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              discount: { ...discount, value: '7.91', amount: '7.91' },
+              lines: [
+                {
+                  grossTotal: '119.90',
+                  discount: {
+                    line: {
+                      type: 'PERCENT',
+                      value: '10.00',
+                      reason: 'Empaque deteriorado',
+                      amount: '11.99',
+                    },
+                    sale: { ...discount, value: '7.91', amount: '7.91' },
+                    total: '19.90',
+                  },
+                  subtotal: '86.21',
+                  tax: '13.79',
+                  total: '100.00',
+                },
+              ],
+              totals: {
+                gross: '119.90',
+                lineDiscount: '11.99',
+                saleDiscount: '7.91',
+                discount: '19.90',
+                subtotal: '86.21',
+                tax: '13.79',
+                total: '100.00',
+              },
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          discount: {
+            type: 'PERCENT',
+            value: '50.01',
+            reason: 'Fuera del límite',
+          },
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SALE_DISCOUNT_LIMIT_EXCEEDED');
+        });
+
+      const createSale = () =>
+        request(app.getHttpServer())
+          .post('/api/v1/pos/sales')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', 'sale-sale-sale')
+          .send({
+            lines: discountedLines,
+            discount,
+            payments: [
+              {
+                method: 'CASH',
+                amount: '100.00',
+                amountReceived: '100.00',
+              },
+            ],
+          });
+      const saleResponse = await createSale()
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              discount: { reason: 'Cortesía autorizada', amount: '7.91' },
+              lines: [
+                {
+                  grossTotal: '119.90',
+                  discount: { total: '19.90' },
+                  grossProfit: '6.21',
+                  total: '100.00',
+                },
+              ],
+              totals: {
+                discount: '19.90',
+                total: '100.00',
+                grossProfit: '6.21',
+              },
+            },
+            meta: { idempotentReplay: false },
+          });
+        });
+      await createSale()
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { idempotentReplay: true } });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-sale-sale')
+        .send({
+          lines: [
+            {
+              productId,
+              quantity: '0.5',
+              discount: {
+                type: 'PERCENT',
+                value: '5',
+                reason: 'Descuento contradictorio',
+              },
+            },
+            { ...discountedLines[0], quantity: '0.5' },
+          ],
+          discount,
+          payments: [
+            {
+              method: 'CASH',
+              amount: '100.00',
+              amountReceived: '100.00',
+            },
+          ],
+        })
+        .expect(400)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('MIXED_PRODUCT_DISCOUNTS');
+        });
+      const sale = saleResponse.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${sale.data.id}/receipt/reprints`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  grossTotal: '119.90',
+                  discountTotal: '19.90',
+                  lineDiscountReason: 'Empaque deteriorado',
+                  saleDiscountReason: 'Cortesía autorizada',
+                  total: '100.00',
+                },
+              ],
+              totals: { gross: '119.90', discount: '19.90', total: '100.00' },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${sale.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'return-return-return')
+        .send({
+          reason: 'Devolución total con descuento',
+          lines: [
+            {
+              saleLineId: sale.data.lines[0].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              totals: { subtotal: '86.21', tax: '13.79', total: '100.00' },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/reports/profitability')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              currencies: [
+                expect.objectContaining({
+                  currency: 'MXN',
+                  grossRevenue: '119.90',
+                  discounts: '19.90',
+                  salesTotal: '100.00',
+                  returnTotal: '100.00',
+                  netRevenue: '0.00',
+                  netCost: '0.00',
+                  margin: '0.00',
+                  refundsSettled: '0.00',
+                  salesMatchPayments: true,
+                }),
+              ],
+              products: [
+                expect.objectContaining({
+                  soldQuantity: '1.000',
+                  returnedQuantity: '1.000',
+                  margin: '0.00',
+                }),
+              ],
+              total: 2,
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/audit-events')
+        .query({ entityType: 'SALE', q: sale.data.id, page: 1, pageSize: 10 })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: Array<{ action: string; after: unknown }> };
+          }) => {
+            const completed = body.data.find(
+              ({ action }) => action === 'SALE_COMPLETED',
+            );
+            expect(completed).toBeDefined();
+            const after = completed?.after as {
+              discountTotal?: unknown;
+              discountReasons?: unknown;
+            };
+            expect(after.discountTotal).toBe('19.90');
+            expect(after.discountReasons).toEqual(
+              expect.arrayContaining([
+                'Cortesía autorizada',
+                'Empaque deteriorado',
+              ]),
+            );
+          },
+        );
+
+      const [principal] = await dataSource.query<
+        Array<{ tenant_id: string; role_id: string }>
+      >(
+        `SELECT user.tenant_id, user_role.role_id FROM users user
+         INNER JOIN user_roles user_role
+           ON user_role.user_id = user.id AND user_role.tenant_id = user.tenant_id
+         WHERE user.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'INVENTORY_VALUATION_MANAGE'`,
+        [principal.role_id, principal.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/reports/profitability')
+        .set('Cookie', cookie)
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('INVENTORY_ACCESS_DENIED');
+        });
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${sale.data.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [{ grossProfit: null }],
+              totals: { grossProfit: null },
+            },
+          });
+        });
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'SALES_DISCOUNT'`,
+        [principal.role_id, principal.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          discount: {
+            type: 'PERCENT',
+            value: '5',
+            reason: 'Sin autorización',
+          },
+        })
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SALE_DISCOUNT_PERMISSION_REQUIRED');
+        });
+    });
+
+    it('suspends, isolates, recalculates and transactionally consumes a pending sale', async () => {
+      const { cookie, productId, locationId } = await preparePos();
+      const suspendedResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/suspended-sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'suspended-sale-create-001')
+        .send({
+          notes: 'Cliente vuelve en unos minutos',
+          lines: [{ productId, quantity: '2' }],
+        })
+        .expect(201);
+      const suspended = suspendedResponse.body as {
+        data: { id: string; status: string; notes: string; lines: unknown[] };
+        meta: { idempotentReplay: boolean };
+      };
+      expect(suspended).toMatchObject({
+        data: {
+          status: 'ACTIVE',
+          notes: 'Cliente vuelve en unos minutos',
+          lines: [
+            expect.objectContaining({
+              quantity: '2.000',
+              unitPriceSnapshot: '119.90',
+            }),
+          ],
+        },
+        meta: { idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/suspended-sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'suspended-sale-create-001')
+        .send({
+          notes: 'Cliente vuelve en unos minutos',
+          lines: [{ productId, quantity: '2' }],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { id: suspended.data.id },
+            meta: { idempotentReplay: true },
+          });
+        });
+
+      const [before] = await dataSource.query<Array<{ quantity: string }>>(
+        `SELECT available_quantity AS quantity FROM inventory_balances
+         WHERE product_id = ? AND location_id = ?`,
+        [productId, locationId],
+      );
+      const [{ salesBefore }] = await dataSource.query<
+        Array<{ salesBefore: string }>
+      >('SELECT COUNT(*) AS salesBefore FROM sales');
+      expect(before.quantity).toBe('5.000');
+      expect(Number(salesBefore)).toBe(0);
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { expectedCash: '250.00' } });
+        });
+
+      const [scope] = await dataSource.query<
+        Array<{
+          tenant_id: string;
+          branch_id: string;
+          cash_register_id: string;
+          role_id: string;
+        }>
+      >(
+        `SELECT u.tenant_id, b.id AS branch_id, cr.id AS cash_register_id, r.id AS role_id
+         FROM users u
+         INNER JOIN roles r ON r.tenant_id = u.tenant_id AND r.code = 'ADMIN'
+         INNER JOIN branches b ON b.tenant_id = u.tenant_id
+         INNER JOIN cash_registers cr ON cr.tenant_id = u.tenant_id AND cr.branch_id = b.id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      const otherUserId = randomUUID();
+      await dataSource.query(
+        `INSERT INTO users (id, tenant_id, email, normalized_email, password_hash)
+         VALUES (?, ?, 'other-cashier@example.com', 'other-cashier@example.com', 'not-used')`,
+        [otherUserId, scope.tenant_id],
+      );
+      await dataSource.query(
+        'INSERT INTO user_roles (user_id, role_id, tenant_id) VALUES (?, ?, ?)',
+        [otherUserId, scope.role_id, scope.tenant_id],
+      );
+      await dataSource.query(
+        'INSERT INTO user_branch_access (user_id, tenant_id, branch_id) VALUES (?, ?, ?)',
+        [otherUserId, scope.tenant_id, scope.branch_id],
+      );
+      await dataSource.query(
+        `INSERT INTO user_cash_register_access (user_id, tenant_id, branch_id, cash_register_id)
+         VALUES (?, ?, ?, ?)`,
+        [otherUserId, scope.tenant_id, scope.branch_id, scope.cash_register_id],
+      );
+      const otherCookie = await createPersistedSession(
+        'other-cashier@example.com',
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/suspended-sales/${suspended.data.id}/resume`)
+        .set('Cookie', otherCookie)
+        .expect(404);
+
+      await dataSource.query('UPDATE products SET price = ? WHERE id = ?', [
+        '129.90',
+        productId,
+      ]);
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/suspended-sales/${suspended.data.id}/resume`)
+        .set('Cookie', cookie)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              suspendedSale: { id: suspended.data.id, status: 'ACTIVE' },
+              quote: { totals: { total: '259.80' } },
+              conflicts: [
+                expect.objectContaining({
+                  code: 'PRICE_CHANGED',
+                  productId,
+                  previous: '119.90',
+                  current: '129.90',
+                }),
+              ],
+            },
+          });
+        });
+
+      const completed = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'suspended-sale-complete-001')
+        .send({
+          suspendedSaleId: suspended.data.id,
+          lines: [{ productId, quantity: '2' }],
+          payment: { method: 'CASH', amountReceived: '260.00' },
+        })
+        .expect(201);
+      const completedId = (completed.body as { data: { id: string } }).data.id;
+      const [state] = await dataSource.query<
+        Array<{ status: string; completed_sale_id: string }>
+      >('SELECT status, completed_sale_id FROM suspended_sales WHERE id = ?', [
+        suspended.data.id,
+      ]);
+      expect(state).toEqual({
+        status: 'RESUMED',
+        completed_sale_id: completedId,
+      });
+      const [after] = await dataSource.query<Array<{ quantity: string }>>(
+        `SELECT available_quantity AS quantity FROM inventory_balances
+         WHERE product_id = ? AND location_id = ?`,
+        [productId, locationId],
+      );
+      expect(after.quantity).toBe('3.000');
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'suspended-sale-complete-duplicate')
+        .send({
+          suspendedSaleId: suspended.data.id,
+          lines: [{ productId, quantity: '1' }],
+          payment: { method: 'CASH', amountReceived: '130.00' },
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string; status?: string } }) => {
+          expect(body).toMatchObject({
+            code: 'SUSPENDED_SALE_NOT_ACTIVE',
+            status: 'RESUMED',
+          });
+        });
+
+      const cancellable = await request(app.getHttpServer())
+        .post('/api/v1/pos/suspended-sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'suspended-sale-cancel-001')
+        .send({ notes: 'Cancelar', lines: [{ productId, quantity: '1' }] })
+        .expect(201);
+      const cancellableId = (cancellable.body as { data: { id: string } }).data
+        .id;
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/suspended-sales/${cancellableId}/cancel`)
+        .set('Cookie', cookie)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { status: 'CANCELLED' },
+            meta: { idempotentReplay: false },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/suspended-sales/${cancellableId}/cancel`)
+        .set('Cookie', cookie)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { idempotentReplay: true } });
+        });
+
+      const expirable = await request(app.getHttpServer())
+        .post('/api/v1/pos/suspended-sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'suspended-sale-expire-001')
+        .send({ notes: 'Expirar', lines: [{ productId, quantity: '1' }] })
+        .expect(201);
+      const expirableId = (expirable.body as { data: { id: string } }).data.id;
+      await dataSource.query(
+        `UPDATE suspended_sales SET expires_at = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 1 SECOND)
+         WHERE id = ?`,
+        [expirableId],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/suspended-sales/${expirableId}/resume`)
+        .set('Cookie', cookie)
+        .expect(409)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            code: 'SUSPENDED_SALE_EXPIRED',
+            status: 'EXPIRED',
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/suspended-sales')
+        .set('Cookie', cookie)
+        .expect(200);
+      const [expirationAudit] = await dataSource.query<
+        Array<{ total: string }>
+      >(
+        `SELECT COUNT(*) AS total FROM audit_events
+         WHERE entity_id = ? AND action = 'SALE_SUSPENSION_EXPIRED'`,
+        [expirableId],
+      );
+      expect(Number(expirationAudit.total)).toBe(1);
+
+      const audit = await dataSource.query<Array<{ action: string }>>(
+        `SELECT action FROM audit_events WHERE entity_id = ? ORDER BY created_at, id`,
+        [suspended.data.id],
+      );
+      expect(audit.map(({ action }) => action)).toEqual([
+        'SALE_SUSPENDED',
+        'SALE_SUSPENSION_RESUMED',
+      ]);
     });
 
     it('authorizes card, transfer and voucher payments without affecting expected cash', async () => {
@@ -6932,6 +9699,149 @@ describe('UInventario API (e2e)', () => {
       expect(balance.quantity).toBe('1.000');
     });
 
+    it('captures a terminal payment once and resolves a late response before completing the sale', async () => {
+      const { cookie, productId, locationId } = await preparePos();
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/payment-terminal/operations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-zero-amount')
+        .send({ amount: '0.00', currency: 'MXN', scenario: 'SUCCESS' })
+        .expect(400);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/payment-terminal/operations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-decline-001')
+        .send({ amount: '119.90', currency: 'MXN', scenario: 'REJECT' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { status: 'DECLINED', errorCode: 'SIMULATED_DECLINE' },
+          });
+          expect(JSON.stringify(body)).not.toMatch(/cardNumber|cvv|pan/i);
+        });
+
+      const uncertain = await request(app.getHttpServer())
+        .post('/api/v1/pos/payment-terminal/operations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-late-001')
+        .send({ amount: '119.90', currency: 'MXN', scenario: 'INDETERMINATE' })
+        .expect(201);
+      const uncertainData = uncertain.body as {
+        data: { id: string; status: string };
+      };
+      expect(uncertainData.data.status).toBe('INDETERMINATE');
+
+      const terminalSale = {
+        lines: [{ productId, quantity: '1' }],
+        payment: {
+          method: 'CARD',
+          terminalOperationId: uncertainData.data.id,
+        },
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-sale-before-capture')
+        .send(terminalSale)
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PAYMENT_TERMINAL_NOT_CAPTURED');
+        });
+
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/payment-terminal/operations/${uncertainData.data.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          const response = body as {
+            data: {
+              status: string;
+              queryCount: number;
+              authorizationCode: unknown;
+            };
+          };
+          expect(response.data).toMatchObject({
+            status: 'CAPTURED',
+            queryCount: 1,
+          });
+          expect(typeof response.data.authorizationCode).toBe('string');
+        });
+
+      const completed = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-sale-completed')
+        .send(terminalSale)
+        .expect(201);
+      const completedData = completed.body as { data: { id: string } };
+      const completedPayment = completed.body as {
+        data: {
+          payment: { method: string; provider: string; reference: string };
+        };
+      };
+      expect(completedPayment.data.payment).toMatchObject({
+        method: 'CARD',
+        provider: 'SIMULATOR',
+      });
+      expect(completedPayment.data.payment.reference).toMatch(/^TERM-/);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-sale-completed')
+        .send(terminalSale)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { id: completedData.data.id },
+            meta: { idempotentReplay: true },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-sale-reused-operation')
+        .send(terminalSale)
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PAYMENT_TERMINAL_ALREADY_USED');
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/payment-terminal/reconciliation')
+        .set('Cookie', cookie)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            meta: { totals: { captured: 1, matchedSales: 1, pending: 0 } },
+          });
+        });
+      const [balance] = await dataSource.query<Array<{ quantity: string }>>(
+        `SELECT available_quantity AS quantity FROM inventory_balances
+         WHERE product_id = ? AND location_id = ?`,
+        [productId, locationId],
+      );
+      expect(balance.quantity).toBe('4.000');
+
+      const cancellable = await request(app.getHttpServer())
+        .post('/api/v1/pos/payment-terminal/operations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-cancel-001')
+        .send({ amount: '20.00', currency: 'MXN', scenario: 'SUCCESS' })
+        .expect(201);
+      const cancellableId = (cancellable.body as { data: { id: string } }).data
+        .id;
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/payment-terminal/operations/${cancellableId}/cancel`)
+        .set('Cookie', cookie)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { status: 'CANCELLED' } });
+        });
+    });
+
     it('reconciles tenant-scoped sales, payments and cash shifts with local-date filters', async () => {
       const { cookie, productId } = await preparePos();
       const mixedSale = await request(app.getHttpServer())
@@ -7054,6 +9964,41 @@ describe('UInventario API (e2e)', () => {
             );
           },
         );
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/reports/profitability')
+        .set('Cookie', cookie)
+        .query({
+          branchId: mixedData.data.context.branch.id,
+          page: 1,
+          pageSize: 10,
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              currencies: [
+                expect.objectContaining({
+                  currency: 'MXN',
+                  sales: 1,
+                  cancellations: 1,
+                  salesTotal: '119.90',
+                  paymentObligations: '119.90',
+                  salesMatchPayments: true,
+                }),
+              ],
+              products: [
+                expect.objectContaining({
+                  soldQuantity: '1.000',
+                }),
+              ],
+              total: 2,
+            },
+            meta: {
+              pagination: { page: 1, pageSize: 10, total: 2, totalPages: 1 },
+              periodTimezone: 'BRANCH_LOCAL',
+            },
+          });
+        });
       await request(app.getHttpServer())
         .get('/api/v1/pos/reports/sales-cash')
         .set('Cookie', cookie)
@@ -7697,6 +10642,692 @@ describe('UInventario API (e2e)', () => {
       await request(app.getHttpServer())
         .get(`/api/v1/customers/${customer.id}/history`)
         .set('Cookie', otherCookie)
+        .expect(404);
+    });
+
+    it('sells on customer credit within the locked limit and reverses debt on void', async () => {
+      const { cookie, productId, locationId } = await preparePos();
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Cliente crédito',
+          identifier: 'CREDIT-001',
+          dataProcessingConsent: false,
+        })
+        .expect(201);
+      const customer = (
+        customerResponse.body as {
+          data: { id: string; version: number };
+        }
+      ).data;
+      await request(app.getHttpServer())
+        .patch(`/api/v1/customers/${customer.id}/credit`)
+        .set('Cookie', cookie)
+        .send({
+          enabled: true,
+          creditLimit: '150.00',
+          currency: 'MXN',
+          termDays: 30,
+          maxInstallments: 3,
+          version: customer.version,
+        })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              version: 2,
+              credit: {
+                enabled: true,
+                limit: '150.00',
+                balance: '0.00',
+                available: '150.00',
+                status: 'AVAILABLE',
+              },
+            },
+          });
+        });
+
+      const [creditRole] = await dataSource.query<
+        Array<{ role_id: string; tenant_id: string }>
+      >(
+        `SELECT r.id AS role_id, r.tenant_id FROM roles r
+         INNER JOIN users u ON u.tenant_id = r.tenant_id
+         WHERE r.code = 'ADMIN' AND u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'SALES_CREDIT'`,
+        [creditRole.role_id, creditRole.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'credit-forbidden')
+        .send({
+          customerId: customer.id,
+          lines: [{ productId, quantity: '1' }],
+          credit: { installmentCount: 1 },
+        })
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'SALES_CREDIT')`,
+        [creditRole.role_id, creditRole.tenant_id],
+      );
+
+      const payload = {
+        customerId: customer.id,
+        lines: [{ productId, quantity: '1' }],
+        credit: { installmentCount: 3 },
+      };
+      const attempts = await Promise.all(
+        ['credit-concurrent-a', 'credit-concurrent-b'].map((key) =>
+          request(app.getHttpServer())
+            .post('/api/v1/pos/sales')
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', key)
+            .send(payload),
+        ),
+      );
+      expect(attempts.map(({ status }) => status).sort()).toEqual([201, 409]);
+      expect(attempts.find(({ status }) => status === 409)?.body).toMatchObject(
+        {
+          code: 'CUSTOMER_CREDIT_LIMIT_EXCEEDED',
+          balance: '119.90',
+          limit: '150.00',
+        },
+      );
+      const completed = attempts.find(({ status }) => status === 201)!;
+      expect(completed.body).toMatchObject({
+        data: {
+          customer: { id: customer.id },
+          payment: {
+            method: 'CREDIT',
+            status: 'PENDING',
+            amountReceived: '0.00',
+            amountApplied: '119.90',
+          },
+          credit: {
+            originalAmount: '119.90',
+            balance: '119.90',
+            currency: 'MXN',
+            termDays: 30,
+            status: 'OPEN',
+            installments: [
+              { number: 1, amount: '39.97' },
+              { number: 2, amount: '39.97' },
+              { number: 3, amount: '39.96' },
+            ],
+          },
+        },
+      });
+      const successfulKey =
+        attempts[0].status === 201
+          ? 'credit-concurrent-a'
+          : 'credit-concurrent-b';
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', successfulKey)
+        .send(payload)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { idempotentReplay: true } });
+        });
+      await request(app.getHttpServer())
+        .get(`/api/v1/customers/${customer.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              credit: {
+                balance: '119.90',
+                available: '30.10',
+                overdueAmount: '0.00',
+              },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { expectedCash: '250.00' } });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/reports/sales-cash')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              summary: {
+                payments: [
+                  {
+                    method: 'CREDIT',
+                    status: 'PENDING',
+                    count: 1,
+                    amount: '119.90',
+                  },
+                ],
+                cash: { expected: '250.00' },
+                reconciliation: {
+                  salesNet: '119.90',
+                  paymentsApplied: '119.90',
+                  matches: true,
+                },
+              },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/reports/profitability')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              currencies: [
+                expect.objectContaining({
+                  currency: 'MXN',
+                  salesTotal: '119.90',
+                  paymentObligations: '119.90',
+                  creditSales: '119.90',
+                  salesMatchPayments: true,
+                }),
+              ],
+            },
+          });
+        });
+      const saleId = (completed.body as { data: { id: string } }).data.id;
+      await dataSource.query(
+        `UPDATE customer_credit_installments
+         SET due_date = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+         WHERE tenant_id = ? AND account_id = (
+           SELECT id FROM customer_credit_accounts WHERE tenant_id = ? AND sale_id = ?
+         ) AND installment_number = 1`,
+        [creditRole.tenant_id, creditRole.tenant_id, saleId],
+      );
+      await request(app.getHttpServer())
+        .get(`/api/v1/customers/${customer.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              credit: {
+                balance: '119.90',
+                overdueAmount: '39.97',
+                status: 'OVERDUE',
+              },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'credit-sale-void')
+        .send({ reason: 'Crédito capturado por error' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              status: 'VOIDED',
+              payment: { method: 'CREDIT', status: 'REVERSED' },
+              credit: { balance: '0.00', status: 'CANCELLED' },
+            },
+          });
+        });
+      const [state] = await dataSource.query<
+        Array<{
+          balance: string;
+          stock: string;
+          sales: number | string;
+          debits: number | string;
+          credits: number | string;
+        }>
+      >(
+        `SELECT
+          (SELECT COALESCE(SUM(CASE WHEN entry_type = 'DEBIT' THEN amount ELSE -amount END), 0)
+           FROM customer_debt_ledger WHERE customer_id = ?) AS balance,
+          (SELECT quantity FROM inventory_balances
+           WHERE product_id = ? AND location_id = ?) AS stock,
+          (SELECT COUNT(*) FROM sales WHERE customer_id = ?) AS sales,
+          (SELECT COUNT(*) FROM customer_debt_ledger
+           WHERE customer_id = ? AND entry_type = 'DEBIT') AS debits,
+          (SELECT COUNT(*) FROM customer_debt_ledger
+           WHERE customer_id = ? AND entry_type = 'CREDIT') AS credits`,
+        [
+          customer.id,
+          productId,
+          locationId,
+          customer.id,
+          customer.id,
+          customer.id,
+        ],
+      );
+      expect({
+        balance: state.balance,
+        stock: state.stock,
+        sales: Number(state.sales),
+        debits: Number(state.debits),
+        credits: Number(state.credits),
+      }).toEqual({
+        balance: '0.00',
+        stock: '5.000',
+        sales: 1,
+        debits: 1,
+        credits: 1,
+      });
+
+      const other = {
+        organizationName: 'Otro tenant crédito',
+        email: 'other-credit@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'other-credit-registration')
+        .send(other)
+        .expect(201);
+      const otherCookie = await createPersistedSession(other.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Otro tenant crédito Legal',
+          tradeName: 'Otro tenant crédito',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Sucursal crédito',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega crédito',
+          locationName: 'General crédito',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Caja crédito' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .patch(`/api/v1/customers/${customer.id}/credit`)
+        .set('Cookie', otherCookie)
+        .send({
+          enabled: true,
+          creditLimit: '999.00',
+          currency: 'MXN',
+          termDays: 30,
+          maxInstallments: 3,
+          version: 2,
+        })
+        .expect(404);
+    });
+
+    it('applies credit payments to installments and reverses them idempotently', async () => {
+      const { cookie, productId } = await preparePos();
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Cliente con abonos',
+          identifier: 'PAYMENTS-001',
+          dataProcessingConsent: false,
+        })
+        .expect(201);
+      const customer = (
+        customerResponse.body as { data: { id: string; version: number } }
+      ).data;
+      await request(app.getHttpServer())
+        .patch(`/api/v1/customers/${customer.id}/credit`)
+        .set('Cookie', cookie)
+        .send({
+          enabled: true,
+          creditLimit: '300.00',
+          currency: 'MXN',
+          termDays: 30,
+          maxInstallments: 3,
+          version: customer.version,
+        })
+        .expect(200);
+      const saleResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'credit-payment-source-sale')
+        .send({
+          customerId: customer.id,
+          lines: [{ productId, quantity: '1' }],
+          credit: { installmentCount: 3 },
+        })
+        .expect(201);
+      const sale = (
+        saleResponse.body as {
+          data: { id: string; credit: { accountId: string } };
+        }
+      ).data;
+      await dataSource.query(
+        `UPDATE customer_credit_installments
+         SET due_date = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+         WHERE tenant_id = (SELECT tenant_id FROM customers WHERE id = ?)
+           AND account_id = ? AND installment_number = 1`,
+        [customer.id, sale.credit.accountId],
+      );
+
+      const [creditRole] = await dataSource.query<
+        Array<{ role_id: string; tenant_id: string }>
+      >(
+        `SELECT role.id AS role_id, role.tenant_id FROM roles role
+         INNER JOIN users user ON user.tenant_id = role.tenant_id
+         WHERE role.code = 'ADMIN' AND user.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'SALES_CREDIT'`,
+        [creditRole.role_id, creditRole.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/customers/${customer.id}/credit/payments`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'credit-payment-forbidden')
+        .send({ amount: '20.00', method: 'CASH' })
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'SALES_CREDIT')`,
+        [creditRole.role_id, creditRole.tenant_id],
+      );
+
+      const cashPayment = await request(app.getHttpServer())
+        .post(`/api/v1/customers/${customer.id}/credit/payments`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'credit-payment-cash-partial')
+        .send({ amount: '20.00', method: 'CASH' })
+        .expect(201);
+      const cashPaymentBody = cashPayment.body as {
+        data: {
+          payment: { id: string; receiptNumber: string };
+          credit: {
+            accounts: Array<{
+              installments: Array<Record<string, unknown>>;
+            }>;
+          };
+        };
+      };
+      expect(cashPaymentBody.data.payment.receiptNumber).toMatch(
+        /^CP-[A-F0-9]{32}$/,
+      );
+      expect(cashPaymentBody).toMatchObject({
+        data: {
+          payment: {
+            amount: '20.00',
+            method: 'CASH',
+            status: 'COMPLETED',
+            allocations: [{ installmentNumber: 1, amount: '20.00' }],
+          },
+          credit: {
+            balance: '99.90',
+            overdueAmount: '19.97',
+            accounts: [
+              {
+                id: sale.credit.accountId,
+                balance: '99.90',
+                status: 'OVERDUE',
+              },
+            ],
+          },
+        },
+        meta: { idempotentReplay: false },
+      });
+      expect(cashPaymentBody.data.credit.accounts[0].installments).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            number: 1,
+            amount: '39.97',
+            paidAmount: '20.00',
+            balance: '19.97',
+            status: 'OVERDUE',
+          }),
+        ]),
+      );
+      const cashPaymentId = cashPaymentBody.data.payment.id;
+      await request(app.getHttpServer())
+        .post(`/api/v1/customers/${customer.id}/credit/payments`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'credit-payment-cash-partial')
+        .send({ amount: '20.00', method: 'CASH' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { payment: { id: cashPaymentId } },
+            meta: { idempotentReplay: true },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/customers/${customer.id}/credit/payments`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'credit-payment-over-balance')
+        .send({ amount: '100.00', method: 'CASH' })
+        .expect(409)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            code: 'CREDIT_PAYMENT_EXCEEDS_BALANCE',
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          const response = body as {
+            data: Array<{ reason: string }>;
+            meta: { expectedCash: string };
+          };
+          expect(body).toMatchObject({
+            data: [
+              {
+                type: 'INCOME',
+                amount: '20.00',
+              },
+            ],
+            meta: { expectedCash: '270.00' },
+          });
+          expect(response.data[0].reason).toMatch(/^Abono de crédito CP-/);
+        });
+
+      const transferPayment = await request(app.getHttpServer())
+        .post(`/api/v1/customers/${customer.id}/credit/payments`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'credit-payment-transfer-total')
+        .send({
+          amount: '99.90',
+          method: 'TRANSFER',
+          reference: 'TRANSFER-0001',
+        })
+        .expect(201);
+      expect(transferPayment.body).toMatchObject({
+        data: {
+          payment: {
+            amount: '99.90',
+            method: 'TRANSFER',
+            status: 'COMPLETED',
+          },
+          credit: {
+            balance: '0.00',
+            overdueAmount: '0.00',
+            accounts: [{ status: 'PAID', balance: '0.00' }],
+          },
+        },
+      });
+      const transferPaymentId = (
+        transferPayment.body as { data: { payment: { id: string } } }
+      ).data.payment.id;
+      await request(app.getHttpServer())
+        .get(`/api/v1/customers/${customer.id}/history`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              credit: {
+                balance: '0.00',
+                payments: [
+                  {
+                    id: transferPaymentId,
+                    method: 'TRANSFER',
+                    status: 'COMPLETED',
+                  },
+                  {
+                    id: cashPaymentId,
+                    method: 'CASH',
+                    status: 'COMPLETED',
+                  },
+                ],
+              },
+            },
+          });
+        });
+
+      const reversalPayload = { reason: 'Transferencia aplicada por error' };
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/customers/${customer.id}/credit/payments/${transferPaymentId}/reversal`,
+        )
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'credit-payment-transfer-reversal')
+        .send(reversalPayload)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              payment: { status: 'REVERSED', reversal: reversalPayload },
+              credit: { balance: '99.90', overdueAmount: '19.97' },
+            },
+            meta: { idempotentReplay: false },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/customers/${customer.id}/credit/payments/${transferPaymentId}/reversal`,
+        )
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'credit-payment-transfer-reversal')
+        .send(reversalPayload)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { idempotentReplay: true } });
+        });
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/customers/${customer.id}/credit/payments/${cashPaymentId}/reversal`,
+        )
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'credit-payment-cash-reversal')
+        .send({ reason: 'Efectivo devuelto al cliente' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              payment: { status: 'REVERSED' },
+              credit: { balance: '119.90', overdueAmount: '39.97' },
+            },
+          });
+        });
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { expectedCash: '250.00' } });
+        });
+      const [state] = await dataSource.query<
+        Array<{
+          payments: number | string;
+          allocations: number | string;
+          balance: string;
+          cash_movements: number | string;
+        }>
+      >(
+        `SELECT
+          (SELECT COUNT(*) FROM customer_credit_payments
+           WHERE customer_id = ?) AS payments,
+          (SELECT COUNT(*) FROM customer_credit_payment_allocations allocation
+           INNER JOIN customer_credit_payments payment
+             ON payment.id = allocation.payment_id
+            AND payment.tenant_id = allocation.tenant_id
+           WHERE payment.customer_id = ?) AS allocations,
+          (SELECT COALESCE(SUM(CASE WHEN entry_type = 'DEBIT'
+            THEN amount ELSE -amount END), 0)
+           FROM customer_debt_ledger WHERE customer_id = ?) AS balance,
+          (SELECT COUNT(*) FROM cash_register_movements
+           WHERE reason LIKE '%crédito%') AS cash_movements`,
+        [customer.id, customer.id, customer.id],
+      );
+      expect({
+        payments: Number(state.payments),
+        allocations: Number(state.allocations),
+        balance: state.balance,
+        cashMovements: Number(state.cash_movements),
+      }).toEqual({
+        payments: 2,
+        allocations: 4,
+        balance: '119.90',
+        cashMovements: 1,
+      });
+
+      const other = {
+        organizationName: 'Empresa ajena a abonos',
+        email: 'other-credit-payments@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'other-credit-payments-registration')
+        .send(other)
+        .expect(201);
+      const otherCookie = await createPersistedSession(other.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Empresa ajena a abonos Legal',
+          tradeName: 'Empresa ajena a abonos',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Sucursal ajena',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega ajena',
+          locationName: 'General ajena',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Caja ajena' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/customers/${customer.id}/credit`)
+        .set('Cookie', otherCookie)
+        .expect(404);
+      await request(app.getHttpServer())
+        .post(`/api/v1/customers/${customer.id}/credit/payments`)
+        .set('Cookie', otherCookie)
+        .set('Idempotency-Key', 'other-tenant-credit-payment')
+        .send({ amount: '10.00', method: 'CASH' })
         .expect(404);
     });
 
@@ -8448,6 +12079,15 @@ describe('UInventario API (e2e)', () => {
           'PRODUCT_RESERVATION_CONSUMED',
         ]),
       );
+      const [piiAudit] = await dataSource.query<
+        Array<{ total: number | string }>
+      >(
+        `SELECT COUNT(*) AS total FROM audit_events
+         WHERE after_data LIKE '%Calle Privada 123%'
+            OR after_data LIKE '%55 1234 9876%'
+            OR after_data LIKE '%Persona privada%'`,
+      );
+      expect(Number(piiAudit.total)).toBe(0);
     });
 
     it('opens one auditable register shift idempotently and requires it for POS operations', async () => {
@@ -9223,6 +12863,1079 @@ describe('UInventario API (e2e)', () => {
         });
     });
 
+    it('reprints an immutable non-fiscal receipt and sends it through the email simulator', async () => {
+      const { cookie, productId } = await preparePos();
+      const sale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'receipt-sale')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: '120.00',
+        })
+        .expect(201);
+      const saleId = (sale.body as { data: { id: string } }).data.id;
+      const [principal] = await dataSource.query<
+        Array<{ tenant_id: string; role_id: string }>
+      >(
+        `SELECT user.tenant_id, user_role.role_id FROM users user
+         INNER JOIN user_roles user_role
+           ON user_role.user_id = user.id AND user_role.tenant_id = user.tenant_id
+         WHERE user.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'SALE_REPRINT'`,
+        [principal.role_id, principal.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/receipt/reprints`)
+        .set('Cookie', cookie)
+        .expect(403)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PERMISSION_DENIED');
+        });
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'SALE_REPRINT')`,
+        [principal.role_id, principal.tenant_id],
+      );
+
+      await dataSource.query(
+        `UPDATE tenants SET name = 'Nombre nuevo', legal_name = 'Razón social nueva'
+         WHERE id = ?`,
+        [principal.tenant_id],
+      );
+      await dataSource.query(
+        `UPDATE cash_registers SET name = 'Caja renombrada' WHERE tenant_id = ?`,
+        [principal.tenant_id],
+      );
+      await dataSource.query(
+        `UPDATE sale_lines SET product_name = 'Producto alterado' WHERE sale_id = ?`,
+        [saleId],
+      );
+
+      for (const requestId of ['receipt-print-1', 'receipt-print-2']) {
+        await request(app.getHttpServer())
+          .post(`/api/v1/pos/sales/${saleId}/receipt/reprints`)
+          .set('Cookie', cookie)
+          .set('X-Request-Id', requestId)
+          .expect(200)
+          .expect(({ body }: { body: unknown }) => {
+            expect(body).toMatchObject({
+              data: {
+                saleId,
+                documentType: 'NON_FISCAL_SALE_RECEIPT',
+                fiscalNotice: 'COMPROBANTE NO FISCAL',
+                merchant: {
+                  name: 'Tienda POS',
+                  legalName: 'Tienda POS Legal',
+                  countryCode: 'MX',
+                },
+                branchName: 'Sucursal POS',
+                cashRegister: { name: 'Caja POS', code: 'MAIN' },
+                sellerEmail: registrationPayload.email,
+                currency: 'MXN',
+                lines: [
+                  {
+                    productName: 'Café POS',
+                    productSku: 'CAFE-POS',
+                    quantity: '1.000',
+                    unitPrice: '119.90',
+                    total: '119.90',
+                  },
+                ],
+                payments: [
+                  {
+                    method: 'CASH',
+                    amountReceived: '120.00',
+                    amountApplied: '119.90',
+                    change: '0.10',
+                  },
+                ],
+                totals: { subtotal: '103.36', tax: '16.54', total: '119.90' },
+                saleStatus: 'COMPLETED',
+              },
+              meta: { apiVersion: '1' },
+            });
+          });
+      }
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/receipt/deliveries`)
+        .set('Cookie', cookie)
+        .send({ email: 'no-es-correo' })
+        .expect(400);
+      const recipient = 'cliente.recibo@example.com';
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/receipt/deliveries`)
+        .set('Cookie', cookie)
+        .set('X-Request-Id', 'receipt-email-1')
+        .send({ email: recipient })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              receipt: { saleId, fiscalNotice: 'COMPROBANTE NO FISCAL' },
+              delivery: {
+                mode: 'SIMULATED',
+                channel: 'EMAIL',
+                recipient,
+              },
+            },
+          });
+        });
+
+      const foreignEmail = 'foreign.receipt@example.com';
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'receipt-foreign-registration')
+        .send({
+          organizationName: 'Comercio ajeno',
+          email: foreignEmail,
+          password: registrationPayload.password,
+        })
+        .expect(201);
+      const foreignCookie = await createPersistedSession(foreignEmail);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', foreignCookie)
+        .send({
+          legalName: 'Ajeno Legal',
+          tradeName: 'Ajeno',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', foreignCookie)
+        .send({
+          branchName: 'Sucursal ajena',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega ajena',
+          locationName: 'General ajena',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', foreignCookie)
+        .send({ name: 'Caja ajena' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/receipt/reprints`)
+        .set('Cookie', foreignCookie)
+        .expect(404);
+
+      const [state] = await dataSource.query<
+        Array<{
+          snapshots: number | string;
+          reprints: number | string;
+          sends: number | string;
+          send_data: string | { recipientHash: string };
+        }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM sale_receipt_snapshots WHERE sale_id = ?) AS snapshots,
+           (SELECT COUNT(*) FROM audit_events
+             WHERE action = 'SALE_RECEIPT_REPRINTED' AND entity_id = ?) AS reprints,
+           (SELECT COUNT(*) FROM audit_events
+             WHERE action = 'SALE_RECEIPT_SENT' AND entity_id = ?) AS sends,
+           (SELECT after_data FROM audit_events
+             WHERE action = 'SALE_RECEIPT_SENT' AND entity_id = ? LIMIT 1) AS send_data`,
+        [saleId, saleId, saleId, saleId],
+      );
+      const sendData =
+        typeof state.send_data === 'string'
+          ? (JSON.parse(state.send_data) as { recipientHash: string })
+          : state.send_data;
+      expect({
+        snapshots: Number(state.snapshots),
+        reprints: Number(state.reprints),
+        sends: Number(state.sends),
+      }).toEqual({ snapshots: 1, reprints: 2, sends: 1 });
+      expect(sendData.recipientHash).toBe(
+        createHash('sha256').update(recipient).digest('hex'),
+      );
+      expect(JSON.stringify(sendData)).not.toContain(recipient);
+    });
+
+    it('operates configured POS peripherals without duplicating sales and with safe retries', async () => {
+      const { cookie, productId } = await preparePos();
+      const sale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'peripheral-sale')
+        .send({ lines: [{ productId, quantity: '1' }], cashReceived: '120.00' })
+        .expect(201);
+      const saleId = (sale.body as { data: { id: string } }).data.id;
+
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/peripherals/profile')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              adapter: 'SIMULATOR',
+              printerEnabled: true,
+              drawerEnabled: true,
+              autoOpenCashSale: true,
+              cashRegister: { code: 'MAIN' },
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .put('/api/v1/pos/peripherals/profile')
+        .set('Cookie', cookie)
+        .send({
+          deviceId: 'FAIL-PRINTER-1',
+          label: 'Impresora simulada con fallo',
+          adapter: 'SIMULATOR',
+          printerEnabled: true,
+          drawerEnabled: true,
+          autoOpenCashSale: true,
+        })
+        .expect(200);
+
+      let failedOperationId = '';
+      for (const replay of [false, true]) {
+        await request(app.getHttpServer())
+          .post(`/api/v1/pos/peripherals/receipts/${saleId}/prints`)
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', 'peripheral-print-failure')
+          .expect(201)
+          .expect(
+            ({
+              body,
+            }: {
+              body: {
+                data: {
+                  operation: { id: string; status: string; errorCode: string };
+                };
+                meta: { idempotentReplay: boolean };
+              };
+            }) => {
+              failedOperationId ||= body.data.operation.id;
+              expect(body.data.operation).toMatchObject({
+                id: failedOperationId,
+                status: 'FAILED',
+                errorCode: 'DEVICE_UNAVAILABLE',
+              });
+              expect(body.meta.idempotentReplay).toBe(replay);
+            },
+          );
+      }
+
+      await request(app.getHttpServer())
+        .put('/api/v1/pos/peripherals/profile')
+        .set('Cookie', cookie)
+        .send({
+          deviceId: 'SIM-POS-1',
+          label: 'Impresora y cajon principal',
+          adapter: 'SIMULATOR',
+          printerEnabled: true,
+          drawerEnabled: true,
+          autoOpenCashSale: true,
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/peripherals/receipts/${saleId}/prints`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'peripheral-print-retry')
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              receipt: { saleId },
+              operation: { status: 'COMPLETED', deviceId: 'SIM-POS-1' },
+            },
+            meta: { idempotentReplay: false },
+          });
+        });
+
+      const [principal] = await dataSource.query<
+        Array<{ tenant_id: string; role_id: string }>
+      >(
+        `SELECT user.tenant_id, user_role.role_id FROM users user
+         INNER JOIN user_roles user_role
+           ON user_role.user_id = user.id AND user_role.tenant_id = user.tenant_id
+         WHERE user.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'CASH_DRAWER_OPEN'`,
+        [principal.role_id, principal.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/peripherals/cash-drawer/openings')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'drawer-without-permission')
+        .send({ trigger: 'CASH_SALE_COMPLETED', saleId })
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'CASH_DRAWER_OPEN')`,
+        [principal.role_id, principal.tenant_id],
+      );
+
+      for (const replay of [false, true]) {
+        await request(app.getHttpServer())
+          .post('/api/v1/pos/peripherals/cash-drawer/openings')
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', 'drawer-after-cash-sale')
+          .send({ trigger: 'CASH_SALE_COMPLETED', saleId })
+          .expect(201)
+          .expect(
+            ({
+              body,
+            }: {
+              body: { data: unknown; meta: { idempotentReplay: boolean } };
+            }) => {
+              expect(body.data).toMatchObject({
+                action: 'OPEN_DRAWER',
+                trigger: 'CASH_SALE_COMPLETED',
+                status: 'COMPLETED',
+                saleId,
+              });
+              expect(body.meta.idempotentReplay).toBe(replay);
+            },
+          );
+      }
+
+      const [state] = await dataSource.query<
+        Array<{
+          sales: number | string;
+          operations: number | string;
+          audits: number | string;
+          failed_device: string;
+        }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM sales WHERE id = ?) AS sales,
+           (SELECT COUNT(*) FROM pos_peripheral_operations WHERE tenant_id = ?) AS operations,
+           (SELECT COUNT(*) FROM audit_events
+             WHERE entity_type = 'POS_PERIPHERAL_OPERATION') AS audits,
+           (SELECT device_id FROM pos_peripheral_operations WHERE id = ?) AS failed_device`,
+        [saleId, principal.tenant_id, failedOperationId],
+      );
+      expect({
+        sales: Number(state.sales),
+        operations: Number(state.operations),
+        audits: Number(state.audits),
+        failedDevice: state.failed_device,
+      }).toEqual({
+        sales: 1,
+        operations: 3,
+        audits: 3,
+        failedDevice: 'FAIL-PRINTER-1',
+      });
+    });
+
+    it('sells, reports and returns an uncoded untracked product with controlled notes and price', async () => {
+      const { cookie } = await preparePos();
+      const created = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Servicio de envoltura',
+          withoutCode: true,
+          stockBehavior: 'UNTRACKED',
+          taxBehavior: 'EXEMPT',
+          cost: '2.00',
+          price: '10.00',
+          quantityPrecision: 0,
+          minimumQuantity: '1.000',
+        })
+        .expect(201);
+      const product = (
+        created.body as {
+          data: {
+            id: string;
+            sku: string;
+            withoutCode: boolean;
+            stockBehavior: string;
+            taxBehavior: string;
+          };
+        }
+      ).data;
+      expect(product).toMatchObject({
+        withoutCode: true,
+        stockBehavior: 'UNTRACKED',
+        taxBehavior: 'EXEMPT',
+      });
+      expect(product.sku).toMatch(/^NC-[A-F0-9]{12}$/);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/products')
+        .query({ q: 'envoltura' })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [{ id: product.id, withoutCode: true }],
+            meta: { pagination: { total: 1 } },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({
+          lines: [
+            {
+              productId: product.id,
+              quantity: '1',
+              note: 'Visible\u0000oculto',
+            },
+          ],
+        })
+        .expect(400);
+
+      const line = {
+        productId: product.id,
+        quantity: '1',
+        note: 'Entregar en mostrador',
+        manualUnitPrice: '15.00',
+        priceOverrideReason: 'Servicio personalizado',
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [line] })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  product: {
+                    id: product.id,
+                    withoutCode: true,
+                    stockBehavior: 'UNTRACKED',
+                    taxBehavior: 'EXEMPT',
+                  },
+                  note: line.note,
+                  unitPrice: line.manualUnitPrice,
+                  priceSource: 'MANUAL',
+                  priceOverrideReason: line.priceOverrideReason,
+                  tax: '0.00',
+                  total: '15.00',
+                },
+              ],
+              totals: { subtotal: '15.00', tax: '0.00', total: '15.00' },
+            },
+          });
+        });
+
+      const saleResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'uncoded-untracked-sale')
+        .send({ lines: [line], cashReceived: '20.00' })
+        .expect(201);
+      const sale = saleResponse.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+      expect(saleResponse.body).toMatchObject({
+        data: {
+          lines: [
+            {
+              note: line.note,
+              priceSource: 'MANUAL',
+              priceOverrideReason: line.priceOverrideReason,
+              product: { withoutCode: true, stockBehavior: 'UNTRACKED' },
+            },
+          ],
+        },
+      });
+      const [movementCount] = await dataSource.query<
+        Array<{ total: number | string }>
+      >(
+        'SELECT COUNT(*) AS total FROM inventory_movements WHERE sale_id = ? AND product_id = ?',
+        [sale.data.id, product.id],
+      );
+      expect(Number(movementCount.total)).toBe(0);
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${sale.data.id}/receipt/reprints`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  withoutCode: true,
+                  note: line.note,
+                  priceSource: 'MANUAL',
+                  priceOverrideReason: line.priceOverrideReason,
+                },
+              ],
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${sale.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'uncoded-untracked-return')
+        .send({
+          reason: 'Servicio cancelado',
+          lines: [
+            {
+              saleLineId: sale.data.lines[0].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              totals: { subtotal: '15.00', tax: '0.00', total: '15.00' },
+            },
+          });
+        });
+    });
+
+    it('returns sale quantities once, restores the right stock state and links an exchange', async () => {
+      const { cookie, productId, locationId } = await preparePos();
+      const original = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-return-original')
+        .send({
+          lines: [{ productId, quantity: '4' }],
+          cashReceived: '500.00',
+        })
+        .expect(201);
+      const originalData = original.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+      const exchange = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-return-exchange')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          cashReceived: '150.00',
+        })
+        .expect(201);
+      const exchangeId = (exchange.body as { data: { id: string } }).data.id;
+      const saleId = originalData.data.id;
+      const saleLineId = originalData.data.lines[0].id;
+      const [principal] = await dataSource.query<
+        Array<{ tenant_id: string; role_id: string }>
+      >(
+        `SELECT u.tenant_id, ur.role_id FROM users u
+         INNER JOIN user_roles ur
+           ON ur.user_id = u.id AND ur.tenant_id = u.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+
+      await dataSource.query(
+        `DELETE FROM role_permissions
+         WHERE role_id = ? AND tenant_id = ? AND permission = 'SALES_RETURN'`,
+        [principal.role_id, principal.tenant_id],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-return-no-permission')
+        .send({
+          reason: 'Cliente solicita cambio',
+          lines: [{ saleLineId, quantity: '1', condition: 'SELLABLE' }],
+        })
+        .expect(403);
+      await dataSource.query(
+        `INSERT INTO role_permissions (role_id, tenant_id, permission)
+         VALUES (?, ?, 'SALES_RETURN')`,
+        [principal.role_id, principal.tenant_id],
+      );
+
+      const firstPayload = {
+        reason: 'Cliente solicita cambio de presentación',
+        exchangeSaleId: exchangeId,
+        lines: [{ saleLineId, quantity: '1', condition: 'SELLABLE' }],
+      };
+      const first = await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/returns`)
+        .set('Cookie', cookie)
+        .set('X-Request-Id', 'sale-return-first-audit')
+        .set('Idempotency-Key', 'sale-return-first')
+        .send(firstPayload)
+        .expect(201);
+      expect(first.body).toMatchObject({
+        data: {
+          saleId,
+          exchangeSale: { id: exchangeId },
+          settlementStatus: 'PENDING',
+          reason: firstPayload.reason,
+          lines: [
+            {
+              saleLineId,
+              quantity: '1.000',
+              condition: 'SELLABLE',
+            },
+          ],
+        },
+        meta: { idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-return-first')
+        .send(firstPayload)
+        .expect(201)
+        .expect(
+          ({ body }: { body: { meta: { idempotentReplay: boolean } } }) => {
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+
+      const concurrent = await Promise.all(
+        ['sale-return-concurrent-a', 'sale-return-concurrent-b'].map((key) =>
+          request(app.getHttpServer())
+            .post(`/api/v1/pos/sales/${saleId}/returns`)
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', key)
+            .send({
+              reason: 'Producto abierto y dañado',
+              lines: [{ saleLineId, quantity: '2', condition: 'DAMAGED' }],
+            }),
+        ),
+      );
+      expect(concurrent.map(({ status }) => status).sort()).toEqual([201, 409]);
+      expect(
+        concurrent.find(({ status }) => status === 409)?.body,
+      ).toMatchObject({
+        code: 'SALE_RETURN_QUANTITY_EXCEEDED',
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-return-over-limit')
+        .send({
+          reason: 'Intento por encima del remanente',
+          lines: [{ saleLineId, quantity: '2', condition: 'SELLABLE' }],
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SALE_RETURN_QUANTITY_EXCEEDED');
+        });
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/void`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'sale-void-after-return')
+        .send({ reason: 'No debe anular tras devolver' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SALE_VOID_NOT_ALLOWED');
+        });
+
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${saleId}/returns`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toHaveLength(2);
+        });
+      const [state] = await dataSource.query<
+        Array<{
+          returns: number | string;
+          return_lines: number | string;
+          return_movements: number | string;
+          available_quantity: string;
+          damaged_quantity: string;
+          quantity: string;
+          valuation_quantity: string;
+          fifo_quantity: string;
+          audits: number | string;
+        }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM sale_returns WHERE sale_id = ?) AS returns,
+           (SELECT COUNT(*) FROM sale_return_lines srl
+             INNER JOIN sale_returns sr ON sr.id = srl.sale_return_id
+             WHERE sr.sale_id = ?) AS return_lines,
+           (SELECT COUNT(*) FROM inventory_movements
+             WHERE sale_id = ? AND type = 'SALE_RETURN') AS return_movements,
+           ib.available_quantity, ib.damaged_quantity, ib.quantity,
+           iv.quantity AS valuation_quantity,
+           (SELECT COALESCE(SUM(remaining_quantity), 0)
+              FROM inventory_fifo_layers WHERE product_id = ?) AS fifo_quantity,
+           (SELECT COUNT(*) FROM audit_events
+              WHERE action = 'SALE_RETURNED') AS audits
+         FROM inventory_balances ib
+         INNER JOIN inventory_valuations iv
+           ON iv.tenant_id = ib.tenant_id AND iv.product_id = ib.product_id
+         WHERE ib.product_id = ? AND ib.location_id = ?`,
+        [saleId, saleId, saleId, productId, productId, locationId],
+      );
+      expect({
+        returns: Number(state.returns),
+        returnLines: Number(state.return_lines),
+        returnMovements: Number(state.return_movements),
+        available: state.available_quantity,
+        damaged: state.damaged_quantity,
+        quantity: state.quantity,
+        valuation: state.valuation_quantity,
+        fifo: state.fifo_quantity,
+        audits: Number(state.audits),
+      }).toEqual({
+        returns: 2,
+        returnLines: 2,
+        returnMovements: 2,
+        available: '1.000',
+        damaged: '2.000',
+        quantity: '3.000',
+        valuation: '3.000',
+        fifo: '3.000',
+        audits: 2,
+      });
+      await request(app.getHttpServer())
+        .get('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .query({ productId, type: 'SALE_RETURN' })
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) => {
+          expect(body.data).toHaveLength(2);
+          expect(body.data[0]).toMatchObject({
+            type: 'SALE_RETURN',
+            direction: 'IN',
+            responsible: { email: registrationPayload.email },
+            document: { type: 'SALE_RETURN' },
+          });
+        });
+    });
+
+    it('settles returns partially, credits customers and records failed provider refunds once', async () => {
+      const { cookie, productId } = await preparePos();
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Cliente con saldo',
+          identifier: 'CREDIT-001',
+          dataProcessingConsent: false,
+        })
+        .expect(201);
+      const customerId = (customerResponse.body as { data: { id: string } })
+        .data.id;
+
+      const cashSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'settlement-cash-sale')
+        .send({
+          customerId,
+          lines: [{ productId, quantity: '2' }],
+          cashReceived: '240.00',
+        })
+        .expect(201);
+      const cashSaleData = cashSale.body as {
+        data: {
+          id: string;
+          lines: Array<{ id: string }>;
+          payments: Array<{ id: string }>;
+        };
+      };
+      const cashReturn = await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${cashSaleData.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'settlement-cash-return')
+        .send({
+          reason: 'DevoluciÃ³n completa con liquidaciÃ³n mixta',
+          lines: [
+            {
+              saleLineId: cashSaleData.data.lines[0].id,
+              quantity: '2',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201);
+      const cashReturnId = (cashReturn.body as { data: { id: string } }).data
+        .id;
+      const partialPayload = {
+        mode: 'REFUND',
+        amount: '100.00',
+        originalPaymentId: cashSaleData.data.payments[0].id,
+      };
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/sales/${cashSaleData.data.id}/returns/${cashReturnId}/settlements`,
+        )
+        .set('Cookie', cookie)
+        .set('X-Request-Id', 'return-settlement-partial-audit')
+        .set('Idempotency-Key', 'return-settlement-partial')
+        .send(partialPayload)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              saleReturn: {
+                id: cashReturnId,
+                settlementStatus: 'PARTIALLY_SETTLED',
+                refundableAmount: '139.80',
+              },
+              settlement: {
+                mode: 'REFUND',
+                method: 'CASH',
+                status: 'COMPLETED',
+                amount: '100.00',
+                originalPayment: { id: cashSaleData.data.payments[0].id },
+              },
+            },
+            meta: { idempotentReplay: false },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/sales/${cashSaleData.data.id}/returns/${cashReturnId}/settlements`,
+        )
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'return-settlement-partial')
+        .send(partialPayload)
+        .expect(201)
+        .expect(
+          ({ body }: { body: { meta: { idempotentReplay: boolean } } }) => {
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/sales/${cashSaleData.data.id}/returns/${cashReturnId}/settlements`,
+        )
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'return-settlement-over-limit')
+        .send({ ...partialPayload, amount: '140.00' })
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('SALE_RETURN_SETTLEMENT_EXCEEDS_BALANCE');
+        });
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/sales/${cashSaleData.data.id}/returns/${cashReturnId}/settlements`,
+        )
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'return-settlement-credit')
+        .send({ mode: 'STORE_CREDIT', amount: '139.80' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              saleReturn: {
+                settlementStatus: 'SETTLED',
+                refundableAmount: '0.00',
+              },
+              settlement: {
+                mode: 'STORE_CREDIT',
+                method: 'STORE_CREDIT',
+                status: 'COMPLETED',
+                amount: '139.80',
+              },
+            },
+          });
+        });
+
+      const cardSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'settlement-card-sale')
+        .send({
+          lines: [{ productId, quantity: '1' }],
+          payment: { method: 'CARD', reference: 'FAIL-REFUND-CARD-001' },
+        })
+        .expect(201);
+      const cardSaleData = cardSale.body as {
+        data: {
+          id: string;
+          lines: Array<{ id: string }>;
+          payments: Array<{ id: string }>;
+        };
+      };
+      const cardReturn = await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${cardSaleData.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'settlement-card-return')
+        .send({
+          reason: 'Proveedor simula fallo del reembolso',
+          lines: [
+            {
+              saleLineId: cardSaleData.data.lines[0].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201);
+      const cardReturnId = (cardReturn.body as { data: { id: string } }).data
+        .id;
+      const failedPayload = {
+        mode: 'REFUND',
+        amount: '119.90',
+        originalPaymentId: cardSaleData.data.payments[0].id,
+      };
+      for (const replay of [false, true]) {
+        await request(app.getHttpServer())
+          .post(
+            `/api/v1/pos/sales/${cardSaleData.data.id}/returns/${cardReturnId}/settlements`,
+          )
+          .set('Cookie', cookie)
+          .set('Idempotency-Key', 'return-settlement-provider-failure')
+          .send(failedPayload)
+          .expect(201)
+          .expect(({ body }: { body: unknown }) => {
+            expect(body).toMatchObject({
+              data: {
+                saleReturn: {
+                  settlementStatus: 'PENDING',
+                  refundableAmount: '119.90',
+                },
+                settlement: {
+                  method: 'CARD',
+                  status: 'FAILED',
+                  failureCode: 'SIMULATED_REFUND_FAILURE',
+                },
+              },
+              meta: { idempotentReplay: replay },
+            });
+          });
+      }
+
+      const foreignEmail = 'foreign.settlement@example.com';
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'settlement-foreign-registration')
+        .send({
+          organizationName: 'Comercio externo',
+          email: foreignEmail,
+          password: registrationPayload.password,
+        })
+        .expect(201);
+      const foreignCookie = await createPersistedSession(foreignEmail);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', foreignCookie)
+        .send({
+          legalName: 'Comercio externo legal',
+          tradeName: 'Externo',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', foreignCookie)
+        .send({
+          branchName: 'Sucursal externa',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega externa',
+          locationName: 'General externa',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', foreignCookie)
+        .send({ name: 'Caja externa' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/sales/${cashSaleData.data.id}/returns/${cashReturnId}/settlements`,
+        )
+        .set('Cookie', foreignCookie)
+        .set('Idempotency-Key', 'settlement-foreign-attempt')
+        .send({ mode: 'STORE_CREDIT', amount: '1.00' })
+        .expect(404);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/pos/register-shifts/current/movements')
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ meta: { expectedCash: '389.80' } });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/register-shifts/current/closure')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'return-settlement-close-shift')
+        .send({ countedAmount: '389.80' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { expectedCash: '389.80', difference: '0.00' },
+          });
+        });
+      await request(app.getHttpServer())
+        .post(
+          `/api/v1/pos/sales/${cashSaleData.data.id}/returns/${cashReturnId}/settlements`,
+        )
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'return-settlement-partial')
+        .send(partialPayload)
+        .expect(201)
+        .expect(
+          ({ body }: { body: { meta: { idempotentReplay: boolean } } }) => {
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+      const [state] = await dataSource.query<
+        Array<{
+          settlements: number | string;
+          credits: number | string;
+          credit_amount: string;
+          completed_audits: number | string;
+          failed_audits: number | string;
+        }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM sale_return_settlements) AS settlements,
+           (SELECT COUNT(*) FROM customer_credit_ledger
+             WHERE tenant_id = ? AND customer_id = ?) AS credits,
+           (SELECT COALESCE(SUM(amount), 0) FROM customer_credit_ledger
+             WHERE tenant_id = ? AND customer_id = ?) AS credit_amount,
+           (SELECT COUNT(*) FROM audit_events
+             WHERE action = 'SALE_RETURN_SETTLED') AS completed_audits,
+           (SELECT COUNT(*) FROM audit_events
+             WHERE action = 'SALE_RETURN_SETTLEMENT_FAILED') AS failed_audits`,
+        [
+          (
+            await dataSource.query<Array<{ tenant_id: string }>>(
+              'SELECT tenant_id FROM customers WHERE id = ?',
+              [customerId],
+            )
+          )[0].tenant_id,
+          customerId,
+          (
+            await dataSource.query<Array<{ tenant_id: string }>>(
+              'SELECT tenant_id FROM customers WHERE id = ?',
+              [customerId],
+            )
+          )[0].tenant_id,
+          customerId,
+        ],
+      );
+      expect({
+        settlements: Number(state.settlements),
+        credits: Number(state.credits),
+        creditAmount: state.credit_amount,
+        completedAudits: Number(state.completed_audits),
+        failedAudits: Number(state.failed_audits),
+      }).toEqual({
+        settlements: 3,
+        credits: 1,
+        creditAmount: '139.80',
+        completedAudits: 2,
+        failedAudits: 1,
+      });
+    });
+
     it('voids a sale once with payment, stock, cash and audit compensation', async () => {
       const { cookie, productId, locationId } = await preparePos();
       const sale = await request(app.getHttpServer())
@@ -9533,6 +14246,21 @@ describe('UInventario API (e2e)', () => {
         .set('Cookie', cookie)
         .set('Idempotency-Key', 'pos-void-branch-scope')
         .send({ reason: 'No debe revelar la venta' })
+        .expect(404);
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${saleId}/returns`)
+        .set('Cookie', cookie)
+        .expect(404);
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${saleId}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'pos-return-branch-scope')
+        .send({
+          reason: 'No debe revelar la venta',
+          lines: [
+            { saleLineId: randomUUID(), quantity: '1', condition: 'SELLABLE' },
+          ],
+        })
         .expect(404);
     });
 
@@ -12738,6 +17466,47 @@ describe('UInventario API (e2e)', () => {
           },
         );
 
+      const partialLotSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-partial-return-sale')
+        .send({
+          lines: [{ productId, lotId: lotB.id, quantity: '2' }],
+          payment: { method: 'CASH', amountReceived: '20.00' },
+        })
+        .expect(201);
+      const partialLotSaleData = partialLotSale.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${partialLotSaleData.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'lot-partial-return')
+        .send({
+          reason: 'Una unidad regresa en buen estado',
+          lines: [
+            {
+              saleLineId: partialLotSaleData.data.lines[0].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/products/${productId}/lots`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: [
+              { code: 'LOT-A', quantity: '3.000' },
+              { code: 'LOT-B', quantity: '3.000' },
+            ],
+            meta: { totalQuantity: '6.000', reconciled: true },
+          }),
+        );
+
       const isolated = {
         organizationName: 'Otro tenant lotes',
         email: 'otro-lotes@example.com',
@@ -12977,6 +17746,68 @@ describe('UInventario API (e2e)', () => {
               { type: 'STATE_TRANSITION', toStatus: 'AVAILABLE' },
               { type: 'SALE', toStatus: 'SOLD' },
               { type: 'SALE_VOID', toStatus: 'AVAILABLE' },
+            ]);
+          },
+        );
+
+      const returnableSerialSale = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-return-sale')
+        .send({
+          lines: [
+            {
+              productId,
+              quantity: '1',
+              serialNumbers: ['SN-0001'],
+            },
+          ],
+          payment: { method: 'CASH', amountReceived: '150.00' },
+        })
+        .expect(201);
+      const returnableSerialSaleData = returnableSerialSale.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${returnableSerialSaleData.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'serial-return')
+        .send({
+          reason: 'Equipo devuelto con serie verificada',
+          lines: [
+            {
+              saleLineId: returnableSerialSaleData.data.lines[0].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+              serialNumbers: ['sn-0001'],
+            },
+          ],
+        })
+        .expect(201);
+      await request(app.getHttpServer())
+        .get(`/api/v1/inventory/serials/${serialId}/history`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: {
+                serial: { status: string };
+                events: Array<{ movement: { type: string }; toStatus: string }>;
+              };
+            };
+          }) => {
+            expect(body.data.serial.status).toBe('AVAILABLE');
+            expect(
+              body.data.events.slice(-2).map(({ movement, toStatus }) => ({
+                type: movement.type,
+                toStatus,
+              })),
+            ).toEqual([
+              { type: 'SALE', toStatus: 'SOLD' },
+              { type: 'SALE_RETURN', toStatus: 'AVAILABLE' },
             ]);
           },
         );
@@ -13354,6 +18185,1066 @@ describe('UInventario API (e2e)', () => {
           serialNumbers: ['REC-SN-003'],
         })
         .expect(201);
+    });
+  });
+
+  describe('customer order lifecycle', () => {
+    beforeEach(resetIdentityData);
+
+    it('reserves, prepares and delivers once while cancellation compensates stock and tenants stay isolated', async () => {
+      await registerAccount('order-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Pedidos SA',
+          tradeName: 'Pedidos',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega Principal',
+          locationName: 'General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Principal' })
+        .expect(200);
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l
+         INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      const product = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Pedido preparado',
+          sku: 'ORD-001',
+          cost: '40',
+          price: '100',
+        })
+        .expect(201);
+      const productId = (product.body as { data: { id: string } }).data.id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-stock')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '5',
+          reason: 'Stock para pedidos',
+        })
+        .expect(201);
+      const customer = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({ name: 'Cliente de pedidos', dataProcessingConsent: false })
+        .expect(201);
+      const customerId = (customer.body as { data: { id: string } }).data.id;
+      await openCurrentCashRegister(cookie, 'order-open-shift', '200.00');
+
+      const pickupWindowStart = new Date(
+        Date.now() + 60 * 60_000,
+      ).toISOString();
+      const pickupWindowEnd = new Date(
+        Date.now() + 3 * 60 * 60_000,
+      ).toISOString();
+
+      const orderPayload = {
+        channel: 'WEB',
+        customerId,
+        locationId: location.id,
+        priority: 'HIGH',
+        expiresInHours: 48,
+        fulfillment: {
+          method: 'PICKUP',
+          deliveryCost: '0.00',
+          windowStart: pickupWindowStart,
+          windowEnd: pickupWindowEnd,
+        },
+        lines: [{ productId, quantity: '2' }],
+        payments: [{ method: 'CASH', amountReceived: '500.00' }],
+      };
+      const created = await request(app.getHttpServer())
+        .post('/api/v1/orders')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-create-main')
+        .send(orderPayload)
+        .expect(201);
+      const createdData = created.body as {
+        data: { id: string; version: number; totals: { total: string } };
+      };
+      expect(created.body).toMatchObject({
+        data: {
+          channel: 'WEB',
+          priority: 'HIGH',
+          status: 'DRAFT',
+          customer: { id: customerId },
+          lines: [{ product: { id: productId }, quantity: '2.000' }],
+          payments: [{ method: 'CASH', status: 'PLANNED' }],
+          reservation: null,
+          sale: null,
+          fulfillment: {
+            method: 'PICKUP',
+            status: 'PENDING',
+            deliveryCost: '0.00',
+            address: null,
+            carrier: null,
+          },
+        },
+        meta: { idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .post('/api/v1/orders')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-create-main')
+        .send(orderPayload)
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: { id: string }; meta: { idempotentReplay: boolean } };
+          }) => {
+            expect(body.data.id).toBe(createdData.data.id);
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+
+      const confirmed = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${createdData.data.id}/confirm`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-confirm-main')
+        .send({ version: createdData.data.version })
+        .expect(201);
+      const confirmedData = confirmed.body as {
+        data: { version: number; reservation: { id: string; status: string } };
+      };
+      expect(confirmed.body).toMatchObject({
+        data: { status: 'CONFIRMED', reservation: { status: 'ACTIVE' } },
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${createdData.data.id}/confirm`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-confirm-main')
+        .send({ version: createdData.data.version })
+        .expect(201)
+        .expect(({ body }: { body: { meta: { idempotentReplay: boolean } } }) =>
+          expect(body.meta.idempotentReplay).toBe(true),
+        );
+
+      const prepareAttempts = await Promise.all(
+        ['order-prepare-a', 'order-prepare-b'].map((key) =>
+          request(app.getHttpServer())
+            .post(`/api/v1/orders/${createdData.data.id}/prepare`)
+            .set('Cookie', cookie)
+            .set('Idempotency-Key', key)
+            .send({ version: confirmedData.data.version }),
+        ),
+      );
+      expect(prepareAttempts.map(({ status }) => status).sort()).toEqual([
+        201, 409,
+      ]);
+      const prepared = prepareAttempts.find(({ status }) => status === 201)!
+        .body as {
+        data: { version: number };
+      };
+      const ready = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${createdData.data.id}/ready`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-ready-main')
+        .send({ version: prepared.data.version })
+        .expect(201);
+      const readyData = ready.body as { data: { version: number } };
+      const delivered = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${createdData.data.id}/deliver`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-deliver-main')
+        .send({ version: readyData.data.version })
+        .expect(201);
+      expect(delivered.body).toMatchObject({
+        data: {
+          status: 'DELIVERED',
+          reservation: { status: 'CONSUMED' },
+          payments: [{ status: 'COMPLETED' }],
+        },
+      });
+      expect(
+        (delivered.body as { data: { sale: { receiptNumber: string } } }).data
+          .sale.receiptNumber,
+      ).toMatch(/^V-/);
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${createdData.data.id}/deliver`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-deliver-main')
+        .send({ version: readyData.data.version })
+        .expect(201)
+        .expect(({ body }: { body: { meta: { idempotentReplay: boolean } } }) =>
+          expect(body.meta.idempotentReplay).toBe(true),
+        );
+
+      const deliveryWindowStart = new Date(
+        Date.now() + 4 * 60 * 60_000,
+      ).toISOString();
+      const deliveryWindowEnd = new Date(
+        Date.now() + 6 * 60 * 60_000,
+      ).toISOString();
+      const delivery = await request(app.getHttpServer())
+        .post('/api/v1/orders')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-create-delivery')
+        .send({
+          ...orderPayload,
+          lines: [{ productId, quantity: '1' }],
+          fulfillment: {
+            method: 'DELIVERY',
+            deliveryCost: '85.50',
+            windowStart: deliveryWindowStart,
+            windowEnd: deliveryWindowEnd,
+            recipientName: 'Persona privada',
+            recipientPhone: '+52 55 1234 9876',
+            addressLine1: 'Calle Privada 123',
+            addressLine2: 'Interior 4',
+            city: 'Ciudad de México',
+            region: 'CDMX',
+            postalCode: '01000',
+            countryCode: 'MX',
+            carrierCode: 'SIMULATED_RETRY',
+          },
+        })
+        .expect(201);
+      const deliveryCreated = delivery.body as {
+        data: { id: string; version: number };
+      };
+      expect(JSON.stringify(delivery.body)).not.toContain('Calle Privada 123');
+      expect(JSON.stringify(delivery.body)).not.toContain('+52 55 1234 9876');
+      expect(delivery.body).toMatchObject({
+        data: {
+          fulfillment: {
+            method: 'DELIVERY',
+            status: 'PENDING',
+            deliveryCost: '85.50',
+            address: {
+              recipientNameMasked: 'P***',
+              phoneMasked: '***9876',
+              summary: 'Ciudad de México, CDMX, MX',
+            },
+            carrier: { code: 'SIMULATED_RETRY', attempts: 0 },
+          },
+        },
+      });
+      const deliveryConfirmed = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/confirm`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-confirm')
+        .send({ version: deliveryCreated.data.version })
+        .expect(201);
+      const deliveryConfirmedData = deliveryConfirmed.body as {
+        data: { version: number };
+      };
+      const deliveryPrepared = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/prepare`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-prepare')
+        .send({ version: deliveryConfirmedData.data.version })
+        .expect(201);
+      const deliveryPreparedData = deliveryPrepared.body as {
+        data: {
+          version: number;
+          fulfillment: {
+            responsible: { preparation: { email: string } | null };
+          };
+        };
+      };
+      expect(
+        deliveryPreparedData.data.fulfillment.responsible.preparation,
+      ).toMatchObject({
+        email: registrationPayload.email,
+      });
+      const deliveryReady = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/ready`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-ready')
+        .send({ version: deliveryPreparedData.data.version })
+        .expect(201);
+      const deliveryReadyData = deliveryReady.body as {
+        data: { version: number };
+      };
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/deliver`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-too-soon')
+        .send({ version: deliveryReadyData.data.version })
+        .expect(409);
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/dispatch`)
+        .set('Idempotency-Key', 'order-delivery-no-session')
+        .send({ version: deliveryReadyData.data.version })
+        .expect(401);
+      const carrierQuote = await request(app.getHttpServer())
+        .post(`/api/v1/shipping/v1/orders/${deliveryCreated.data.id}/quote`)
+        .set('Cookie', cookie)
+        .expect(201);
+      const carrierQuoteData = carrierQuote.body as {
+        data: { quoteReference: string; service: string; currency: string };
+      };
+      expect(carrierQuote.body).toMatchObject({
+        data: {
+          service: 'SIMULATED_STANDARD',
+          currency: 'MXN',
+        },
+      });
+      expect(carrierQuoteData.data.quoteReference).toMatch(/^QUOTE-O-/);
+      expect(JSON.stringify(carrierQuote.body)).not.toContain(
+        'Calle Privada 123',
+      );
+      expect(JSON.stringify(carrierQuote.body)).not.toContain(
+        '+52 55 1234 9876',
+      );
+      const failedDispatch = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/dispatch`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-dispatch-1')
+        .send({ version: deliveryReadyData.data.version })
+        .expect(201);
+      const failedDispatchData = failedDispatch.body as {
+        data: { version: number };
+      };
+      expect(failedDispatch.body).toMatchObject({
+        data: {
+          status: 'READY',
+          fulfillment: {
+            status: 'RETRYABLE_FAILURE',
+            carrier: {
+              attempts: 1,
+              lastErrorCode: 'SIMULATED_CARRIER_TIMEOUT',
+            },
+          },
+        },
+        meta: { idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/dispatch`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-dispatch-1')
+        .send({ version: deliveryReadyData.data.version })
+        .expect(201)
+        .expect(({ body }: { body: { meta: { idempotentReplay: boolean } } }) =>
+          expect(body.meta.idempotentReplay).toBe(true),
+        );
+      const dispatched = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/dispatch`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-dispatch-2')
+        .send({ version: failedDispatchData.data.version })
+        .expect(201);
+      const dispatchedData = dispatched.body as {
+        data: {
+          version: number;
+          fulfillment: {
+            carrier: {
+              trackingReference: string | null;
+              label: { payload: string };
+            };
+          };
+        };
+      };
+      expect(dispatched.body).toMatchObject({
+        data: {
+          fulfillment: {
+            status: 'DISPATCHED',
+            carrier: {
+              attempts: 2,
+              providerVersion: '1',
+              trackingStatus: 'LABEL_READY',
+              label: { format: 'ZPL' },
+              lastErrorCode: null,
+            },
+          },
+        },
+      });
+      expect(dispatchedData.data.fulfillment.carrier.trackingReference).toMatch(
+        /^SIM-O-/,
+      );
+      expect(dispatchedData.data.fulfillment.carrier.label.payload).toContain(
+        '^XA',
+      );
+      expect(JSON.stringify(dispatched.body)).not.toContain(
+        'Calle Privada 123',
+      );
+
+      const cancelTimeout = await request(app.getHttpServer())
+        .post(`/api/v1/shipping/v1/orders/${deliveryCreated.data.id}/cancel`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-carrier-cancel-timeout')
+        .send({ scenario: 'TIMEOUT' })
+        .expect(201);
+      expect(cancelTimeout.body).toMatchObject({
+        data: {
+          status: 'READY',
+          fulfillment: {
+            status: 'DISPATCHED',
+            carrier: {
+              trackingStatus: 'LABEL_READY',
+              manualActionRequired: true,
+              lastErrorCode: 'SIMULATED_CARRIER_CANCEL_TIMEOUT',
+            },
+          },
+        },
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/shipping/v1/orders/${deliveryCreated.data.id}/cancel`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-carrier-cancel-timeout')
+        .send({ scenario: 'TIMEOUT' })
+        .expect(201)
+        .expect(({ body }: { body: { meta: { idempotentReplay: boolean } } }) =>
+          expect(body.meta.idempotentReplay).toBe(true),
+        );
+
+      const polled = await request(app.getHttpServer())
+        .post(`/api/v1/shipping/v1/orders/${deliveryCreated.data.id}/poll`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-carrier-poll-transit')
+        .send({ scenario: 'IN_TRANSIT' })
+        .expect(201);
+      expect(polled.body).toMatchObject({
+        data: {
+          fulfillment: {
+            carrier: {
+              trackingStatus: 'IN_TRANSIT',
+              latestEventSequence: 1,
+              manualActionRequired: false,
+            },
+          },
+        },
+        meta: { eventApplied: true, idempotentReplay: false },
+      });
+
+      const deliveredEvent = {
+        providerEventId: 'carrier-event-delivered-20',
+        trackingReference:
+          dispatchedData.data.fulfillment.carrier.trackingReference!,
+        status: 'DELIVERED',
+        sequence: 20,
+        occurredAt: new Date().toISOString(),
+      };
+      await request(app.getHttpServer())
+        .post(`/api/v1/shipping/v1/orders/${deliveryCreated.data.id}/events`)
+        .set('Cookie', cookie)
+        .send(deliveredEvent)
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: { fulfillment: CustomerOrderData['fulfillment'] };
+              meta: { eventApplied: boolean };
+            };
+          }) => {
+            expect(body.meta.eventApplied).toBe(true);
+            expect(body.data.fulfillment.carrier?.trackingStatus).toBe(
+              'DELIVERED',
+            );
+          },
+        );
+      await request(app.getHttpServer())
+        .post(`/api/v1/shipping/v1/orders/${deliveryCreated.data.id}/events`)
+        .set('Cookie', cookie)
+        .send(deliveredEvent)
+        .expect(201)
+        .expect(({ body }: { body: { meta: { idempotentReplay: boolean } } }) =>
+          expect(body.meta.idempotentReplay).toBe(true),
+        );
+      await request(app.getHttpServer())
+        .post(`/api/v1/shipping/v1/orders/${deliveryCreated.data.id}/events`)
+        .set('Cookie', cookie)
+        .send({
+          providerEventId: 'carrier-event-old-transit-10',
+          trackingReference:
+            dispatchedData.data.fulfillment.carrier.trackingReference!,
+          status: 'IN_TRANSIT',
+          sequence: 10,
+          occurredAt: new Date(Date.now() - 60_000).toISOString(),
+        })
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: { fulfillment: CustomerOrderData['fulfillment'] };
+              meta: { eventApplied: boolean };
+            };
+          }) => {
+            expect(body.meta.eventApplied).toBe(false);
+            expect(body.data.fulfillment.carrier?.trackingStatus).toBe(
+              'DELIVERED',
+            );
+            expect(body.data.fulfillment.carrier?.latestEventSequence).toBe(20);
+          },
+        );
+      const deliveredDispatch = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${deliveryCreated.data.id}/deliver`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-delivery-complete')
+        .send({ version: dispatchedData.data.version })
+        .expect(201);
+      expect(deliveredDispatch.body).toMatchObject({
+        data: {
+          status: 'DELIVERED',
+          fulfillment: {
+            status: 'DELIVERED',
+            responsible: {
+              delivery: { email: registrationPayload.email },
+            },
+          },
+        },
+      });
+
+      const cancellable = await request(app.getHttpServer())
+        .post('/api/v1/orders')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-create-cancel')
+        .send({
+          ...orderPayload,
+          lines: [{ productId, quantity: '1' }],
+          payments: [{ method: 'CASH', amountReceived: '500.00' }],
+        })
+        .expect(201);
+      const cancellableData = cancellable.body as {
+        data: { id: string; version: number };
+      };
+      const cancellableConfirmed = await request(app.getHttpServer())
+        .post(`/api/v1/orders/${cancellableData.data.id}/confirm`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-confirm-cancel')
+        .send({ version: cancellableData.data.version })
+        .expect(201);
+      const cancellableState = (
+        cancellableConfirmed.body as {
+          data: { version: number; reservation: { id: string } };
+        }
+      ).data;
+      await dataSource.query(
+        `UPDATE product_reservations
+         SET created_at = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 2 SECOND),
+             expires_at = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 1 SECOND)
+         WHERE id = ?`,
+        [cancellableState.reservation.id],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${cancellableData.data.id}/prepare`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-prepare-expired')
+        .send({ version: cancellableState.version })
+        .expect(409)
+        .expect(({ body }: { body: { code: string } }) =>
+          expect(body.code).toBe('CUSTOMER_ORDER_RESERVATION_UNAVAILABLE'),
+        );
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${cancellableData.data.id}/cancel`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-cancel-main')
+        .send({
+          version: cancellableState.version,
+          reason: 'Cliente desistió del pedido',
+        })
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: { status: string; reservation: { status: string } } };
+          }) => {
+            expect(body.data.status).toBe('CANCELLED');
+            expect(body.data.reservation.status).toBe('RELEASED');
+          },
+        );
+      await request(app.getHttpServer())
+        .post(`/api/v1/orders/${cancellableData.data.id}/cancel`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-cancel-main')
+        .send({
+          version: cancellableState.version,
+          reason: 'Cliente desistió del pedido',
+        })
+        .expect(201)
+        .expect(({ body }: { body: { meta: { idempotentReplay: boolean } } }) =>
+          expect(body.meta.idempotentReplay).toBe(true),
+        );
+
+      const [balance] = await dataSource.query<
+        Array<{
+          quantity: string;
+          available_quantity: string;
+          reserved_quantity: string;
+        }>
+      >(
+        `SELECT quantity, available_quantity, reserved_quantity FROM inventory_balances
+         WHERE product_id = ? AND location_id = ?`,
+        [productId, location.id],
+      );
+      expect(balance).toMatchObject({
+        quantity: '2.000',
+        available_quantity: '2.000',
+        reserved_quantity: '0.000',
+      });
+      const [counts] = await dataSource.query<
+        Array<{ sales: number | string; transitions: number | string }>
+      >(
+        `SELECT
+           (SELECT COUNT(*) FROM sales) AS sales,
+           (SELECT COUNT(*) FROM customer_order_transitions) AS transitions`,
+      );
+      expect(Number(counts.sales)).toBe(2);
+      expect(Number(counts.transitions)).toBe(10);
+      const auditActions = await dataSource.query<Array<{ action: string }>>(
+        `SELECT action FROM audit_events
+         WHERE action LIKE 'CUSTOMER_ORDER_%' OR action IN (
+           'PRODUCT_RESERVATION_CREATED', 'PRODUCT_RESERVATION_RELEASED',
+           'PRODUCT_RESERVATION_CONSUMED', 'SALE_COMPLETED'
+         )`,
+      );
+      expect(auditActions.map(({ action }) => action)).toEqual(
+        expect.arrayContaining([
+          'CUSTOMER_ORDER_CREATED',
+          'CUSTOMER_ORDER_CONFIRMED',
+          'CUSTOMER_ORDER_PREPARED',
+          'CUSTOMER_ORDER_READY',
+          'CUSTOMER_ORDER_DISPATCH_RETRYABLE',
+          'CUSTOMER_ORDER_DISPATCHED',
+          'CUSTOMER_ORDER_DELIVERED',
+          'CUSTOMER_ORDER_CANCELLED',
+          'PRODUCT_RESERVATION_CREATED',
+          'PRODUCT_RESERVATION_RELEASED',
+          'PRODUCT_RESERVATION_CONSUMED',
+          'SALE_COMPLETED',
+        ]),
+      );
+
+      const other = {
+        organizationName: 'Otro tenant pedidos',
+        email: 'other-orders@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'order-other-registration')
+        .send(other)
+        .expect(201);
+      const otherCookie = await createPersistedSession(other.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Otro Pedidos',
+          tradeName: 'Otro',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Otra Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Otra Bodega',
+          locationName: 'Otra General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Otra Caja' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/orders/${createdData.data.id}`)
+        .set('Cookie', otherCookie)
+        .expect(404);
+      await request(app.getHttpServer())
+        .get('/api/v1/orders')
+        .set('Cookie', otherCookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) =>
+          expect(body.data).toEqual([]),
+        );
+    });
+  });
+
+  describe('sales quotation lifecycle', () => {
+    beforeEach(resetIdentityData);
+
+    it('edits, recalculates and converts once without touching stock beforehand or crossing tenants', async () => {
+      await registerAccount('quotation-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Cotizaciones SA',
+          tradeName: 'Cotizaciones',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Principal',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Bodega',
+          locationName: 'General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja Principal' })
+        .expect(200);
+      const [location] = await dataSource.query<Array<{ id: string }>>(
+        `SELECT l.id FROM locations l INNER JOIN users u ON u.tenant_id = l.tenant_id
+         WHERE u.normalized_email = ? LIMIT 1`,
+        [registrationPayload.email],
+      );
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto cotizado',
+          sku: 'QUOTE-001',
+          cost: '40',
+          price: '100',
+        })
+        .expect(201);
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-stock')
+        .send({
+          productId,
+          locationId: location.id,
+          type: 'INITIAL',
+          quantity: '5',
+          reason: 'Stock para cotización',
+        })
+        .expect(201);
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({ name: 'Cliente cotizado', dataProcessingConsent: false })
+        .expect(201);
+      const customerId = (customerResponse.body as { data: { id: string } })
+        .data.id;
+      await openCurrentCashRegister(cookie, 'quotation-open-shift', '100.00');
+
+      const validUntil = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+      const payload = {
+        channel: 'WEB',
+        validUntil,
+        notes: 'Propuesta inicial',
+        lines: [{ productId, quantity: '1' }],
+      };
+      const created = await request(app.getHttpServer())
+        .post('/api/v1/quotations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-create-main')
+        .send(payload)
+        .expect(201);
+      const createdData = (
+        created.body as { data: { id: string; version: number } }
+      ).data;
+      expect(created.body).toMatchObject({
+        data: {
+          status: 'ACTIVE',
+          customer: null,
+          totals: { total: '100.00' },
+          lines: [{ product: { id: productId }, quantity: '1.000' }],
+          sale: null,
+        },
+        meta: { idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .post('/api/v1/quotations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-create-main')
+        .send(payload)
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: { data: { id: string }; meta: { idempotentReplay: boolean } };
+          }) => {
+            expect(body.data.id).toBe(createdData.id);
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+      const [beforeEdit] = await dataSource.query<
+        Array<{ quantity: string; available_quantity: string }>
+      >(
+        'SELECT quantity, available_quantity FROM inventory_balances WHERE product_id = ? AND location_id = ?',
+        [productId, location.id],
+      );
+      expect(beforeEdit).toMatchObject({
+        quantity: '5.000',
+        available_quantity: '5.000',
+      });
+
+      const updatePayload = {
+        ...payload,
+        customerId,
+        notes: 'Propuesta revisada',
+        version: createdData.version,
+        lines: [{ productId, quantity: '2' }],
+      };
+      const updated = await request(app.getHttpServer())
+        .put(`/api/v1/quotations/${createdData.id}`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-update-main')
+        .send(updatePayload)
+        .expect(200);
+      const updatedData = (updated.body as { data: { version: number } }).data;
+      expect(updated.body).toMatchObject({
+        data: {
+          version: 2,
+          customer: { id: customerId },
+          notes: 'Propuesta revisada',
+          totals: { total: '200.00' },
+        },
+      });
+      await request(app.getHttpServer())
+        .put(`/api/v1/quotations/${createdData.id}`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-update-main')
+        .send(updatePayload)
+        .expect(200)
+        .expect(({ body }: { body: { meta: { idempotentReplay: boolean } } }) =>
+          expect(body.meta.idempotentReplay).toBe(true),
+        );
+
+      await dataSource.query(
+        'UPDATE products SET price = ?, version = version + 1 WHERE id = ?',
+        ['110.00', productId],
+      );
+      const preview = await request(app.getHttpServer())
+        .post(`/api/v1/quotations/${createdData.id}/preview`)
+        .set('Cookie', cookie)
+        .expect(201);
+      const previewData = (
+        preview.body as {
+          data: {
+            canConvert: boolean;
+            differences: Array<{
+              field: string;
+              quoted: string;
+              current: string;
+              blocking: boolean;
+            }>;
+          };
+        }
+      ).data;
+      expect(previewData.canConvert).toBe(true);
+      expect(
+        previewData.differences.some(
+          (difference) =>
+            difference.field === 'UNIT_PRICE' &&
+            difference.quoted === '100.00' &&
+            difference.current === '110.00' &&
+            !difference.blocking,
+        ),
+      ).toBe(true);
+      expect(
+        previewData.differences.some(
+          (difference) =>
+            difference.field === 'TOTAL' &&
+            difference.quoted === '200.00' &&
+            difference.current === '220.00' &&
+            !difference.blocking,
+        ),
+      ).toBe(true);
+      await request(app.getHttpServer())
+        .post(`/api/v1/quotations/${createdData.id}/convert`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-convert-main')
+        .send({
+          version: updatedData.version,
+          acceptDifferences: false,
+          payments: [{ method: 'CASH', amountReceived: '300.00' }],
+        })
+        .expect(409)
+        .expect(({ body }: { body: { code: string } }) =>
+          expect(body.code).toBe('QUOTATION_CHANGED'),
+        );
+
+      const converted = await request(app.getHttpServer())
+        .post(`/api/v1/quotations/${createdData.id}/convert`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-convert-main')
+        .send({
+          version: updatedData.version,
+          acceptDifferences: true,
+          payments: [{ method: 'CASH', amountReceived: '300.00' }],
+        })
+        .expect(201);
+      const convertedData = converted.body as {
+        data: {
+          quotation: { version: number; status: string; sale: { id: string } };
+          sale: { id: string; receiptNumber: string };
+        };
+        meta: { idempotentReplay: boolean };
+      };
+      expect(convertedData.data.quotation.status).toBe('CONVERTED');
+      expect(convertedData.data.sale.receiptNumber).toMatch(/^V-/);
+      expect(convertedData.meta.idempotentReplay).toBe(false);
+      await request(app.getHttpServer())
+        .post(`/api/v1/quotations/${createdData.id}/convert`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-convert-retry')
+        .send({
+          version: updatedData.version,
+          acceptDifferences: true,
+          payments: [{ method: 'CASH', amountReceived: '300.00' }],
+        })
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: { sale: { id: string } };
+              meta: { idempotentReplay: boolean };
+            };
+          }) => {
+            expect(body.data.sale.id).toBe(convertedData.data.sale.id);
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/sales/${convertedData.data.sale.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) =>
+          expect(body).toMatchObject({
+            data: { quotation: { id: createdData.id } },
+          }),
+        );
+      const [afterSale] = await dataSource.query<
+        Array<{ quantity: string; available_quantity: string }>
+      >(
+        'SELECT quantity, available_quantity FROM inventory_balances WHERE product_id = ? AND location_id = ?',
+        [productId, location.id],
+      );
+      expect(afterSale).toMatchObject({
+        quantity: '3.000',
+        available_quantity: '3.000',
+      });
+      const [saleCount] = await dataSource.query<
+        Array<{ total: number | string }>
+      >('SELECT COUNT(*) AS total FROM sales WHERE quotation_id = ?', [
+        createdData.id,
+      ]);
+      expect(Number(saleCount.total)).toBe(1);
+
+      const expired = await request(app.getHttpServer())
+        .post('/api/v1/quotations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-create-expired')
+        .send({ ...payload, notes: 'Por vencer' })
+        .expect(201);
+      const expiredData = (
+        expired.body as { data: { id: string; version: number } }
+      ).data;
+      await dataSource.query(
+        'UPDATE sales_quotations SET valid_until = DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 1 SECOND) WHERE id = ?',
+        [expiredData.id],
+      );
+      await request(app.getHttpServer())
+        .post(`/api/v1/quotations/${expiredData.id}/convert`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'quotation-convert-expired')
+        .send({
+          version: expiredData.version,
+          acceptDifferences: true,
+          payments: [{ method: 'CASH', amountReceived: '200.00' }],
+        })
+        .expect(409)
+        .expect(({ body }: { body: { status: string } }) =>
+          expect(body.status).toBe('EXPIRED'),
+        );
+
+      const other = {
+        organizationName: 'Otro tenant cotizaciones',
+        email: 'other-quotes@example.com',
+        password: registrationPayload.password,
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/auth/registrations')
+        .set('Idempotency-Key', 'quotation-other-registration')
+        .send(other)
+        .expect(201);
+      const otherCookie = await createPersistedSession(other.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', otherCookie)
+        .send({
+          legalName: 'Otro Cotizaciones',
+          tradeName: 'Otro',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', otherCookie)
+        .send({
+          branchName: 'Otra',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'Otra Bodega',
+          locationName: 'Otra General',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', otherCookie)
+        .send({ name: 'Otra Caja' })
+        .expect(200);
+      await request(app.getHttpServer())
+        .get(`/api/v1/quotations/${createdData.id}`)
+        .set('Cookie', otherCookie)
+        .expect(404);
+      await request(app.getHttpServer())
+        .get('/api/v1/quotations')
+        .set('Cookie', otherCookie)
+        .expect(200)
+        .expect(({ body }: { body: { data: unknown[] } }) =>
+          expect(body.data).toEqual([]),
+        );
+
+      const actions = await dataSource.query<Array<{ action: string }>>(
+        "SELECT action FROM audit_events WHERE action LIKE 'SALES_QUOTATION_%'",
+      );
+      expect(actions.map(({ action }) => action)).toEqual(
+        expect.arrayContaining([
+          'SALES_QUOTATION_CREATED',
+          'SALES_QUOTATION_UPDATED',
+          'SALES_QUOTATION_CONVERTED',
+        ]),
+      );
     });
   });
 

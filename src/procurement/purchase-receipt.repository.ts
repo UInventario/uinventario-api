@@ -16,6 +16,12 @@ import {
   PurchaseReceiptOverageReasonError,
 } from './purchase-order.errors';
 import type { PurchaseOrderStatus } from './purchase-order.types';
+import {
+  normalizeProductQuantity,
+  ProductBaseUnit,
+  ProductQuantityPolicy,
+  QuantityRoundingMode,
+} from '../common/quantity-policy';
 
 interface ReceiptRequestRow {
   id: string;
@@ -48,12 +54,26 @@ export class PurchaseReceiptRepository {
     const lineIds = input.dto.lines.map((line) => line.purchaseOrderLineId);
     if (new Set(lineIds).size !== lineIds.length)
       throw new InvalidPurchaseReceiptError();
-    const lines = input.dto.lines.map((line) => ({
-      purchaseOrderLineId: line.purchaseOrderLineId,
-      receivedQuantity: this.fromUnits(this.toUnits(line.receivedQuantity)),
-      lotCode: line.lotCode ?? null,
-      serialNumbers: line.serialNumbers ?? [],
-    }));
+    const policies = await this.quantityPolicies(
+      input.tenantId,
+      input.orderId,
+      lineIds,
+    );
+    const lines = input.dto.lines.map((line) => {
+      const policy = policies.get(line.purchaseOrderLineId);
+      if (!policy) throw new InvalidPurchaseReceiptError();
+      return {
+        purchaseOrderLineId: line.purchaseOrderLineId,
+        receivedQuantity: normalizeProductQuantity(
+          line.receivedQuantity,
+          policy,
+        ),
+        lotCode: line.lotCode ?? null,
+        manufacturedOn: line.manufacturedOn ?? null,
+        expiresOn: line.expiresOn ?? null,
+        serialNumbers: line.serialNumbers ?? [],
+      };
+    });
     const fingerprint = createHash('sha256')
       .update(
         JSON.stringify({
@@ -138,6 +158,8 @@ export class PurchaseReceiptRepository {
               received,
               overage,
               lotCode: line.lotCode ?? null,
+              manufacturedOn: line.manufacturedOn,
+              expiresOn: line.expiresOn,
               serialNumbers: line.serialNumbers,
             };
           });
@@ -176,7 +198,7 @@ export class PurchaseReceiptRepository {
               }>
             >(
               `SELECT cost, track_lots, track_serials FROM products
-               WHERE id = ? AND tenant_id = ? FOR UPDATE`,
+               WHERE id = ? AND tenant_id = ? AND variant_schema IS NULL FOR UPDATE`,
               [item.orderLine.product_id, input.tenantId],
             );
             if (!product) throw new InvalidPurchaseReceiptError();
@@ -232,9 +254,10 @@ export class PurchaseReceiptRepository {
             await manager.query(
               `INSERT INTO purchase_receipt_lines
                 (id, tenant_id, receipt_id, purchase_order_line_id, line_number,
-                 received_quantity, lot_code, overage_quantity, unit_cost, total_cost,
-                 previous_catalog_cost, resulting_catalog_cost)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                 received_quantity, lot_code, manufactured_on, expires_on,
+                 overage_quantity, unit_cost, total_cost, previous_catalog_cost,
+                 resulting_catalog_cost)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 receiptLineId,
                 input.tenantId,
@@ -243,6 +266,8 @@ export class PurchaseReceiptRepository {
                 index + 1,
                 this.fromUnits(item.received),
                 item.lotCode,
+                item.manufacturedOn,
+                item.expiresOn,
                 this.fromUnits(item.overage),
                 item.orderLine.unit_cost,
                 this.receiptCost(item.received, item.orderLine.unit_cost),
@@ -390,6 +415,41 @@ export class PurchaseReceiptRepository {
     return (
       error instanceof QueryFailedError &&
       (error.driverError as { errno?: number }).errno === 1062
+    );
+  }
+
+  private async quantityPolicies(
+    tenantId: string,
+    orderId: string,
+    lineIds: string[],
+  ): Promise<Map<string, ProductQuantityPolicy>> {
+    const rows = await this.dataSource.query<
+      Array<{
+        line_id: string;
+        base_unit: ProductBaseUnit;
+        quantity_precision: number;
+        quantity_rounding: QuantityRoundingMode;
+        minimum_quantity: string;
+      }>
+    >(
+      `SELECT pol.id AS line_id, p.base_unit, p.quantity_precision,
+              p.quantity_rounding, p.minimum_quantity
+       FROM purchase_order_lines pol
+       INNER JOIN products p ON p.id = pol.product_id AND p.tenant_id = pol.tenant_id
+       WHERE pol.tenant_id = ? AND pol.purchase_order_id = ?
+         AND pol.id IN (${lineIds.map(() => '?').join(',')})`,
+      [tenantId, orderId, ...lineIds],
+    );
+    return new Map(
+      rows.map((row) => [
+        row.line_id,
+        {
+          baseUnit: row.base_unit,
+          precision: Number(row.quantity_precision),
+          rounding: row.quantity_rounding,
+          minimumQuantity: row.minimum_quantity,
+        },
+      ]),
     );
   }
 

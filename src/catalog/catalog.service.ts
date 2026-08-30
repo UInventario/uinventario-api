@@ -11,6 +11,11 @@ import {
   ProductIdentifierConflictError,
   ProductVersionConflictError,
   ProductLotTrackingLockedError,
+  ProductQuantityPolicyLockedError,
+  ProductKitConfigurationError,
+  ProductVariantConfigurationError,
+  ProductVariantsRequireZeroStockError,
+  ProductSaleBehaviorError,
 } from './catalog.errors';
 import {
   CatalogOptionsResponse,
@@ -25,6 +30,9 @@ import {
   CatalogClassificationKind,
   UpdateCatalogClassificationDto,
 } from './dto/catalog-classification.dto';
+import { UpdateProductVariantsDto } from './dto/update-product-variants.dto';
+import { UpdateProductKitDto } from './dto/update-product-kit.dto';
+import { assertProductQuantityPolicy } from '../common/quantity-policy';
 
 @Injectable()
 export class CatalogService {
@@ -34,6 +42,18 @@ export class CatalogService {
     tenantId: string,
     dto: CreateProductDto,
   ): Promise<ProductResponse> {
+    this.assertSaleBehavior(dto);
+    this.assertLotExpirationPolicy(dto, true);
+    assertProductQuantityPolicy(
+      {
+        baseUnit: dto.baseUnit ?? 'UNIT',
+        precision: dto.quantityPrecision ?? (dto.trackSerials ? 0 : 3),
+        rounding: dto.quantityRounding ?? 'HALF_UP',
+        minimumQuantity:
+          dto.minimumQuantity ?? (dto.trackSerials ? '1.000' : '0.001'),
+      },
+      dto.trackSerials ?? false,
+    );
     try {
       return {
         data: await this.catalog.createProduct(tenantId, dto),
@@ -69,6 +89,8 @@ export class CatalogService {
     id: string,
     dto: UpdateProductDto,
   ): Promise<ProductResponse> {
+    this.assertSaleBehavior(dto);
+    this.assertLotExpirationPolicy(dto);
     try {
       const product = await this.catalog.updateProduct(tenantId, id, dto);
       if (!product) throw new NotFoundException();
@@ -90,6 +112,19 @@ export class CatalogService {
           code: 'PRODUCT_LOT_TRACKING_LOCKED',
           message:
             'El control por lotes no puede cambiar después del primer movimiento de inventario.',
+        });
+      }
+      if (error instanceof ProductQuantityPolicyLockedError) {
+        throw new ConflictException({
+          code: 'PRODUCT_QUANTITY_POLICY_LOCKED',
+          message:
+            'La unidad, precisi\u00f3n, redondeo y cantidad m\u00ednima no pueden cambiar despu\u00e9s del primer movimiento.',
+        });
+      }
+      if (error instanceof ProductSaleBehaviorError) {
+        throw new BadRequestException({
+          code: 'PRODUCT_SALE_BEHAVIOR_INVALID',
+          message: error.reason,
         });
       }
       throw error;
@@ -124,6 +159,86 @@ export class CatalogService {
     return { data: product, meta: { apiVersion: '1' } };
   }
 
+  async updateProductVariants(
+    tenantId: string,
+    id: string,
+    dto: UpdateProductVariantsDto,
+  ): Promise<ProductResponse> {
+    try {
+      const product = await this.catalog.updateProductVariants(
+        tenantId,
+        id,
+        dto,
+      );
+      if (!product) throw new NotFoundException();
+      return { data: product, meta: { apiVersion: '1' } };
+    } catch (error) {
+      if (error instanceof ProductIdentifierConflictError) {
+        this.throwIdentifierConflict(error);
+      }
+      if (error instanceof ProductVersionConflictError) {
+        throw new ConflictException({
+          code: 'PRODUCT_VERSION_CONFLICT',
+          currentVersion: error.currentVersion,
+          message:
+            'El producto o una variante cambió. Recarga antes de guardar.',
+        });
+      }
+      if (error instanceof ProductVariantsRequireZeroStockError) {
+        throw new ConflictException({
+          code: 'PRODUCT_VARIANTS_REQUIRE_ZERO_STOCK',
+          message:
+            'El producto padre debe quedar sin existencias antes de habilitar variantes.',
+        });
+      }
+      if (error instanceof ProductVariantConfigurationError) {
+        throw new BadRequestException({
+          code: 'PRODUCT_VARIANT_CONFIGURATION_INVALID',
+          message: error.reason,
+        });
+      }
+      throw error;
+    }
+  }
+
+  async updateProductKit(
+    tenantId: string,
+    id: string,
+    dto: UpdateProductKitDto,
+  ): Promise<ProductResponse> {
+    if (
+      dto.enabled &&
+      dto.effectiveFrom &&
+      dto.effectiveTo &&
+      dto.effectiveFrom > dto.effectiveTo
+    ) {
+      throw new BadRequestException({
+        code: 'PRODUCT_KIT_CONFIGURATION_INVALID',
+        message: 'La vigencia final no puede ser anterior a la inicial.',
+      });
+    }
+    try {
+      const product = await this.catalog.updateProductKit(tenantId, id, dto);
+      if (!product) throw new NotFoundException();
+      return { data: product, meta: { apiVersion: '1' } };
+    } catch (error) {
+      if (error instanceof ProductVersionConflictError) {
+        throw new ConflictException({
+          code: 'PRODUCT_VERSION_CONFLICT',
+          currentVersion: error.currentVersion,
+          message: 'El producto cambió. Recarga antes de guardar el kit.',
+        });
+      }
+      if (error instanceof ProductKitConfigurationError) {
+        throw new BadRequestException({
+          code: 'PRODUCT_KIT_CONFIGURATION_INVALID',
+          message: error.reason,
+        });
+      }
+      throw error;
+    }
+  }
+
   async resolveCode(tenantId: string, code: string): Promise<ProductResponse> {
     try {
       const product = await this.catalog.resolveCode(tenantId, code);
@@ -143,6 +258,19 @@ export class CatalogService {
         });
       }
       throw error;
+    }
+  }
+
+  private assertSaleBehavior(dto: CreateProductDto): void {
+    if (
+      dto.stockBehavior === 'UNTRACKED' &&
+      (dto.trackLots === true || dto.trackSerials === true)
+    ) {
+      throw new BadRequestException({
+        code: 'UNTRACKED_PRODUCT_CANNOT_TRACK_INVENTORY',
+        message:
+          'Un producto sin control de stock no puede usar lotes ni series.',
+      });
     }
   }
 
@@ -239,6 +367,35 @@ export class CatalogService {
       throw new BadRequestException({
         code: 'CATEGORY_NAME_TOO_LONG',
         message: 'La categoría admite hasta 80 caracteres.',
+      });
+    }
+  }
+
+  private assertLotExpirationPolicy(
+    dto: CreateProductDto,
+    creating = false,
+  ): void {
+    const policy = dto.lotExpirationPolicy ?? 'NONE';
+    if (
+      policy !== 'NONE' &&
+      (dto.trackLots === false || (creating && dto.trackLots !== true))
+    ) {
+      throw new BadRequestException({
+        code: 'LOT_EXPIRATION_REQUIRES_TRACKING',
+        message: 'La política de caducidad requiere control por lotes.',
+      });
+    }
+    const days = dto.lotExpirationAlertDays ?? 30;
+    if (days < 1 || days > 365) {
+      throw new BadRequestException({
+        code: 'INVALID_LOT_EXPIRATION_ALERT_DAYS',
+        message: 'El horizonte de alertas debe estar entre 1 y 365 días.',
+      });
+    }
+    if (dto.allowExpiredStockOverride && policy === 'NONE') {
+      throw new BadRequestException({
+        code: 'LOT_EXPIRATION_OVERRIDE_REQUIRES_POLICY',
+        message: 'La excepción de caducidad requiere una política de lotes.',
       });
     }
   }

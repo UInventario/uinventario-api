@@ -8,7 +8,14 @@ export interface InventoryCountAttemptData {
 }
 
 export interface InventoryCountSessionLineData {
-  product: { id: string; name: string; sku: string };
+  product: {
+    id: string;
+    name: string;
+    sku: string;
+    baseUnit: import('../common/quantity-policy').ProductBaseUnit;
+    quantityPrecision: number;
+    minimumQuantity: string;
+  };
   snapshotQuantity: string | null;
   countedQuantity: string | null;
   varianceQuantity: string | null;

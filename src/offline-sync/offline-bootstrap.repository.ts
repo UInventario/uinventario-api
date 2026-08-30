@@ -133,6 +133,10 @@ export class OfflineBootstrapRepository {
         brand_name: string | null;
         brand_created_at: Date | string | null;
         price: string;
+        base_unit: import('../common/quantity-policy').ProductBaseUnit;
+        quantity_precision: number;
+        quantity_rounding: import('../common/quantity-policy').QuantityRoundingMode;
+        minimum_quantity: string;
         version: number;
         updated_at: Date | string;
       }>
@@ -140,11 +144,13 @@ export class OfflineBootstrapRepository {
       `SELECT p.id, p.name, p.sku, p.barcode, p.category_id,
               c.name AS category_name, c.created_at AS category_created_at,
               p.brand_id, br.name AS brand_name, br.created_at AS brand_created_at,
-              p.price, p.version, p.updated_at
+              p.price, p.base_unit, p.quantity_precision, p.quantity_rounding,
+              p.minimum_quantity, p.version, p.updated_at
        FROM products p
        LEFT JOIN categories c ON c.id = p.category_id AND c.tenant_id = p.tenant_id
        LEFT JOIN brands br ON br.id = p.brand_id AND br.tenant_id = p.tenant_id
-       WHERE p.tenant_id = ? AND p.active = TRUE AND p.updated_at <= ? ORDER BY p.id`,
+       WHERE p.tenant_id = ? AND p.active = TRUE AND p.variant_schema IS NULL
+         AND p.updated_at <= ? ORDER BY p.id`,
       [input.scope.tenantId, input.snapshotAt],
     );
     const classifications = new Map<string, OfflineSyncEntityV1>();
@@ -184,9 +190,74 @@ export class OfflineBootstrapRepository {
         categoryId: product.category_id,
         brandId: product.brand_id,
         price: this.decimal(product.price, 2),
+        baseUnit: product.base_unit,
+        quantityPrecision: Number(product.quantity_precision),
+        quantityRounding: product.quantity_rounding,
+        minimumQuantity: this.decimal(product.minimum_quantity, 3),
         active: true,
       })),
     );
+    if (input.permissions.includes('SALES_MANAGE')) {
+      const priceLists = await this.dataSource.query<
+        Array<{
+          id: string;
+          name: string;
+          currency: string;
+          branch_id: string | null;
+          customer_id: string | null;
+          channel: 'POS' | 'WEB' | 'MOBILE' | 'DESKTOP' | null;
+          priority: number | string;
+          valid_from: Date | string;
+          valid_to: Date | string | null;
+          active: number | boolean;
+          version: number | string;
+          updated_at: Date | string;
+        }>
+      >(
+        `SELECT id, name, currency, branch_id, customer_id, channel, priority,
+                valid_from, valid_to, active, version, updated_at
+         FROM price_lists WHERE tenant_id = ? AND updated_at <= ? ORDER BY id`,
+        [input.scope.tenantId, input.snapshotAt],
+      );
+      const priceItems = priceLists.length
+        ? await this.dataSource.query<
+            Array<{
+              price_list_id: string;
+              product_id: string;
+              price: string;
+            }>
+          >(
+            `SELECT price_list_id, product_id, price FROM price_list_items
+             WHERE tenant_id = ? AND price_list_id IN (${priceLists.map(() => '?').join(', ')})
+             ORDER BY price_list_id, product_id`,
+            [input.scope.tenantId, ...priceLists.map(({ id }) => id)],
+          )
+        : [];
+      entities.push(
+        ...priceLists.map((list) => ({
+          kind: 'PRICE_LIST' as const,
+          id: list.id,
+          tenantId: input.scope.tenantId,
+          version: Number(list.version),
+          updatedAt: this.iso(list.updated_at),
+          name: list.name,
+          currency: list.currency,
+          branchId: list.branch_id,
+          customerId: list.customer_id,
+          channel: list.channel,
+          priority: Number(list.priority),
+          validFrom: this.iso(list.valid_from),
+          validTo: list.valid_to ? this.iso(list.valid_to) : null,
+          active: Boolean(list.active),
+          items: priceItems
+            .filter(({ price_list_id }) => price_list_id === list.id)
+            .map((item) => ({
+              productId: item.product_id,
+              price: this.decimal(item.price, 2),
+            })),
+        })),
+      );
+    }
     if (
       locationRows.length &&
       input.permissions.some((permission) =>

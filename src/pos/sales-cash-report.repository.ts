@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import type { SalesCashReportDto } from './dto/sales-cash-report.dto';
-import type { PaymentMethod } from './dto/create-sale.dto';
+import type { PaymentMethod } from './pos.types';
 
 export interface BranchScope {
   id: string;
@@ -87,7 +87,7 @@ export class SalesCashReportRepository {
         this.dataSource.query<
           Array<{
             method: PaymentMethod;
-            status: 'COMPLETED' | 'REVERSED';
+            status: 'COMPLETED' | 'PENDING' | 'REVERSED';
             amount: string;
             count: number | string;
           }>
@@ -125,7 +125,13 @@ export class SalesCashReportRepository {
                     INNER JOIN sale_payments sp ON sp.sale_id = s2.id AND sp.tenant_id = s2.tenant_id
                       AND sp.method = 'CASH'
                     WHERE s2.tenant_id = crs.tenant_id AND s2.cash_register_shift_id = crs.id
-                      AND s2.status = 'COMPLETED'), 0) +
+                      AND s2.status = 'COMPLETED'), 0) -
+                  COALESCE((SELECT SUM(settlement.amount)
+                    FROM sale_return_settlements settlement
+                    WHERE settlement.tenant_id = crs.tenant_id
+                      AND settlement.cash_register_shift_id = crs.id
+                      AND settlement.method = 'CASH'
+                      AND settlement.status = 'COMPLETED'), 0) +
                   COALESCE((SELECT SUM(CASE WHEN cm.type = 'INCOME' THEN cm.amount
                     WHEN cm.type = 'WITHDRAWAL' THEN -cm.amount
                     WHEN original.type = 'INCOME' THEN -cm.amount ELSE cm.amount END)
@@ -168,7 +174,13 @@ export class SalesCashReportRepository {
                           INNER JOIN sale_payments sp ON sp.sale_id = s2.id AND sp.tenant_id = s2.tenant_id
                             AND sp.method = 'CASH'
                           WHERE s2.tenant_id = crs.tenant_id AND s2.cash_register_shift_id = crs.id
-                            AND s2.status = 'COMPLETED'), 0) +
+                            AND s2.status = 'COMPLETED'), 0) -
+                        COALESCE((SELECT SUM(settlement.amount)
+                          FROM sale_return_settlements settlement
+                          WHERE settlement.tenant_id = crs.tenant_id
+                            AND settlement.cash_register_shift_id = crs.id
+                            AND settlement.method = 'CASH'
+                            AND settlement.status = 'COMPLETED'), 0) +
                         COALESCE((SELECT SUM(CASE WHEN cm.type = 'INCOME' THEN cm.amount
                           WHEN cm.type = 'WITHDRAWAL' THEN -cm.amount
                           WHEN original.type = 'INCOME' THEN -cm.amount ELSE cm.amount END)
@@ -208,7 +220,7 @@ export class SalesCashReportRepository {
           Array<{
             sale_id: string;
             method: PaymentMethod;
-            status: 'COMPLETED' | 'REVERSED';
+            status: 'COMPLETED' | 'PENDING' | 'REVERSED';
             amount_applied: string;
             change_amount: string;
             external_reference: string | null;
@@ -223,7 +235,7 @@ export class SalesCashReportRepository {
     const total = totals[0];
     const cash = cashTotals[0];
     const paymentApplied = paymentTotals
-      .filter(({ status }) => status === 'COMPLETED')
+      .filter(({ status }) => status !== 'REVERSED')
       .reduce((sum, payment) => sum + this.cents(payment.amount), 0n);
     return {
       scope: branches,

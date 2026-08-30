@@ -1,20 +1,24 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Inject,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { normalizeProductQuantity } from '../common/quantity-policy';
 import type { ConfigType } from '@nestjs/config';
 import { createHash } from 'node:crypto';
 import { posConfig } from '../config/pos.config';
 import { CreateCashSaleDto } from './dto/create-cash-sale.dto';
 import { CreateSaleDto, SalePaymentDto } from './dto/create-sale.dto';
 import { ListSalesDto } from './dto/list-sales.dto';
-import { QuoteCartDto } from './dto/quote-cart.dto';
+import { QuoteCartDto, SaleDiscountDto } from './dto/quote-cart.dto';
 import { VoidSaleDto } from './dto/void-sale.dto';
 import {
   PosContextNotFoundError,
+  CustomerCreditLimitExceededError,
+  CustomerCreditNotAvailableError,
   PosCustomerNotAvailableError,
   PosIdempotencyConflictError,
   PosInsufficientStockError,
@@ -38,11 +42,13 @@ import {
   PaymentDeclinedError,
   PaymentMethodUnavailableError,
 } from './payment-authorization.service';
+import { PaymentTerminalOperationError } from './payment-terminal.errors';
 import {
   InsufficientInventoryLotStockError,
   InventoryFifoCurrencyMismatchError,
   InventoryFifoLayerShortageError,
   InventoryLotNotFoundError,
+  ExpiredInventoryLotError,
 } from '../inventory/inventory.errors';
 import {
   InventorySerialDuplicateError,
@@ -51,6 +57,15 @@ import {
   InventorySerialRequiredError,
   InventorySerialStateConflictError,
 } from '../inventory/inventory-serial-tracking';
+import { SuspendedSaleStateError } from './suspended-sale.errors';
+import { PriceListRepository } from '../pricing/price-list.repository';
+import { PromotionEngineService } from '../promotions/promotion-engine.service';
+import type { AppliedPromotion } from '../promotions/promotion.types';
+import { LoyaltyService } from '../loyalty/loyalty.service';
+import {
+  LoyaltyInsufficientBalanceError,
+  LoyaltyRuleChangedError,
+} from '../loyalty/loyalty.types';
 
 @Injectable()
 export class PosService {
@@ -59,6 +74,9 @@ export class PosService {
     private readonly sales: SalesRepository,
     private readonly shifts: CashRegisterShiftService,
     private readonly paymentAuthorization: PaymentAuthorizationService,
+    private readonly priceLists: PriceListRepository,
+    private readonly promotionEngine: PromotionEngineService,
+    private readonly loyalty: LoyaltyService,
     @Inject(posConfig.KEY)
     private readonly config: ConfigType<typeof posConfig>,
   ) {}
@@ -85,10 +103,18 @@ export class PosService {
     };
   }
 
-  async getSale(tenantId: string, branchId: string, saleId: string) {
+  async getSale(
+    tenantId: string,
+    branchId: string,
+    saleId: string,
+    canViewMargin = false,
+  ) {
     const sale = await this.sales.getSaleDetail(tenantId, branchId, saleId);
     if (!sale) throw new NotFoundException();
-    return { data: sale, meta: { apiVersion: '1' as const } };
+    return {
+      data: this.applyMarginAccess(sale, canViewMargin),
+      meta: { apiVersion: '1' as const },
+    };
   }
 
   async voidSale(input: {
@@ -150,6 +176,15 @@ export class PosService {
             'La venta sólo puede anularse mientras su turno de caja siga abierto.',
         });
       }
+      if (error instanceof LoyaltyInsufficientBalanceError) {
+        throw new ConflictException({
+          code: 'LOYALTY_COMPENSATION_BALANCE_REQUIRED',
+          available: error.available,
+          requested: error.requested,
+          message:
+            'El cliente ya utilizó los puntos a revertir; regulariza su saldo antes de anular.',
+        });
+      }
       throw error;
     }
   }
@@ -163,13 +198,20 @@ export class PosService {
     idempotencyKey: string | undefined;
     dto: CreateCashSaleDto;
     expectedSnapshot?: OfflineCashSaleSnapshot;
+    canDiscount?: boolean;
+    canOverridePrice?: boolean;
+    canOverrideExpired?: boolean;
+    canViewMargin?: boolean;
   }): Promise<CashSaleResponse> {
     return this.createSale({
       ...input,
       dto: {
+        channel: input.dto.channel,
         customerId: input.dto.customerId,
         reservationId: input.dto.reservationId,
+        loyaltyPointsToRedeem: input.dto.loyaltyPointsToRedeem,
         lines: input.dto.lines,
+        discount: input.dto.discount,
         payment: { method: 'CASH', amountReceived: input.dto.cashReceived },
       },
     });
@@ -184,8 +226,26 @@ export class PosService {
     idempotencyKey: string | undefined;
     dto: CreateSaleDto;
     expectedSnapshot?: OfflineCashSaleSnapshot;
+    canDiscount?: boolean;
+    canOverridePrice?: boolean;
+    canOverrideExpired?: boolean;
+    canCredit?: boolean;
+    canViewMargin?: boolean;
+    sourceQuotationId?: string;
   }): Promise<CashSaleResponse> {
     this.assertIdempotencyKey(input.idempotencyKey);
+    if (input.dto.credit && !input.canCredit) {
+      throw new ForbiddenException({
+        code: 'CUSTOMER_CREDIT_PERMISSION_REQUIRED',
+        message: 'No tienes permiso para registrar ventas a crédito.',
+      });
+    }
+    if (input.dto.credit && !input.dto.customerId) {
+      throw new BadRequestException({
+        code: 'CUSTOMER_REQUIRED_FOR_CREDIT',
+        message: 'Selecciona un cliente para vender a crédito.',
+      });
+    }
     const fingerprint = this.saleFingerprint(input.dto);
     try {
       const replay = await this.sales.findByIdempotency(
@@ -196,7 +256,7 @@ export class PosService {
         if (replay.fingerprint !== fingerprint)
           throw new PosIdempotencyConflictError();
         return {
-          data: replay.sale,
+          data: this.applyMarginAccess(replay.sale, input.canViewMargin),
           meta: { apiVersion: '1', idempotentReplay: true },
         };
       }
@@ -206,7 +266,17 @@ export class PosService {
         warehouseId: input.warehouseId,
         cashRegisterId: input.cashRegisterId,
         userId: input.userId,
-        dto: { lines: input.dto.lines, reservationId: input.dto.reservationId },
+        dto: {
+          lines: input.dto.lines,
+          reservationId: input.dto.reservationId,
+          loyaltyPointsToRedeem: input.dto.loyaltyPointsToRedeem,
+          customerId: input.dto.customerId,
+          channel: input.dto.channel,
+          discount: input.dto.discount,
+        },
+        canDiscount: input.canDiscount,
+        canOverridePrice: input.canOverridePrice,
+        canOverrideExpired: input.canOverrideExpired,
       });
       if (input.expectedSnapshot) {
         this.assertOfflineSnapshot(input.expectedSnapshot, quote.data);
@@ -217,7 +287,9 @@ export class PosService {
         cashRegisterId: input.cashRegisterId,
         userId: input.userId,
       });
-      const totalCents = this.toMoneyCents(quote.data.totals.total);
+      const totalCents = this.toMoneyCents(
+        quote.data.totals.payable ?? quote.data.totals.total,
+      );
       const payments = this.preparePayments(
         input.dto,
         totalCents,
@@ -233,10 +305,13 @@ export class PosService {
         quote: quote.data,
         customerId: input.dto.customerId ?? null,
         reservationId: input.dto.reservationId ?? null,
+        suspendedSaleId: input.dto.suspendedSaleId ?? null,
+        quotationId: input.sourceQuotationId ?? null,
         payments,
+        credit: input.dto.credit ?? null,
       });
       return {
-        data: result.sale,
+        data: this.applyMarginAccess(result.sale, input.canViewMargin),
         meta: { apiVersion: '1', idempotentReplay: result.replay },
       };
     } catch (error) {
@@ -244,6 +319,29 @@ export class PosService {
         throw new ConflictException({
           code: 'IDEMPOTENCY_KEY_REUSED',
           message: 'La clave de idempotencia ya fue usada con otros datos.',
+        });
+      }
+      if (error instanceof LoyaltyInsufficientBalanceError) {
+        throw new ConflictException({
+          code: 'LOYALTY_INSUFFICIENT_BALANCE',
+          available: error.available,
+          requested: error.requested,
+        });
+      }
+      if (error instanceof LoyaltyRuleChangedError) {
+        throw new ConflictException({
+          code: 'LOYALTY_RULE_CHANGED',
+          message:
+            'La regla de fidelización cambió; vuelve a cotizar la venta.',
+        });
+      }
+      if (error instanceof SuspendedSaleStateError) {
+        throw new ConflictException({
+          code:
+            error.status === 'EXPIRED'
+              ? 'SUSPENDED_SALE_EXPIRED'
+              : 'SUSPENDED_SALE_NOT_ACTIVE',
+          status: error.status,
         });
       }
       if (error instanceof PaymentMethodUnavailableError) {
@@ -265,6 +363,17 @@ export class PosService {
           message: 'La referencia del pago ya fue utilizada.',
         });
       }
+      if (error instanceof PaymentTerminalOperationError) {
+        throw new ConflictException({
+          code: `PAYMENT_TERMINAL_${error.code}`,
+          message:
+            error.code === 'NOT_CAPTURED'
+              ? 'El pago del terminal todavía no está capturado.'
+              : error.code === 'ALREADY_USED'
+                ? 'El pago del terminal ya fue aplicado a otra venta.'
+                : 'El pago del terminal no coincide con esta venta o caja.',
+        });
+      }
       if (error instanceof PosInsufficientStockError) {
         throw new ConflictException({
           code: 'INSUFFICIENT_STOCK',
@@ -275,6 +384,22 @@ export class PosService {
         throw new BadRequestException({
           code: 'POS_CUSTOMER_NOT_AVAILABLE',
           message: 'El cliente no existe o está inactivo.',
+        });
+      }
+      if (error instanceof CustomerCreditNotAvailableError) {
+        throw new ConflictException({
+          code: 'CUSTOMER_CREDIT_NOT_AVAILABLE',
+          reason: error.reason,
+          message:
+            'La configuración de crédito del cliente no permite esta venta.',
+        });
+      }
+      if (error instanceof CustomerCreditLimitExceededError) {
+        throw new ConflictException({
+          code: 'CUSTOMER_CREDIT_LIMIT_EXCEEDED',
+          balance: error.balance,
+          limit: error.limit,
+          message: 'La venta excede el límite de crédito disponible.',
         });
       }
       if (error instanceof PosReservationNotAvailableError) {
@@ -292,6 +417,9 @@ export class PosService {
       }
       if (error instanceof InventoryLotNotFoundError) {
         throw new NotFoundException({ code: 'INVENTORY_LOT_NOT_FOUND' });
+      }
+      if (error instanceof ExpiredInventoryLotError) {
+        throw new ConflictException({ code: 'EXPIRED_INVENTORY_LOT' });
       }
       if (error instanceof InsufficientInventoryLotStockError) {
         throw new ConflictException({
@@ -369,6 +497,9 @@ export class PosService {
     cashRegisterId: string;
     userId: string;
     dto: QuoteCartDto;
+    canDiscount?: boolean;
+    canOverridePrice?: boolean;
+    canOverrideExpired?: boolean;
   }): Promise<PosCartQuoteResponse> {
     try {
       await this.shifts.requireCurrent({
@@ -380,7 +511,21 @@ export class PosService {
       const context = await this.pos.getContext(input);
       const requested = new Map<string, bigint>();
       const requestedLots = new Map<string, string | null>();
+      const requestedExpiredReasons = new Map<string, string | null>();
       const requestedSerials = new Map<string, string[]>();
+      const requestedDiscounts = new Map<string, SaleDiscountDto | null>();
+      const requestedNotes = new Map<string, string | null>();
+      const requestedManualPrices = new Map<string, string | null>();
+      const requestedOverrideReasons = new Map<string, string | null>();
+      const hasDiscount =
+        Boolean(input.dto.discount) ||
+        input.dto.lines.some((line) => Boolean(line.discount));
+      if (hasDiscount && !input.canDiscount) {
+        throw new ForbiddenException({
+          code: 'SALE_DISCOUNT_PERMISSION_REQUIRED',
+          message: 'No tienes permiso para aplicar descuentos.',
+        });
+      }
       for (const line of input.dto.lines) {
         const quantity = this.toQuantityUnits(line.quantity);
         if (quantity <= 0n) {
@@ -399,16 +544,65 @@ export class PosService {
           throw new BadRequestException({ code: 'MIXED_PRODUCT_LOTS' });
         }
         requestedLots.set(line.productId, selectedLot);
+        const previousExpiredReason = requestedExpiredReasons.get(
+          line.productId,
+        );
+        const expiredReason = line.expiredLotOverrideReason ?? null;
+        if (
+          previousExpiredReason !== undefined &&
+          previousExpiredReason !== expiredReason
+        ) {
+          throw new BadRequestException({ code: 'MIXED_EXPIRED_LOT_REASONS' });
+        }
+        requestedExpiredReasons.set(line.productId, expiredReason);
         requestedSerials.set(line.productId, [
           ...(requestedSerials.get(line.productId) ?? []),
           ...(line.serialNumbers ?? []),
         ]);
+        const previousDiscount = requestedDiscounts.get(line.productId);
+        const discount = line.discount ?? null;
+        if (
+          previousDiscount !== undefined &&
+          JSON.stringify(previousDiscount) !== JSON.stringify(discount)
+        ) {
+          throw new BadRequestException({
+            code: 'MIXED_PRODUCT_DISCOUNTS',
+            message: 'Un producto repetido debe usar el mismo descuento.',
+          });
+        }
+        requestedDiscounts.set(line.productId, discount);
+        const controls = [
+          [requestedNotes, line.note ?? null],
+          [requestedManualPrices, line.manualUnitPrice ?? null],
+          [requestedOverrideReasons, line.priceOverrideReason ?? null],
+        ] as const;
+        for (const [values, value] of controls) {
+          const previous = values.get(line.productId);
+          if (previous !== undefined && previous !== value) {
+            throw new BadRequestException({
+              code: 'MIXED_PRODUCT_LINE_CONTROLS',
+              message:
+                'Un producto repetido debe usar la misma nota y precio manual.',
+            });
+          }
+          values.set(line.productId, value);
+        }
+      }
+      if (
+        [...requestedManualPrices.values()].some((price) => price !== null) &&
+        !input.canOverridePrice
+      ) {
+        throw new ForbiddenException({
+          code: 'SALE_PRICE_OVERRIDE_PERMISSION_REQUIRED',
+          message: 'No tienes permiso para modificar el precio de venta.',
+        });
       }
       const products = await this.pos.getProducts(
         input.tenantId,
         input.warehouseId,
         [...requested.keys()],
         input.dto.reservationId,
+        this.localDate(context.timezone ?? 'UTC'),
       );
       const selectedLots = [...requestedLots]
         .filter((entry): entry is [string, string] => entry[1] !== null)
@@ -433,10 +627,92 @@ export class PosService {
         this.config.taxRates.DEFAULT ??
         '0.0000';
       const taxBasisPoints = this.taxBasisPoints(taxRate);
-      let subtotalCents = 0n;
-      let taxCents = 0n;
-      let totalCents = 0n;
-      const lines = [...requested.entries()].map(
+      const currency = this.currencyFor(context.countryCode);
+      const resolvedPrices = await this.priceLists.resolve({
+        tenantId: input.tenantId,
+        branchId: input.branchId,
+        ...(input.dto.customerId ? { customerId: input.dto.customerId } : {}),
+        channel: input.dto.channel ?? 'POS',
+        currency,
+        productIds: [...requested.keys()],
+      });
+      const normalizedRequested = new Map(
+        [...requested.entries()].map(([productId, quantity]) => {
+          const product = productMap.get(productId);
+          if (!product)
+            throw new NotFoundException({ code: 'PRODUCT_NOT_FOUND' });
+          return [
+            productId,
+            this.toQuantityUnits(
+              normalizeProductQuantity(this.fromQuantityUnits(quantity), {
+                baseUnit: product.baseUnit ?? 'UNIT',
+                precision: product.quantityPrecision ?? 3,
+                rounding: product.quantityRounding ?? 'HALF_UP',
+                minimumQuantity: product.minimumQuantity ?? '0.001',
+              }),
+            ),
+          ] as const;
+        }),
+      );
+      const inventoryDemand = new Map<
+        string,
+        { quantity: bigint; available: bigint; requestedProductId: string }
+      >();
+      for (const [productId, quantity] of normalizedRequested) {
+        const product = productMap.get(productId)!;
+        if (product.stockBehavior === 'UNTRACKED') {
+          if (
+            input.dto.reservationId ||
+            requestedLots.get(productId) ||
+            (requestedSerials.get(productId)?.length ?? 0) > 0
+          ) {
+            throw new BadRequestException({
+              code: 'UNTRACKED_PRODUCT_INVENTORY_CONTROLS_NOT_SUPPORTED',
+              message:
+                'Los productos sin control de stock no admiten reserva, lote ni serie.',
+            });
+          }
+          continue;
+        }
+        if (product.kit?.stockMode === 'DERIVED') {
+          if (
+            input.dto.reservationId ||
+            requestedLots.get(productId) ||
+            (requestedSerials.get(productId)?.length ?? 0) > 0
+          ) {
+            throw new BadRequestException({
+              code: 'DERIVED_KIT_TRACKING_NOT_SUPPORTED',
+              message:
+                'Los kits derivados no admiten reserva, lote ni serie seleccionada.',
+            });
+          }
+          for (const component of product.kit.components) {
+            const required = this.roundDivide(
+              quantity * this.toQuantityUnits(component.quantity),
+              1000n,
+            );
+            const current = inventoryDemand.get(component.product.id);
+            inventoryDemand.set(component.product.id, {
+              quantity: (current?.quantity ?? 0n) + required,
+              available: this.toQuantityUnits(component.availableQuantity),
+              requestedProductId: current?.requestedProductId ?? productId,
+            });
+          }
+        } else {
+          const current = inventoryDemand.get(productId);
+          inventoryDemand.set(productId, {
+            quantity: (current?.quantity ?? 0n) + quantity,
+            available: this.toQuantityUnits(product.availableQuantity),
+            requestedProductId: current?.requestedProductId ?? productId,
+          });
+        }
+      }
+      for (const demand of inventoryDemand.values()) {
+        if (demand.quantity > demand.available) {
+          throw new PosInsufficientStockError(demand.requestedProductId);
+        }
+      }
+      const preparedLines = [...normalizedRequested.entries()].map(
         ([productId, quantityUnits]) => {
           const product = productMap.get(productId);
           if (!product)
@@ -453,42 +729,269 @@ export class PosService {
             });
           }
           const selectedLotId = requestedLots.get(productId) ?? null;
-          const availableQuantity = selectedLotId
+          const selectedLot = selectedLotId
             ? lotAvailability.get(`${productId}:${selectedLotId}`)
+            : undefined;
+          const availableQuantity = selectedLotId
+            ? selectedLot?.quantity
             : product.availableQuantity;
           if (selectedLotId && availableQuantity === undefined) {
             throw new InventoryLotNotFoundError();
           }
-          if (quantityUnits > this.toQuantityUnits(availableQuantity!)) {
+          const expired = Boolean(
+            selectedLot?.expiresOn &&
+            selectedLot.expiresOn < this.localDate(context.timezone ?? 'UTC'),
+          );
+          const expiredReason = requestedExpiredReasons.get(productId) ?? null;
+          if (expired && !selectedLot?.allowExpiredStockOverride) {
+            throw new ConflictException({
+              code: 'EXPIRED_INVENTORY_LOT',
+              message:
+                'El lote seleccionado está caducado y no puede venderse.',
+            });
+          }
+          if (expired && !input.canOverrideExpired) {
+            throw new ForbiddenException({
+              code: 'EXPIRED_INVENTORY_LOT_PERMISSION_REQUIRED',
+              message: 'No tienes permiso para autorizar stock caducado.',
+            });
+          }
+          if (expired && !expiredReason) {
+            throw new BadRequestException({
+              code: 'EXPIRED_INVENTORY_LOT_REASON_REQUIRED',
+              message: 'Captura el motivo de la excepción de caducidad.',
+            });
+          }
+          if (
+            product.stockBehavior !== 'UNTRACKED' &&
+            quantityUnits > this.toQuantityUnits(availableQuantity!)
+          ) {
             throw new PosInsufficientStockError(productId);
           }
-          const lineTotal = this.roundDivide(
-            this.toMoneyCents(product.price) * quantityUnits,
+          const resolvedPrice = resolvedPrices.get(productId);
+          const referencePrice = resolvedPrice?.price ?? product.price;
+          const manualPrice = requestedManualPrices.get(productId) ?? null;
+          const priceOverrideReason =
+            requestedOverrideReasons.get(productId) ?? null;
+          if (manualPrice && !priceOverrideReason) {
+            throw new BadRequestException({
+              code: 'SALE_PRICE_OVERRIDE_REASON_REQUIRED',
+              message: 'Captura el motivo del precio manual.',
+            });
+          }
+          if (manualPrice) {
+            const referenceCents = this.toMoneyCents(referencePrice);
+            const manualCents = this.toMoneyCents(manualPrice);
+            if (
+              manualCents * 2n < referenceCents ||
+              manualCents > referenceCents * 2n
+            ) {
+              throw new BadRequestException({
+                code: 'SALE_PRICE_OVERRIDE_LIMIT_EXCEEDED',
+                message:
+                  'El precio manual debe estar entre 50% y 200% del precio vigente.',
+              });
+            }
+          }
+          const effectivePrice = manualPrice ?? referencePrice;
+          const grossCents = this.roundDivide(
+            this.toMoneyCents(effectivePrice) * quantityUnits,
             1000n,
           );
-          const lineTax =
-            taxBasisPoints === 0n
-              ? 0n
-              : this.roundDivide(
-                  lineTotal * taxBasisPoints,
-                  10_000n + taxBasisPoints,
-                );
-          const lineSubtotal = lineTotal - lineTax;
-          subtotalCents += lineSubtotal;
-          taxCents += lineTax;
-          totalCents += lineTotal;
+          const requestedDiscount = requestedDiscounts.get(productId) ?? null;
+          const lineDiscountCents = this.discountAmount(
+            requestedDiscount,
+            grossCents,
+          );
+          const kit = product.kit
+            ? {
+                stockMode: product.kit.stockMode,
+                components: product.kit.components.map((component) => ({
+                  product: component.product,
+                  quantityPerKit: component.quantity,
+                  totalQuantity: this.fromQuantityUnits(
+                    this.roundDivide(
+                      quantityUnits * this.toQuantityUnits(component.quantity),
+                      1000n,
+                    ),
+                  ),
+                  unitCost: component.unitCost,
+                })),
+                unitCost: this.fromCostUnits(
+                  product.kit.components.reduce(
+                    (sum, component) =>
+                      sum +
+                      this.roundDivide(
+                        this.toCostUnits(component.unitCost) *
+                          this.toQuantityUnits(component.quantity),
+                        1000n,
+                      ),
+                    0n,
+                  ),
+                ),
+              }
+            : null;
           return {
-            product: { id: product.id, name: product.name, sku: product.sku },
+            product: {
+              id: product.id,
+              name: product.name,
+              sku: product.sku,
+              withoutCode: product.withoutCode,
+              stockBehavior: product.stockBehavior,
+              taxBehavior: product.taxBehavior,
+              baseUnit: product.baseUnit ?? 'UNIT',
+              quantityPrecision: product.quantityPrecision ?? 3,
+              minimumQuantity: product.minimumQuantity ?? '0.001',
+            },
             quantity: this.fromQuantityUnits(quantityUnits),
+            note: requestedNotes.get(productId) ?? null,
             lotId: requestedLots.get(productId) ?? null,
+            expiredLotOverrideReason: expired ? expiredReason : null,
             serialNumbers,
             availableQuantity: availableQuantity!,
-            unitPrice: this.fromMoneyCents(this.toMoneyCents(product.price)),
-            subtotal: this.fromMoneyCents(lineSubtotal),
-            tax: this.fromMoneyCents(lineTax),
-            total: this.fromMoneyCents(lineTotal),
+            kit,
+            unitPrice: this.fromMoneyCents(this.toMoneyCents(effectivePrice)),
+            priceSource: manualPrice
+              ? ('MANUAL' as const)
+              : (resolvedPrice?.source ?? ('BASE' as const)),
+            priceOverrideReason: manualPrice ? priceOverrideReason : null,
+            priceList: manualPrice ? null : (resolvedPrice?.priceList ?? null),
+            grossCents,
+            lineDiscountCents,
+            requestedDiscount,
+            promotions: [] as AppliedPromotion[],
+            promotionDiscountCents: 0n,
           };
         },
+      );
+      const promotionAllocations = await this.promotionEngine.resolve({
+        tenantId: input.tenantId,
+        branchId: input.branchId,
+        ...(input.dto.customerId ? { customerId: input.dto.customerId } : {}),
+        channel: input.dto.channel ?? 'POS',
+        at: new Date(),
+        lines: preparedLines.map((line) => ({
+          productId: line.product.id,
+          quantity: line.quantity,
+          unitPrice: line.unitPrice,
+          grossTotal: this.fromMoneyCents(line.grossCents),
+        })),
+      });
+      for (const line of preparedLines) {
+        line.promotions = promotionAllocations.get(line.product.id) ?? [];
+        line.promotionDiscountCents = line.promotions.reduce(
+          (sum, promotion) => sum + this.toMoneyCents(promotion.amount),
+          0n,
+        );
+        if (
+          line.lineDiscountCents + line.promotionDiscountCents >=
+          line.grossCents
+        ) {
+          throw new BadRequestException({
+            code: 'SALE_DISCOUNT_LIMIT_EXCEEDED',
+            message: 'Los descuentos no pueden consumir el total de una línea.',
+          });
+        }
+      }
+      const grossCents = preparedLines.reduce(
+        (sum, line) => sum + line.grossCents,
+        0n,
+      );
+      const lineDiscountCents = preparedLines.reduce(
+        (sum, line) => sum + line.lineDiscountCents,
+        0n,
+      );
+      const promotionDiscountCents = preparedLines.reduce(
+        (sum, line) => sum + line.promotionDiscountCents,
+        0n,
+      );
+      const saleDiscountBase =
+        grossCents - lineDiscountCents - promotionDiscountCents;
+      const saleDiscountCents = this.discountAmount(
+        input.dto.discount ?? null,
+        saleDiscountBase,
+      );
+      const totalDiscountCents =
+        lineDiscountCents + promotionDiscountCents + saleDiscountCents;
+      if (totalDiscountCents * 2n > grossCents) {
+        throw new BadRequestException({
+          code: 'SALE_DISCOUNT_LIMIT_EXCEEDED',
+          message: 'El descuento combinado no puede superar 50% de la venta.',
+        });
+      }
+      const saleAllocations = this.allocateDiscount(
+        preparedLines.map(
+          (line) =>
+            line.grossCents -
+            line.lineDiscountCents -
+            line.promotionDiscountCents,
+        ),
+        saleDiscountCents,
+      );
+      let subtotalCents = 0n;
+      let taxCents = 0n;
+      let totalCents = 0n;
+      const lines = preparedLines.map((line, index) => {
+        const saleAllocation = saleAllocations[index] ?? 0n;
+        const totalDiscount =
+          line.lineDiscountCents + line.promotionDiscountCents + saleAllocation;
+        const lineTotal = line.grossCents - totalDiscount;
+        const lineTax =
+          taxBasisPoints === 0n || line.product.taxBehavior === 'EXEMPT'
+            ? 0n
+            : this.roundDivide(
+                lineTotal * taxBasisPoints,
+                10_000n + taxBasisPoints,
+              );
+        const lineSubtotal = lineTotal - lineTax;
+        subtotalCents += lineSubtotal;
+        taxCents += lineTax;
+        totalCents += lineTotal;
+        return {
+          product: line.product,
+          quantity: line.quantity,
+          note: line.note,
+          lotId: line.lotId,
+          expiredLotOverrideReason: line.expiredLotOverrideReason,
+          serialNumbers: line.serialNumbers,
+          availableQuantity: line.availableQuantity,
+          kit: line.kit,
+          unitPrice: line.unitPrice,
+          priceSource: line.priceSource,
+          priceOverrideReason: line.priceOverrideReason,
+          priceList: line.priceList,
+          grossTotal: this.fromMoneyCents(line.grossCents),
+          discount: {
+            line: this.appliedDiscount(
+              line.requestedDiscount,
+              line.lineDiscountCents,
+            ),
+            sale: this.appliedDiscount(input.dto.discount, saleAllocation),
+            total: this.fromMoneyCents(totalDiscount),
+          },
+          promotions: line.promotions,
+          subtotal: this.fromMoneyCents(lineSubtotal),
+          tax: this.fromMoneyCents(lineTax),
+          total: this.fromMoneyCents(lineTotal),
+        };
+      });
+      if (input.dto.loyaltyPointsToRedeem && !input.dto.customerId) {
+        throw new BadRequestException({
+          code: 'LOYALTY_CUSTOMER_REQUIRED',
+          message: 'Selecciona un cliente para canjear puntos.',
+        });
+      }
+      const loyalty = input.dto.customerId
+        ? await this.loyalty.preview({
+            tenantId: input.tenantId,
+            customerId: input.dto.customerId,
+            userId: input.userId,
+            saleTotal: this.fromMoneyCents(totalCents),
+            pointsToRedeem: input.dto.loyaltyPointsToRedeem ?? 0,
+          })
+        : null;
+      const loyaltyValueCents = this.toMoneyCents(
+        loyalty?.redemptionValue ?? '0.00',
       );
       return {
         data: {
@@ -496,14 +999,27 @@ export class PosService {
             branch: context.branch,
             warehouse: context.warehouse,
             cashRegister: context.cashRegister,
+            businessDate: this.localDate(context.timezone ?? 'UTC'),
           },
-          currency: this.currencyFor(context.countryCode),
+          currency,
           taxRate: this.normalizeTaxRate(taxRate),
+          discount: this.appliedDiscount(input.dto.discount, saleDiscountCents),
+          loyalty,
           lines,
           totals: {
+            gross: this.fromMoneyCents(grossCents),
+            lineDiscount: this.fromMoneyCents(lineDiscountCents),
+            promotionDiscount: this.fromMoneyCents(promotionDiscountCents),
+            saleDiscount: this.fromMoneyCents(saleDiscountCents),
+            discount: this.fromMoneyCents(totalDiscountCents),
             subtotal: this.fromMoneyCents(subtotalCents),
             tax: this.fromMoneyCents(taxCents),
             total: this.fromMoneyCents(totalCents),
+            ...(loyalty
+              ? {
+                  payable: this.fromMoneyCents(totalCents - loyaltyValueCents),
+                }
+              : {}),
           },
         },
         meta: { apiVersion: '1', recalculatedAt: new Date().toISOString() },
@@ -546,12 +1062,35 @@ export class PosService {
     }
   }
 
+  private applyMarginAccess<
+    T extends {
+      lines: Array<{ grossProfit: string | null }>;
+      totals: { grossProfit: string | null };
+    },
+  >(sale: T, canViewMargin = false): T {
+    if (canViewMargin) return sale;
+    return {
+      ...sale,
+      lines: sale.lines.map((line) => ({ ...line, grossProfit: null })),
+      totals: { ...sale.totals, grossProfit: null },
+    };
+  }
+
   private preparePayments(
     dto: CreateSaleDto,
     totalCents: bigint,
     currency: string,
     idempotencyKey: string,
   ) {
+    if (dto.credit) {
+      if (dto.payment || dto.payments) {
+        throw new BadRequestException({
+          code: 'PAYMENT_CONFIGURATION_INVALID',
+          message: 'Una venta a crédito no puede incluir cobros inmediatos.',
+        });
+      }
+      return [];
+    }
     if ((!dto.payment && !dto.payments) || (dto.payment && dto.payments)) {
       throw new BadRequestException({
         code: 'PAYMENT_CONFIGURATION_INVALID',
@@ -573,9 +1112,12 @@ export class PosService {
       const amountCents = this.toMoneyCents(amount);
       appliedTotal += amountCents;
       const isCash = payment.method === 'CASH';
+      const usesTerminal = Boolean(payment.terminalOperationId);
       if (
         (isCash && payment.reference) ||
-        (!isCash && payment.amountReceived)
+        (!isCash && payment.amountReceived) ||
+        (usesTerminal &&
+          (payment.method !== 'CARD' || Boolean(payment.reference)))
       ) {
         throw new BadRequestException({
           code: 'PAYMENT_FIELDS_INVALID',
@@ -588,7 +1130,7 @@ export class PosService {
           message: 'Indica el efectivo recibido.',
         });
       }
-      if (!isCash && !payment.reference) {
+      if (!isCash && !payment.reference && !usesTerminal) {
         throw new BadRequestException({
           code: 'PAYMENT_REFERENCE_REQUIRED',
           message: 'La referencia es obligatoria para pagos no efectivos.',
@@ -603,19 +1145,26 @@ export class PosService {
           message: 'El efectivo recibido no cubre su parte de la venta.',
         });
       }
-      const authorization = this.paymentAuthorization.authorize({
-        method: payment.method,
-        reference: payment.reference,
-        amount: this.fromMoneyCents(amountCents),
-        currency,
-        idempotencyKey: `${idempotencyKey}:${index}`,
-      });
+      const authorization = usesTerminal
+        ? {
+            provider: 'PAYMENT_TERMINAL',
+            providerReference: null,
+            authorizationCode: null,
+          }
+        : this.paymentAuthorization.authorize({
+            method: payment.method,
+            reference: payment.reference,
+            amount: this.fromMoneyCents(amountCents),
+            currency,
+            idempotencyKey: `${idempotencyKey}:${index}`,
+          });
       return {
         method: payment.method,
         amountReceived: this.fromMoneyCents(receivedCents),
         amountApplied: this.fromMoneyCents(amountCents),
         change: this.fromMoneyCents(receivedCents - amountCents),
-        reference: isCash ? null : payment.reference!,
+        reference: isCash ? null : (payment.reference ?? null),
+        terminalOperationId: payment.terminalOperationId ?? null,
         ...authorization,
       };
     });
@@ -632,6 +1181,10 @@ export class PosService {
     const quantities = new Map<string, bigint>();
     const lots = new Map<string, string | null>();
     const serials = new Map<string, string[]>();
+    const discounts = new Map<string, SaleDiscountDto | null>();
+    const notes = new Map<string, string | null>();
+    const manualPrices = new Map<string, string | null>();
+    const overrideReasons = new Map<string, string | null>();
     for (const line of dto.lines) {
       quantities.set(
         line.productId,
@@ -648,6 +1201,32 @@ export class PosService {
         ...(serials.get(line.productId) ?? []),
         ...(line.serialNumbers ?? []),
       ]);
+      const previousDiscount = discounts.get(line.productId);
+      const discount = line.discount ?? null;
+      if (
+        previousDiscount !== undefined &&
+        JSON.stringify(previousDiscount) !== JSON.stringify(discount)
+      ) {
+        throw new BadRequestException({
+          code: 'MIXED_PRODUCT_DISCOUNTS',
+          message: 'Un producto repetido debe usar el mismo descuento.',
+        });
+      }
+      discounts.set(line.productId, discount);
+      const controls = [
+        [notes, line.note ?? null],
+        [manualPrices, line.manualUnitPrice ?? null],
+        [overrideReasons, line.priceOverrideReason ?? null],
+      ] as const;
+      for (const [values, value] of controls) {
+        const previous = values.get(line.productId);
+        if (previous !== undefined && previous !== value) {
+          throw new BadRequestException({
+            code: 'MIXED_PRODUCT_LINE_CONTROLS',
+          });
+        }
+        values.set(line.productId, value);
+      }
     }
     const canonical = {
       lines: [...quantities.entries()]
@@ -659,6 +1238,15 @@ export class PosService {
           serialNumbers: (serials.get(productId) ?? [])
             .map((value) => value.trim().toUpperCase())
             .sort(),
+          discount: discounts.get(productId)
+            ? {
+                ...discounts.get(productId),
+                reason: discounts.get(productId)!.reason.trim(),
+              }
+            : null,
+          note: notes.get(productId) ?? null,
+          manualUnitPrice: manualPrices.get(productId) ?? null,
+          priceOverrideReason: overrideReasons.get(productId) ?? null,
         })),
       payments: (dto.payments ?? (dto.payment ? [dto.payment] : [])).map(
         (payment) => ({
@@ -670,10 +1258,22 @@ export class PosService {
             ? this.fromMoneyCents(this.toMoneyCents(payment.amountReceived))
             : null,
           reference: payment.reference ?? null,
+          terminalOperationId: payment.terminalOperationId ?? null,
         }),
       ),
+      credit: dto.credit
+        ? { installmentCount: dto.credit.installmentCount }
+        : null,
       customerId: dto.customerId ?? null,
+      loyaltyPointsToRedeem: dto.loyaltyPointsToRedeem ?? 0,
       reservationId: dto.reservationId ?? null,
+      suspendedSaleId: dto.suspendedSaleId ?? null,
+      discount: dto.discount
+        ? {
+            ...dto.discount,
+            reason: dto.discount.reason.trim(),
+          }
+        : null,
     };
     return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
   }
@@ -693,7 +1293,11 @@ export class PosService {
       lines: [...expected.lines].sort((left, right) =>
         left.productId.localeCompare(right.productId),
       ),
-      totals: expected.totals,
+      totals: {
+        subtotal: expected.totals.subtotal,
+        tax: expected.totals.tax,
+        total: expected.totals.total,
+      },
     };
     const currentValue = {
       branchId: current.context.branch.id,
@@ -715,7 +1319,11 @@ export class PosService {
           total: line.total,
         }))
         .sort((left, right) => left.productId.localeCompare(right.productId)),
-      totals: current.totals,
+      totals: {
+        subtotal: current.totals.subtotal,
+        tax: current.totals.tax,
+        total: current.totals.total,
+      },
     };
     if (JSON.stringify(expectedValue) !== JSON.stringify(currentValue)) {
       throw new ConflictException({
@@ -731,8 +1339,106 @@ export class PosService {
     return BigInt(whole) * 1000n + BigInt(fraction.padEnd(3, '0'));
   }
 
+  private discountAmount(
+    discount: SaleDiscountDto | null | undefined,
+    baseCents: bigint,
+  ): bigint {
+    if (!discount) return 0n;
+    if (discount.reason.trim().length < 3) {
+      throw new BadRequestException({
+        code: 'SALE_DISCOUNT_REASON_REQUIRED',
+        message: 'Indica un motivo de al menos tres caracteres.',
+      });
+    }
+    const amount =
+      discount.type === 'PERCENT'
+        ? this.roundDivide(
+            baseCents * this.toPercentageBasisPoints(discount.value),
+            10_000n,
+          )
+        : this.toMoneyCents(discount.value);
+    if (amount <= 0n || amount >= baseCents || amount * 2n > baseCents) {
+      throw new BadRequestException({
+        code: 'SALE_DISCOUNT_LIMIT_EXCEEDED',
+        message:
+          'El descuento debe ser mayor que cero, menor al importe y no superar 50%.',
+      });
+    }
+    return amount;
+  }
+
+  private toPercentageBasisPoints(value: string): bigint {
+    const [whole, fraction = ''] = value.split('.');
+    const basisPoints =
+      BigInt(whole) * 100n + BigInt(fraction.padEnd(2, '0').slice(0, 2));
+    if (basisPoints > 5_000n) {
+      throw new BadRequestException({
+        code: 'SALE_DISCOUNT_LIMIT_EXCEEDED',
+        message: 'El porcentaje de descuento no puede superar 50%.',
+      });
+    }
+    return basisPoints;
+  }
+
+  private appliedDiscount(
+    discount: SaleDiscountDto | null | undefined,
+    amountCents: bigint,
+  ) {
+    if (!discount) return null;
+    return {
+      type: discount.type,
+      value:
+        discount.type === 'PERCENT'
+          ? this.fromPercentageBasisPoints(
+              this.toPercentageBasisPoints(discount.value),
+            )
+          : this.fromMoneyCents(this.toMoneyCents(discount.value)),
+      reason: discount.reason.trim(),
+      amount: this.fromMoneyCents(amountCents),
+    };
+  }
+
+  private allocateDiscount(weights: bigint[], amount: bigint): bigint[] {
+    if (amount === 0n) return weights.map(() => 0n);
+    const total = weights.reduce((sum, weight) => sum + weight, 0n);
+    const allocations = weights.map((weight) => (amount * weight) / total);
+    let remainder =
+      amount - allocations.reduce((sum, value) => sum + value, 0n);
+    const order = weights
+      .map((weight, index) => ({
+        index,
+        remainder: (amount * weight) % total,
+      }))
+      .sort((left, right) =>
+        left.remainder === right.remainder
+          ? left.index - right.index
+          : left.remainder > right.remainder
+            ? -1
+            : 1,
+      );
+    for (const entry of order) {
+      if (remainder === 0n) break;
+      allocations[entry.index] += 1n;
+      remainder -= 1n;
+    }
+    return allocations;
+  }
+
+  private fromPercentageBasisPoints(value: bigint): string {
+    return `${value / 100n}.${String(value % 100n).padStart(2, '0')}`;
+  }
+
   private fromQuantityUnits(value: bigint): string {
     return `${value / 1000n}.${String(value % 1000n).padStart(3, '0')}`;
+  }
+
+  private toCostUnits(value: string): bigint {
+    const [whole, fraction = ''] = value.split('.');
+    return BigInt(whole) * 10_000n + BigInt(fraction.padEnd(4, '0'));
+  }
+
+  private fromCostUnits(value: bigint): string {
+    return `${value / 10_000n}.${String(value % 10_000n).padStart(4, '0')}`;
   }
 
   private toMoneyCents(value: string): bigint {
@@ -756,6 +1462,15 @@ export class PosService {
   private normalizeTaxRate(value: string): string {
     const [whole, fraction = ''] = value.split('.');
     return `${whole}.${fraction.padEnd(4, '0')}`;
+  }
+
+  private localDate(timezone: string, now = new Date()): string {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(now);
   }
 
   private currencyFor(countryCode: string): string {

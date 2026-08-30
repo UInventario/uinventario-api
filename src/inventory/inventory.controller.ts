@@ -35,6 +35,13 @@ import {
   PreviewInventoryValuationPolicyDto,
 } from './dto/change-inventory-valuation-policy.dto';
 import { InventoryReconciliationService } from './inventory-reconciliation.service';
+import {
+  InventoryActivityMovementsDto,
+  InventoryActivityReportDto,
+} from './dto/inventory-activity-report.dto';
+import { InventoryActivityReportService } from './inventory-activity-report.service';
+import { InventoryKitService } from './inventory-kit.service';
+import { CreateInventoryKitOperationDto } from './dto/create-inventory-kit-operation.dto';
 
 @Controller('inventory')
 @UseGuards(SessionGuard, PermissionGuard)
@@ -45,7 +52,78 @@ export class InventoryController {
     private readonly inventoryImports: InventoryImportService,
     private readonly valuationPolicy: InventoryValuationPolicyService,
     private readonly reconciliation: InventoryReconciliationService,
+    private readonly activityReports: InventoryActivityReportService,
+    private readonly inventoryKits: InventoryKitService,
   ) {}
+
+  @Post('kits/:productId/operations')
+  @RequirePermissions('INVENTORY_ADJUST')
+  async operateKit(
+    @Req() request: AuthenticatedRequest,
+    @Param('productId', new ParseUUIDPipe()) productId: string,
+    @Headers('idempotency-key') idempotencyKey: string | undefined,
+    @Body() dto: CreateInventoryKitOperationDto,
+  ) {
+    const result = await this.inventoryKits.operate({
+      tenantId: request.principal.tenant.id,
+      warehouseId: request.principal.context.warehouse!.id,
+      userId: request.principal.user.id,
+      productId,
+      idempotencyKey,
+      dto,
+    });
+    if (!result.meta.idempotentReplay) {
+      await this.audit.record({
+        tenantId: request.principal.tenant.id,
+        actorUserId: request.principal.user.id,
+        action:
+          dto.operationType === 'ASSEMBLE'
+            ? 'PRODUCT_KIT_ASSEMBLED'
+            : 'PRODUCT_KIT_DISASSEMBLED',
+        entityType: 'KIT_INVENTORY_OPERATION',
+        entityId: result.data.id,
+        correlationId: request.requestId!,
+        after: {
+          kitProductId: productId,
+          locationId: dto.locationId,
+          quantity: result.data.quantity,
+        },
+      });
+    }
+    return result;
+  }
+
+  @Get('reports/activity')
+  @RequirePermissions('INVENTORY_VIEW')
+  activityReport(
+    @Req() request: AuthenticatedRequest,
+    @Query() query: InventoryActivityReportDto,
+  ) {
+    const { principal } = request;
+    return this.activityReports.report({
+      tenantId: principal.tenant.id,
+      userId: principal.user.id,
+      administrator: principal.user.permissions.includes('TENANT_MANAGE'),
+      query,
+    });
+  }
+
+  @Get('reports/activity/:productId/movements')
+  @RequirePermissions('INVENTORY_VIEW')
+  activityMovements(
+    @Req() request: AuthenticatedRequest,
+    @Param('productId', new ParseUUIDPipe()) productId: string,
+    @Query() query: InventoryActivityMovementsDto,
+  ) {
+    const { principal } = request;
+    return this.activityReports.movements({
+      tenantId: principal.tenant.id,
+      userId: principal.user.id,
+      administrator: principal.user.permissions.includes('TENANT_MANAGE'),
+      productId,
+      query,
+    });
+  }
 
   @Get('reconciliations/latest')
   @RequirePermissions('INVENTORY_VIEW')
@@ -229,6 +307,15 @@ export class InventoryController {
       request.principal.tenant.id,
       request.principal.context.warehouse!.id,
       productId,
+    );
+  }
+
+  @Get('lot-expiration-alerts')
+  @RequirePermissions('INVENTORY_VIEW')
+  listLotExpirationAlerts(@Req() request: AuthenticatedRequest) {
+    return this.inventory.listLotExpirationAlerts(
+      request.principal.tenant.id,
+      request.principal.context.warehouse!.id,
     );
   }
 

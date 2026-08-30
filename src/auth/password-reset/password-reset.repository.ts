@@ -11,10 +11,12 @@ export class PasswordResetRepository {
     tokenHash: string;
     expiresAt: Date;
     now: Date;
-  }): Promise<{ email: string } | null> {
+  }): Promise<{ email: string; tenantId: string } | null> {
     return this.dataSource.transaction(async (manager) => {
-      const [user] = await manager.query<Array<{ id: string; email: string }>>(
-        'SELECT id, email FROM users WHERE normalized_email = ? LIMIT 1',
+      const [user] = await manager.query<
+        Array<{ id: string; email: string; tenant_id: string }>
+      >(
+        'SELECT id, email, tenant_id FROM users WHERE normalized_email = ? LIMIT 1',
         [input.normalizedEmail],
       );
       if (!user) return null;
@@ -27,7 +29,7 @@ export class PasswordResetRepository {
          VALUES (?, ?, ?, ?)`,
         [randomUUID(), user.id, input.tokenHash, input.expiresAt],
       );
-      return { email: user.email };
+      return { email: user.email, tenantId: user.tenant_id };
     });
   }
 

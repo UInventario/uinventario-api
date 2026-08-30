@@ -7,6 +7,7 @@ import { configureApp } from './security/configure-app';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     logger: new ConsoleLogger({ colors: false, compact: true, json: true }),
+    rawBody: true,
   });
   const config = app.get(ConfigService);
   configureApp(app);

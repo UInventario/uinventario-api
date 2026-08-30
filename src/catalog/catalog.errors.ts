@@ -27,3 +27,33 @@ export class ProductLotTrackingLockedError extends Error {
     super('PRODUCT_LOT_TRACKING_LOCKED');
   }
 }
+
+export class ProductQuantityPolicyLockedError extends Error {
+  constructor() {
+    super('PRODUCT_QUANTITY_POLICY_LOCKED');
+  }
+}
+
+export class ProductSaleBehaviorError extends Error {
+  constructor(readonly reason: string) {
+    super('PRODUCT_SALE_BEHAVIOR_INVALID');
+  }
+}
+
+export class ProductVariantConfigurationError extends Error {
+  constructor(readonly reason: string) {
+    super('PRODUCT_VARIANT_CONFIGURATION_INVALID');
+  }
+}
+
+export class ProductVariantsRequireZeroStockError extends Error {
+  constructor() {
+    super('PRODUCT_VARIANTS_REQUIRE_ZERO_STOCK');
+  }
+}
+
+export class ProductKitConfigurationError extends Error {
+  constructor(readonly reason: string) {
+    super('PRODUCT_KIT_CONFIGURATION_INVALID');
+  }
+}

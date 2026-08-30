@@ -133,7 +133,8 @@ export class ProductReservationRepository {
               throw new ProductReservationTargetNotFoundError();
             const [product] = await manager.query<Array<{ id: string }>>(
               `SELECT id FROM products
-             WHERE id = ? AND tenant_id = ? AND active = TRUE LIMIT 1 FOR UPDATE`,
+             WHERE id = ? AND tenant_id = ? AND active = TRUE
+               AND variant_schema IS NULL LIMIT 1 FOR UPDATE`,
               [line.productId, input.tenantId],
             );
             if (!product) throw new ProductReservationTargetNotFoundError();

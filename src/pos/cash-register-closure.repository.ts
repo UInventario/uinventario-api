@@ -175,7 +175,13 @@ export class CashRegisterClosureRepository {
            INNER JOIN sale_payments sp ON sp.sale_id = s.id AND sp.tenant_id = s.tenant_id
              AND sp.method = 'CASH'
            WHERE s.tenant_id = crs.tenant_id AND s.cash_register_shift_id = crs.id
-             AND s.status = 'COMPLETED'), 0) AS cash_sales,
+             AND s.status = 'COMPLETED'), 0)
+         - COALESCE((SELECT SUM(settlement.amount)
+             FROM sale_return_settlements settlement
+             WHERE settlement.tenant_id = crs.tenant_id
+               AND settlement.cash_register_shift_id = crs.id
+               AND settlement.method = 'CASH'
+               AND settlement.status = 'COMPLETED'), 0) AS cash_sales,
          (SELECT COUNT(*) FROM cash_register_movements cm
            WHERE cm.tenant_id = crs.tenant_id
              AND cm.cash_register_shift_id = crs.id) AS movements_count,
@@ -231,6 +237,12 @@ export class CashRegisterClosureRepository {
                          AND sp.method = 'CASH'
                      WHERE s.tenant_id = crs.tenant_id
                        AND s.cash_register_shift_id = crs.id AND s.status = 'COMPLETED'), 0)
+                   - COALESCE((SELECT SUM(settlement.amount)
+                       FROM sale_return_settlements settlement
+                       WHERE settlement.tenant_id = crs.tenant_id
+                         AND settlement.cash_register_shift_id = crs.id
+                         AND settlement.method = 'CASH'
+                         AND settlement.status = 'COMPLETED'), 0)
                      AS cash_sales,
                    (SELECT COUNT(*) FROM cash_register_movements cm
                      WHERE cm.tenant_id = crs.tenant_id

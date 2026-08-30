@@ -31,6 +31,16 @@ import { DataExportModule } from './data-exports/data-export.module';
 import { SecurityThrottlerGuard } from './security/security-throttler.guard';
 import { ObservabilityModule } from './observability/observability.module';
 import { PrivacyModule } from './privacy/privacy.module';
+import { PriceListModule } from './pricing/price-list.module';
+import { PromotionModule } from './promotions/promotion.module';
+import { CustomerOrderModule } from './orders/customer-order.module';
+import { SalesQuotationModule } from './quotations/sales-quotation.module';
+import { NotificationModule } from './notifications/notification.module';
+import { ExternalAdapterModule } from './integrations/external-adapter.module';
+import { emailProviderConfig } from './config/email-provider.config';
+import { LoyaltyModule } from './loyalty/loyalty.module';
+import { CommerceModule } from './commerce/commerce.module';
+import { DemandForecastModule } from './forecasting/demand-forecast.module';
 
 @Module({
   imports: [
@@ -43,6 +53,7 @@ import { PrivacyModule } from './privacy/privacy.module';
         sessionConfig,
         posConfig,
         passwordResetConfig,
+        emailProviderConfig,
       ],
       validationSchema,
       validationOptions: { abortEarly: true, allowUnknown: true },
@@ -80,6 +91,15 @@ import { PrivacyModule } from './privacy/privacy.module';
     PosModule,
     DataExportModule,
     PrivacyModule,
+    PriceListModule,
+    PromotionModule,
+    CustomerOrderModule,
+    SalesQuotationModule,
+    NotificationModule,
+    ExternalAdapterModule,
+    LoyaltyModule,
+    CommerceModule,
+    DemandForecastModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: SecurityThrottlerGuard }],
 })

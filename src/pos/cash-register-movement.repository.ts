@@ -282,6 +282,14 @@ export class CashRegisterMovementRepository {
              WHERE s.tenant_id = crs.tenant_id
                AND s.cash_register_shift_id = crs.id AND s.status = 'COMPLETED'
            ), 0)
+         - COALESCE((
+             SELECT SUM(settlement.amount)
+             FROM sale_return_settlements settlement
+             WHERE settlement.tenant_id = crs.tenant_id
+               AND settlement.cash_register_shift_id = crs.id
+               AND settlement.method = 'CASH'
+               AND settlement.status = 'COMPLETED'
+           ), 0)
          + COALESCE((
              SELECT SUM(CASE
                WHEN cm.type = 'INCOME' THEN cm.amount

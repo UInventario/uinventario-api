@@ -12,6 +12,7 @@ import {
   Req,
   UseGuards,
 } from '@nestjs/common';
+import { quantityToUnits } from '../common/quantity-policy';
 import { AuditService } from '../audit/audit.service';
 import { PermissionGuard } from '../auth/authorization/permission.guard';
 import { RequirePermissions } from '../auth/authorization/require-permissions.decorator';
@@ -214,7 +215,7 @@ export class PurchaseOrderController {
           locationId: receipt.location.id,
           status: result.data.status,
           overage: receipt.lines.some(
-            (line) => Number(line.overageQuantity) > 0,
+            (line) => quantityToUnits(line.overageQuantity) > 0n,
           ),
         },
       });

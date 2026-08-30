@@ -32,6 +32,8 @@ import { PermissionGuard } from '../auth/authorization/permission.guard';
 import { RequirePermissions } from '../auth/authorization/require-permissions.decorator';
 import { SalesCashReportDto } from './dto/sales-cash-report.dto';
 import { SalesCashReportService } from './sales-cash-report.service';
+import { PosProfitabilityReportDto } from './dto/pos-profitability-report.dto';
+import { PosProfitabilityReportService } from './pos-profitability-report.service';
 
 @Controller('pos')
 @UseGuards(SessionGuard, PosAccessGuard)
@@ -43,7 +45,24 @@ export class PosController {
     private readonly closures: CashRegisterClosureService,
     private readonly audit: AuditService,
     private readonly reports: SalesCashReportService,
+    private readonly profitabilityReports: PosProfitabilityReportService,
   ) {}
+
+  @Get('reports/profitability')
+  @UseGuards(PermissionGuard)
+  @RequirePermissions('SALES_MANAGE', 'INVENTORY_VALUATION_MANAGE')
+  profitabilityReport(
+    @Req() request: AuthenticatedRequest,
+    @Query() query: PosProfitabilityReportDto,
+  ) {
+    const { principal } = request;
+    return this.profitabilityReports.report({
+      tenantId: principal.tenant.id,
+      userId: principal.user.id,
+      administrator: principal.user.permissions.includes('TENANT_MANAGE'),
+      query,
+    });
+  }
 
   @Get('reports/sales-cash')
   @UseGuards(PermissionGuard)
@@ -210,6 +229,7 @@ export class PosController {
       principal.tenant.id,
       principal.context.branch!.id,
       saleId,
+      principal.user.permissions.includes('INVENTORY_VALUATION_MANAGE'),
     );
   }
 
@@ -247,6 +267,13 @@ export class PosController {
       cashRegisterId: principal.context.cashRegister!.id,
       userId: principal.user.id,
       dto,
+      canDiscount: principal.user.permissions.includes('SALES_DISCOUNT'),
+      canOverridePrice: principal.user.permissions.includes(
+        'SALES_PRICE_OVERRIDE',
+      ),
+      canOverrideExpired: principal.user.permissions.includes(
+        'INVENTORY_EXPIRED_STOCK_OVERRIDE',
+      ),
     });
   }
 
@@ -265,6 +292,16 @@ export class PosController {
       userId: principal.user.id,
       idempotencyKey,
       dto,
+      canDiscount: principal.user.permissions.includes('SALES_DISCOUNT'),
+      canOverridePrice: principal.user.permissions.includes(
+        'SALES_PRICE_OVERRIDE',
+      ),
+      canOverrideExpired: principal.user.permissions.includes(
+        'INVENTORY_EXPIRED_STOCK_OVERRIDE',
+      ),
+      canViewMargin: principal.user.permissions.includes(
+        'INVENTORY_VALUATION_MANAGE',
+      ),
     });
     await this.audit.record({
       tenantId: principal.tenant.id,
@@ -274,6 +311,12 @@ export class PosController {
       entityId: result.data.id,
       correlationId: request.requestId!,
       deduplicate: true,
+      after: {
+        discountTotal: result.data.totals.discount,
+        discountReasons: this.discountReasons(result.data),
+        priceOverrides: this.priceOverrides(result.data),
+        expiredLotOverrides: this.expiredLotOverrides(result.data),
+      },
     });
     if (dto.reservationId) {
       await this.audit.record({
@@ -305,6 +348,17 @@ export class PosController {
       userId: principal.user.id,
       idempotencyKey,
       dto,
+      canDiscount: principal.user.permissions.includes('SALES_DISCOUNT'),
+      canOverridePrice: principal.user.permissions.includes(
+        'SALES_PRICE_OVERRIDE',
+      ),
+      canOverrideExpired: principal.user.permissions.includes(
+        'INVENTORY_EXPIRED_STOCK_OVERRIDE',
+      ),
+      canCredit: principal.user.permissions.includes('SALES_CREDIT'),
+      canViewMargin: principal.user.permissions.includes(
+        'INVENTORY_VALUATION_MANAGE',
+      ),
     });
     await this.audit.record({
       tenantId: principal.tenant.id,
@@ -316,6 +370,10 @@ export class PosController {
       deduplicate: true,
       after: {
         paymentMethods: result.data.payments.map((payment) => payment.method),
+        discountTotal: result.data.totals.discount,
+        discountReasons: this.discountReasons(result.data),
+        priceOverrides: this.priceOverrides(result.data),
+        expiredLotOverrides: this.expiredLotOverrides(result.data),
       },
     });
     if (dto.reservationId) {
@@ -340,6 +398,46 @@ export class PosController {
       cashRegisterId: principal.context.cashRegister!.id,
       userId: principal.user.id,
     };
+  }
+
+  private discountReasons(
+    sale: Awaited<ReturnType<PosService['createSale']>>['data'],
+  ): string[] {
+    return [
+      sale.discount?.reason,
+      ...sale.lines.map((line) => line.discount.line?.reason),
+    ].filter((reason): reason is string => Boolean(reason));
+  }
+
+  private expiredLotOverrides(
+    sale: Awaited<ReturnType<PosService['createSale']>>['data'],
+  ): Array<{ productId: string; reason: string }> {
+    return sale.lines.flatMap((line) =>
+      line.expiredLotOverrideReason
+        ? [
+            {
+              productId: line.product.id,
+              reason: line.expiredLotOverrideReason,
+            },
+          ]
+        : [],
+    );
+  }
+
+  private priceOverrides(
+    sale: Awaited<ReturnType<PosService['createSale']>>['data'],
+  ): Array<{ productId: string; unitPrice: string; reason: string }> {
+    return sale.lines.flatMap((line) =>
+      line.priceSource === 'MANUAL' && line.priceOverrideReason
+        ? [
+            {
+              productId: line.product.id,
+              unitPrice: line.unitPrice,
+              reason: line.priceOverrideReason,
+            },
+          ]
+        : [],
+    );
   }
 
   private async auditCashMovement(

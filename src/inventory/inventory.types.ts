@@ -16,6 +16,7 @@ export const INVENTORY_MOVEMENT_TYPES = [
   'TRANSFER_DISCREPANCY',
   'SALE',
   'SALE_VOID',
+  'SALE_RETURN',
   'PURCHASE_RECEIPT',
   'SUPPLIER_RETURN',
 ] as const;
@@ -31,6 +32,7 @@ export type UserInventoryMovementType = Exclude<
   | 'TRANSFER_DISCREPANCY'
   | 'SALE'
   | 'SALE_VOID'
+  | 'SALE_RETURN'
   | 'PURCHASE_RECEIPT'
   | 'SUPPLIER_RETURN'
 >;
@@ -125,6 +127,11 @@ export interface InventoryLotData {
   unitCost: string;
   currency: string;
   inventoryValue: string;
+  manufacturedOn: string | null;
+  expiresOn: string | null;
+  expirationStatus:
+    'NO_EXPIRATION' | 'ACTIVE' | 'EXPIRING' | 'EXPIRED' | 'EXHAUSTED';
+  daysUntilExpiration: number | null;
   createdAt: string;
   origins: Array<{
     purchaseReceiptLineId: string;
@@ -138,6 +145,21 @@ export interface InventoryLotData {
     location: InventoryLocationData;
     quantity: string;
   }>;
+}
+
+export interface InventoryLotExpirationAlertData {
+  id: string;
+  status: 'EXPIRING' | 'EXPIRED';
+  product: { id: string; name: string; sku: string };
+  lot: { id: string; code: string; expiresOn: string };
+  location: InventoryLocationData;
+  quantity: string;
+  daysUntilExpiration: number;
+}
+
+export interface InventoryLotExpirationAlertsResponse {
+  data: InventoryLotExpirationAlertData[];
+  meta: { apiVersion: '1'; businessDate: string };
 }
 
 export interface InventoryLotsResponse {
@@ -303,6 +325,7 @@ export interface InventoryMovementHistoryItem {
       | 'MOVEMENT'
       | 'IMPORT'
       | 'SALE'
+      | 'SALE_RETURN'
       | 'TRANSFER'
       | 'RECEIPT'
       | 'PURCHASE_RECEIPT'
@@ -343,6 +366,9 @@ export interface InventoryStockItem {
     sku: string;
     active: boolean;
     trackLots: boolean;
+    baseUnit: import('../common/quantity-policy').ProductBaseUnit;
+    quantityPrecision: number;
+    minimumQuantity: string;
   };
   availableQuantity: string;
   totalQuantity: string;

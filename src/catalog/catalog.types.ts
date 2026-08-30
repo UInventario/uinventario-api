@@ -3,7 +3,17 @@ export interface ProductData {
   name: string;
   sku: string;
   barcode: string | null;
+  withoutCode: boolean;
+  stockBehavior: 'TRACKED' | 'UNTRACKED';
+  taxBehavior: 'STANDARD' | 'EXEMPT';
+  baseUnit: import('../common/quantity-policy').ProductBaseUnit;
+  quantityPrecision: number;
+  quantityRounding: import('../common/quantity-policy').QuantityRoundingMode;
+  minimumQuantity: string;
   trackLots: boolean;
+  lotExpirationPolicy?: 'NONE' | 'OPTIONAL' | 'REQUIRED';
+  lotExpirationAlertDays?: number;
+  allowExpiredStockOverride?: boolean;
   trackSerials: boolean;
   category: { id: string; name: string } | null;
   brand: { id: string; name: string } | null;
@@ -11,6 +21,23 @@ export interface ProductData {
   price: string;
   active: boolean;
   version: number;
+  parentProductId: string | null;
+  variantAttributes: Array<{ name: string; values: string[] }>;
+  variantValues: Array<{ attribute: string; value: string }>;
+  sellable: boolean;
+  variants: ProductData[];
+  kit: ProductKitData | null;
+}
+
+export interface ProductKitData {
+  stockMode: 'DERIVED' | 'ASSEMBLED';
+  priceRule: 'FIXED' | 'COMPONENT_SUM';
+  effectiveFrom: string | null;
+  effectiveTo: string | null;
+  components: Array<{
+    product: { id: string; name: string; sku: string };
+    quantity: string;
+  }>;
 }
 
 export interface ProductResponse {

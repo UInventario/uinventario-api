@@ -34,6 +34,16 @@ export class ReceivePurchaseOrderLineDto {
   @Matches(/^[A-Za-z0-9][A-Za-z0-9._/ -]{0,63}$/)
   lotCode?: string;
 
+  @Transform(trim)
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  manufacturedOn?: string;
+
+  @Transform(trim)
+  @IsOptional()
+  @Matches(/^\d{4}-\d{2}-\d{2}$/)
+  expiresOn?: string;
+
   @IsOptional()
   @IsArray()
   @ArrayMaxSize(1000)

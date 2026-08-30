@@ -24,6 +24,9 @@ import {
   InventoryLotRequiredError,
   InventoryFifoCurrencyMismatchError,
   InventoryFifoLayerShortageError,
+  InvalidInventoryLotDatesError,
+  InventoryLotExpirationRequiredError,
+  ExpiredInventoryLotError,
 } from './inventory.errors';
 import { InventoryRepository } from './inventory.repository';
 import {
@@ -43,6 +46,7 @@ import {
   InventoryStockListResponse,
   InventoryStateTransitionResponse,
   InventoryLotsResponse,
+  InventoryLotExpirationAlertsResponse,
   InventoryFifoLayersResponse,
   InventorySerialHistoryResponse,
   InventorySerialsResponse,
@@ -85,6 +89,26 @@ export class InventoryService {
           currency: result.currency,
           inventoryValue: result.inventoryValue,
         },
+      };
+    } catch (error) {
+      if (error instanceof InventoryTargetNotFoundError)
+        throw new NotFoundException();
+      throw error;
+    }
+  }
+
+  async listLotExpirationAlerts(
+    tenantId: string,
+    warehouseId: string,
+  ): Promise<InventoryLotExpirationAlertsResponse> {
+    try {
+      const result = await this.inventory.listLotExpirationAlerts(
+        tenantId,
+        warehouseId,
+      );
+      return {
+        data: result.items,
+        meta: { apiVersion: '1', businessDate: result.businessDate },
       };
     } catch (error) {
       if (error instanceof InventoryTargetNotFoundError)
@@ -298,6 +322,24 @@ export class InventoryService {
       throw new BadRequestException({
         code: 'INVENTORY_LOT_REQUIRED',
         message: 'Indica el lote para este producto.',
+      });
+    }
+    if (error instanceof InventoryLotExpirationRequiredError) {
+      throw new BadRequestException({
+        code: 'INVENTORY_LOT_EXPIRATION_REQUIRED',
+        message: 'Indica la fecha de caducidad para este producto.',
+      });
+    }
+    if (error instanceof InvalidInventoryLotDatesError) {
+      throw new BadRequestException({
+        code: 'INVALID_INVENTORY_LOT_DATES',
+        message: 'Las fechas del lote no son válidas o no coinciden.',
+      });
+    }
+    if (error instanceof ExpiredInventoryLotError) {
+      throw new ConflictException({
+        code: 'EXPIRED_INVENTORY_LOT',
+        message: 'El lote está caducado y no puede salir del inventario.',
       });
     }
     if (error instanceof InvalidInventoryLotCodeError) {

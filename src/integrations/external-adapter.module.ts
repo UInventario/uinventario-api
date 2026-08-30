@@ -1,0 +1,90 @@
+import { Module } from '@nestjs/common';
+import { AuditModule } from '../audit/audit.module';
+import { PermissionGuard } from '../auth/authorization/permission.guard';
+import { SessionModule } from '../auth/session/session.module';
+import { ExternalAdapterExecutionService } from './external-adapter-execution.service';
+import { ExternalAdapterController } from './external-adapter.controller';
+import { ExternalAdapterRegistry } from './external-adapter.registry';
+import { ExternalAdapterRepository } from './external-adapter.repository';
+import { ExternalAdapterService } from './external-adapter.service';
+import {
+  SimulatedEmailExternalAdapter,
+  SimulatedPushExternalAdapter,
+  SimulatedWhatsAppExternalAdapter,
+} from './simulated-notification.adapter';
+import { ResendEmailExternalAdapter } from './resend-email.adapter';
+import { TransactionalEmailTemplateService } from './transactional-email-template.service';
+import { ResendWebhookController } from './resend-webhook.controller';
+import { ResendWebhookService } from './resend-webhook.service';
+import { FiscalContractController } from './fiscal-contract.controller';
+import { FiscalContractRegistry } from './fiscal-contract.registry';
+import { FiscalContractRepository } from './fiscal-contract.repository';
+import { FiscalContractService } from './fiscal-contract.service';
+import { FiscalSimulatorController } from './fiscal-simulator.controller';
+import { FiscalSimulatorRepository } from './fiscal-simulator.repository';
+import { FiscalSimulatorService } from './fiscal-simulator.service';
+import { SimulatedFiscalAdapter } from './simulated-fiscal.adapter';
+import { ErpIntegrationController } from './erp-integration.controller';
+import { ErpIntegrationRepository } from './erp-integration.repository';
+import { ErpIntegrationService } from './erp-integration.service';
+import { PspPaymentController } from './psp-payment.controller';
+import { PspPaymentRepository } from './psp-payment.repository';
+import { PspPaymentService } from './psp-payment.service';
+import { SimulatedPspAdapter } from './simulated-psp.adapter';
+import { AccountingController } from './accounting.controller';
+import { AccountingRepository } from './accounting.repository';
+import { AccountingService } from './accounting.service';
+import { SimulatedAccountingAdapter } from './simulated-accounting.adapter';
+import { WhatsappController } from './whatsapp.controller';
+import { WhatsappRepository } from './whatsapp.repository';
+import { WhatsappService } from './whatsapp.service';
+
+@Module({
+  imports: [SessionModule, AuditModule],
+  controllers: [
+    ExternalAdapterController,
+    ResendWebhookController,
+    FiscalContractController,
+    FiscalSimulatorController,
+    ErpIntegrationController,
+    PspPaymentController,
+    AccountingController,
+    WhatsappController,
+  ],
+  providers: [
+    ExternalAdapterRepository,
+    ExternalAdapterRegistry,
+    ExternalAdapterExecutionService,
+    ExternalAdapterService,
+    SimulatedEmailExternalAdapter,
+    SimulatedPushExternalAdapter,
+    SimulatedWhatsAppExternalAdapter,
+    ResendEmailExternalAdapter,
+    TransactionalEmailTemplateService,
+    ResendWebhookService,
+    FiscalContractRegistry,
+    FiscalContractRepository,
+    FiscalContractService,
+    SimulatedFiscalAdapter,
+    FiscalSimulatorRepository,
+    FiscalSimulatorService,
+    ErpIntegrationRepository,
+    ErpIntegrationService,
+    PspPaymentRepository,
+    PspPaymentService,
+    SimulatedPspAdapter,
+    AccountingRepository,
+    AccountingService,
+    SimulatedAccountingAdapter,
+    WhatsappRepository,
+    WhatsappService,
+    PermissionGuard,
+  ],
+  exports: [
+    ExternalAdapterExecutionService,
+    ExternalAdapterRepository,
+    TransactionalEmailTemplateService,
+    FiscalSimulatorService,
+  ],
+})
+export class ExternalAdapterModule {}

@@ -35,6 +35,7 @@ export const OFFLINE_SYNC_ENTITY_KINDS = [
   'CATEGORY',
   'BRAND',
   'PRODUCT',
+  'PRICE_LIST',
   'INVENTORY_AVAILABILITY',
 ] as const;
 
@@ -99,6 +100,10 @@ export interface OfflineProductV1 extends OfflineSyncRecordV1 {
   categoryId: string | null;
   brandId: string | null;
   price: string;
+  baseUnit?: import('../common/quantity-policy').ProductBaseUnit;
+  quantityPrecision?: number;
+  quantityRounding?: import('../common/quantity-policy').QuantityRoundingMode;
+  minimumQuantity?: string;
   active: boolean;
 }
 
@@ -107,6 +112,20 @@ export interface OfflineInventoryAvailabilityV1 extends OfflineSyncRecordV1 {
   productId: string;
   locationId: string;
   availableQuantity: string;
+}
+
+export interface OfflinePriceListV1 extends OfflineSyncRecordV1 {
+  kind: 'PRICE_LIST';
+  name: string;
+  currency: string;
+  branchId: string | null;
+  customerId: string | null;
+  channel: 'POS' | 'WEB' | 'MOBILE' | 'DESKTOP' | null;
+  priority: number;
+  validFrom: string;
+  validTo: string | null;
+  active: boolean;
+  items: Array<{ productId: string; price: string }>;
 }
 
 export interface OfflinePosPolicyV1 extends OfflineSyncRecordV1 {
@@ -129,6 +148,7 @@ export type OfflineSyncEntityV1 =
   | OfflineCashRegisterV1
   | OfflineClassificationV1
   | OfflineProductV1
+  | OfflinePriceListV1
   | OfflineInventoryAvailabilityV1;
 
 export interface OfflineBootstrapRequestV1 {

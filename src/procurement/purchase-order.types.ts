@@ -12,6 +12,9 @@ export interface PurchaseOrderLineData {
   productId: string;
   productName: string;
   productSku: string;
+  baseUnit: import('../common/quantity-policy').ProductBaseUnit;
+  quantityPrecision: number;
+  minimumQuantity: string;
   supplierCode: string;
   quantity: string;
   receivedQuantity: string;
@@ -55,6 +58,8 @@ export interface PurchaseReceiptData {
     purchaseOrderLineId: string;
     receivedQuantity: string;
     lotCode: string | null;
+    manufacturedOn: string | null;
+    expiresOn: string | null;
     overageQuantity: string;
     unitCost: string;
     totalCost: string;

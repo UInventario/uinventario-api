@@ -78,7 +78,7 @@ async function resolveSourceCost(
     return toScaled(line.unit_cost, MONEY_DECIMALS);
   }
 
-  if (movement.type === 'SALE_VOID') {
+  if (movement.type === 'SALE_VOID' || movement.type === 'SALE_RETURN') {
     const [originalMovement] = await manager.query<{ unit_cost: string }[]>(
       `SELECT unit_cost
        FROM inventory_movements
@@ -149,7 +149,9 @@ export async function applyInventoryValuation(
 
   const isValuedEntry =
     quantityChange > 0n &&
-    (movement.type === 'PURCHASE_RECEIPT' || movement.type === 'SALE_VOID');
+    (movement.type === 'PURCHASE_RECEIPT' ||
+      movement.type === 'SALE_VOID' ||
+      movement.type === 'SALE_RETURN');
   const unitCost = isValuedEntry
     ? await resolveSourceCost(manager, movement, currentAverage)
     : currentAverage;
