@@ -15,10 +15,18 @@ import { ResendEmailExternalAdapter } from './resend-email.adapter';
 import { TransactionalEmailTemplateService } from './transactional-email-template.service';
 import { ResendWebhookController } from './resend-webhook.controller';
 import { ResendWebhookService } from './resend-webhook.service';
+import { FiscalContractController } from './fiscal-contract.controller';
+import { FiscalContractRegistry } from './fiscal-contract.registry';
+import { FiscalContractRepository } from './fiscal-contract.repository';
+import { FiscalContractService } from './fiscal-contract.service';
 
 @Module({
   imports: [SessionModule, AuditModule],
-  controllers: [ExternalAdapterController, ResendWebhookController],
+  controllers: [
+    ExternalAdapterController,
+    ResendWebhookController,
+    FiscalContractController,
+  ],
   providers: [
     ExternalAdapterRepository,
     ExternalAdapterRegistry,
@@ -29,6 +37,9 @@ import { ResendWebhookService } from './resend-webhook.service';
     ResendEmailExternalAdapter,
     TransactionalEmailTemplateService,
     ResendWebhookService,
+    FiscalContractRegistry,
+    FiscalContractRepository,
+    FiscalContractService,
     PermissionGuard,
   ],
   exports: [
