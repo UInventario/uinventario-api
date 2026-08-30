@@ -580,7 +580,7 @@ export class SalesRepository {
       provider: string;
       providerReference: string | null;
       authorizationCode: string | null;
-      terminalOperationId: string | null;
+      terminalOperationId?: string | null;
     }>;
     credit?: { installmentCount: number } | null;
   }): Promise<{ sale: CashSaleData; replay: boolean }> {
