@@ -19,12 +19,14 @@ case "$environment" in
     database_secret="uinventario-dev-database-url"
     email_secret="uinventario-dev-resend-config"
     observability_success_sample_rate="0.20"
+    password_reset_path="/v2/restablecer"
     ;;
   prod)
     project_id="software-inventario-prod"
     database_secret="uinventario-prod-database-url"
     email_secret="uinventario-prod-resend-config"
     observability_success_sample_rate="0.05"
+    password_reset_path="/restablecer"
     ;;
   *) usage ;;
 esac
@@ -103,7 +105,7 @@ gcloud run deploy "$service_name" \
   --image="$image" \
   --service-account="$runtime_service_account" \
   --set-secrets="$runtime_secrets" \
-  --set-env-vars="NODE_ENV=production,DEPLOY_ENV=${environment},DB_MIGRATIONS_RUN=false,CORS_ORIGINS=${web_origin},PASSWORD_RESET_PUBLIC_URL=${web_origin}/restablecer,PASSWORD_RESET_DELIVERY=${password_reset_delivery},EMAIL_PROVIDER_SECRET_REFERENCE=${email_secret},OBSERVABILITY_SUCCESS_SAMPLE_RATE=${observability_success_sample_rate}" \
+  --set-env-vars="NODE_ENV=production,DEPLOY_ENV=${environment},DB_MIGRATIONS_RUN=false,CORS_ORIGINS=${web_origin},PASSWORD_RESET_PUBLIC_URL=${web_origin}${password_reset_path},PASSWORD_RESET_DELIVERY=${password_reset_delivery},EMAIL_PROVIDER_SECRET_REFERENCE=${email_secret},OBSERVABILITY_SUCCESS_SAMPLE_RATE=${observability_success_sample_rate}" \
   --allow-unauthenticated \
   --port=8080 \
   --cpu=1 \
