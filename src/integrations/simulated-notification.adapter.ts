@@ -57,3 +57,8 @@ export class SimulatedEmailExternalAdapter extends SimulatedNotificationAdapter 
 export class SimulatedPushExternalAdapter extends SimulatedNotificationAdapter {
   readonly capability = 'NOTIFICATION_PUSH' as const;
 }
+
+@Injectable()
+export class SimulatedWhatsAppExternalAdapter extends SimulatedNotificationAdapter {
+  readonly capability = 'NOTIFICATION_WHATSAPP' as const;
+}

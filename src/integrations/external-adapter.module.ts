@@ -10,6 +10,7 @@ import { ExternalAdapterService } from './external-adapter.service';
 import {
   SimulatedEmailExternalAdapter,
   SimulatedPushExternalAdapter,
+  SimulatedWhatsAppExternalAdapter,
 } from './simulated-notification.adapter';
 import { ResendEmailExternalAdapter } from './resend-email.adapter';
 import { TransactionalEmailTemplateService } from './transactional-email-template.service';
@@ -34,6 +35,9 @@ import { AccountingController } from './accounting.controller';
 import { AccountingRepository } from './accounting.repository';
 import { AccountingService } from './accounting.service';
 import { SimulatedAccountingAdapter } from './simulated-accounting.adapter';
+import { WhatsappController } from './whatsapp.controller';
+import { WhatsappRepository } from './whatsapp.repository';
+import { WhatsappService } from './whatsapp.service';
 
 @Module({
   imports: [SessionModule, AuditModule],
@@ -45,6 +49,7 @@ import { SimulatedAccountingAdapter } from './simulated-accounting.adapter';
     ErpIntegrationController,
     PspPaymentController,
     AccountingController,
+    WhatsappController,
   ],
   providers: [
     ExternalAdapterRepository,
@@ -53,6 +58,7 @@ import { SimulatedAccountingAdapter } from './simulated-accounting.adapter';
     ExternalAdapterService,
     SimulatedEmailExternalAdapter,
     SimulatedPushExternalAdapter,
+    SimulatedWhatsAppExternalAdapter,
     ResendEmailExternalAdapter,
     TransactionalEmailTemplateService,
     ResendWebhookService,
@@ -70,6 +76,8 @@ import { SimulatedAccountingAdapter } from './simulated-accounting.adapter';
     AccountingRepository,
     AccountingService,
     SimulatedAccountingAdapter,
+    WhatsappRepository,
+    WhatsappService,
     PermissionGuard,
   ],
   exports: [

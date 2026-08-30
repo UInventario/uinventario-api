@@ -6,6 +6,7 @@ import type {
 import {
   SimulatedEmailExternalAdapter,
   SimulatedPushExternalAdapter,
+  SimulatedWhatsAppExternalAdapter,
 } from './simulated-notification.adapter';
 import { ResendEmailExternalAdapter } from './resend-email.adapter';
 
@@ -16,10 +17,14 @@ export class ExternalAdapterRegistry {
   constructor(
     email: SimulatedEmailExternalAdapter,
     push: SimulatedPushExternalAdapter,
+    whatsapp: SimulatedWhatsAppExternalAdapter,
     resend: ResendEmailExternalAdapter,
   ) {
     this.adapters = new Map(
-      [email, push, resend].map((adapter) => [this.key(adapter), adapter]),
+      [email, push, whatsapp, resend].map((adapter) => [
+        this.key(adapter),
+        adapter,
+      ]),
     );
   }
 

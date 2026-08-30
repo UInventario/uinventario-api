@@ -65,6 +65,7 @@ export class ExternalAdapterRepository {
        CROSS JOIN (
          SELECT 'NOTIFICATION_EMAIL' AS code
          UNION ALL SELECT 'NOTIFICATION_PUSH'
+         UNION ALL SELECT 'NOTIFICATION_WHATSAPP'
        ) capability
        WHERE tenant.id = ?`,
       [tenantId],

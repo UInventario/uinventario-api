@@ -1,6 +1,7 @@
 export const EXTERNAL_ADAPTER_CAPABILITIES = [
   'NOTIFICATION_EMAIL',
   'NOTIFICATION_PUSH',
+  'NOTIFICATION_WHATSAPP',
 ] as const;
 
 export type ExternalAdapterCapability =
@@ -13,7 +14,10 @@ export type ExternalEmailTemplateKey =
   | 'ADAPTER_DIAGNOSTIC'
   | 'PASSWORD_RESET'
   | 'SALE_RECEIPT'
-  | 'OPERATIONAL_NOTIFICATION';
+  | 'OPERATIONAL_NOTIFICATION'
+  | 'WHATSAPP_SALE_RECEIPT'
+  | 'WHATSAPP_ORDER_STATUS'
+  | 'WHATSAPP_OPERATIONAL_NOTICE';
 
 export interface ExternalEmailTemplate {
   key: ExternalEmailTemplateKey;
