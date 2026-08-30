@@ -5,10 +5,13 @@ import {
   IsArray,
   IsIn,
   IsOptional,
+  IsInt,
   IsString,
   IsUUID,
   Matches,
   ValidateNested,
+  Max,
+  Min,
 } from 'class-validator';
 import { QuoteCartLineDto, SaleDiscountDto } from './quote-cart.dto';
 import { PRICE_CHANNELS } from '../../pricing/price-list.types';
@@ -26,6 +29,13 @@ export class CreateCashSaleDto {
   @IsOptional()
   @IsUUID()
   reservationId?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(10_000_000)
+  loyaltyPointsToRedeem?: number;
 
   @IsArray()
   @ArrayMinSize(1)

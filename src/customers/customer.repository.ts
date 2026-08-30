@@ -32,6 +32,7 @@ interface CustomerRow {
   credit_max_installments: number | string | null;
   credit_balance: string;
   credit_overdue_amount: string;
+  loyalty_balance: number | string;
 }
 
 interface CreditAccountRow {
@@ -644,7 +645,18 @@ export class CustomerRepository {
                     WHERE cca.customer_id = customers.id
                       AND cca.tenant_id = customers.tenant_id
                       AND cca.canceled_at IS NULL), 0)
-                    AS credit_overdue_amount
+                    AS credit_overdue_amount,
+                   COALESCE((SELECT SUM(entry.points_delta - COALESCE((
+                     SELECT SUM(allocation.points)
+                     FROM loyalty_point_allocations allocation
+                     WHERE allocation.tenant_id = entry.tenant_id
+                       AND allocation.credit_entry_id = entry.id
+                   ), 0)) FROM loyalty_point_entries entry
+                     WHERE entry.customer_id = customers.id
+                       AND entry.tenant_id = customers.tenant_id
+                       AND entry.points_delta > 0
+                       AND (entry.expires_at IS NULL OR entry.expires_at > CURRENT_TIMESTAMP(6))), 0)
+                     AS loyalty_balance
             FROM customers`;
   }
 
@@ -692,6 +704,7 @@ export class CustomerRepository {
                     ? 'LIMIT_REACHED'
                     : 'AVAILABLE',
             },
+      loyalty: { balance: Number(row.loyalty_balance ?? 0) },
     };
   }
 

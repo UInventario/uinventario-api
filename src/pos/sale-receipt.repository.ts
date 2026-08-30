@@ -23,6 +23,9 @@ interface ReceiptRow {
   subtotal: string;
   tax_total: string;
   total: string;
+  loyalty_points_redeemed: number | string;
+  loyalty_value: string;
+  loyalty_points_earned: number | string;
   receipt_lines: string | SaleReceiptLine[];
   receipt_payments: string | SaleReceiptPayment[];
   issued_at: Date | string;
@@ -45,12 +48,14 @@ export class SaleReceiptRepository {
         (sale_id, tenant_id, receipt_number, merchant_name, merchant_legal_name,
          country_code, branch_name, cash_register_name, cash_register_code,
          seller_email, customer_name, customer_identifier, currency, tax_rate,
-         subtotal, tax_total, total, receipt_lines, receipt_payments, issued_at)
+         subtotal, tax_total, total, loyalty_points_redeemed, loyalty_value,
+         loyalty_points_earned, receipt_lines, receipt_payments, issued_at)
        SELECT sale.id, sale.tenant_id, sale.receipt_number, tenant.name,
               tenant.legal_name, tenant.country_code, branch.name,
               register.name, register.code, seller.email, customer.name,
               customer.identifier, sale.currency, sale.tax_rate, sale.subtotal,
-              sale.tax_total, sale.total,
+              sale.tax_total, sale.total, sale.loyalty_points_redeemed,
+              sale.loyalty_value, sale.loyalty_points_earned,
               COALESCE((
                 SELECT JSON_ARRAYAGG(JSON_OBJECT(
                   'lineNumber', line.line_number,
@@ -108,7 +113,9 @@ export class SaleReceiptRepository {
               receipt.cash_register_code, receipt.seller_email,
               receipt.customer_name, receipt.customer_identifier,
               receipt.currency, receipt.tax_rate, receipt.subtotal,
-              receipt.tax_total, receipt.total, receipt.receipt_lines,
+              receipt.tax_total, receipt.total, receipt.loyalty_points_redeemed,
+              receipt.loyalty_value, receipt.loyalty_points_earned,
+              receipt.receipt_lines,
               receipt.receipt_payments, receipt.issued_at, sale.status AS sale_status,
               sale.void_reason, sale.voided_at
        FROM sale_receipt_snapshots receipt
@@ -174,6 +181,15 @@ export class SaleReceiptRepository {
           change: this.decimal(String(payment.change), 2),
         }),
       ),
+      loyalty:
+        Number(row.loyalty_points_redeemed) > 0 ||
+        Number(row.loyalty_points_earned) > 0
+          ? {
+              pointsRedeemed: Number(row.loyalty_points_redeemed),
+              redemptionValue: this.decimal(row.loyalty_value, 2),
+              pointsEarned: Number(row.loyalty_points_earned),
+            }
+          : null,
       totals: {
         gross: this.money(gross),
         discount: this.money(discount),

@@ -38,6 +38,7 @@ import { SalesQuotationModule } from './quotations/sales-quotation.module';
 import { NotificationModule } from './notifications/notification.module';
 import { ExternalAdapterModule } from './integrations/external-adapter.module';
 import { emailProviderConfig } from './config/email-provider.config';
+import { LoyaltyModule } from './loyalty/loyalty.module';
 
 @Module({
   imports: [
@@ -94,6 +95,7 @@ import { emailProviderConfig } from './config/email-provider.config';
     SalesQuotationModule,
     NotificationModule,
     ExternalAdapterModule,
+    LoyaltyModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: SecurityThrottlerGuard }],
 })

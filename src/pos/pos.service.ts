@@ -60,6 +60,11 @@ import { SuspendedSaleStateError } from './suspended-sale.errors';
 import { PriceListRepository } from '../pricing/price-list.repository';
 import { PromotionEngineService } from '../promotions/promotion-engine.service';
 import type { AppliedPromotion } from '../promotions/promotion.types';
+import { LoyaltyService } from '../loyalty/loyalty.service';
+import {
+  LoyaltyInsufficientBalanceError,
+  LoyaltyRuleChangedError,
+} from '../loyalty/loyalty.types';
 
 @Injectable()
 export class PosService {
@@ -70,6 +75,7 @@ export class PosService {
     private readonly paymentAuthorization: PaymentAuthorizationService,
     private readonly priceLists: PriceListRepository,
     private readonly promotionEngine: PromotionEngineService,
+    private readonly loyalty: LoyaltyService,
     @Inject(posConfig.KEY)
     private readonly config: ConfigType<typeof posConfig>,
   ) {}
@@ -169,6 +175,15 @@ export class PosService {
             'La venta sólo puede anularse mientras su turno de caja siga abierto.',
         });
       }
+      if (error instanceof LoyaltyInsufficientBalanceError) {
+        throw new ConflictException({
+          code: 'LOYALTY_COMPENSATION_BALANCE_REQUIRED',
+          available: error.available,
+          requested: error.requested,
+          message:
+            'El cliente ya utilizó los puntos a revertir; regulariza su saldo antes de anular.',
+        });
+      }
       throw error;
     }
   }
@@ -192,6 +207,7 @@ export class PosService {
         channel: input.dto.channel,
         customerId: input.dto.customerId,
         reservationId: input.dto.reservationId,
+        loyaltyPointsToRedeem: input.dto.loyaltyPointsToRedeem,
         lines: input.dto.lines,
         discount: input.dto.discount,
         payment: { method: 'CASH', amountReceived: input.dto.cashReceived },
@@ -250,6 +266,7 @@ export class PosService {
         dto: {
           lines: input.dto.lines,
           reservationId: input.dto.reservationId,
+          loyaltyPointsToRedeem: input.dto.loyaltyPointsToRedeem,
           customerId: input.dto.customerId,
           channel: input.dto.channel,
           discount: input.dto.discount,
@@ -266,7 +283,9 @@ export class PosService {
         cashRegisterId: input.cashRegisterId,
         userId: input.userId,
       });
-      const totalCents = this.toMoneyCents(quote.data.totals.total);
+      const totalCents = this.toMoneyCents(
+        quote.data.totals.payable ?? quote.data.totals.total,
+      );
       const payments = this.preparePayments(
         input.dto,
         totalCents,
@@ -296,6 +315,20 @@ export class PosService {
         throw new ConflictException({
           code: 'IDEMPOTENCY_KEY_REUSED',
           message: 'La clave de idempotencia ya fue usada con otros datos.',
+        });
+      }
+      if (error instanceof LoyaltyInsufficientBalanceError) {
+        throw new ConflictException({
+          code: 'LOYALTY_INSUFFICIENT_BALANCE',
+          available: error.available,
+          requested: error.requested,
+        });
+      }
+      if (error instanceof LoyaltyRuleChangedError) {
+        throw new ConflictException({
+          code: 'LOYALTY_RULE_CHANGED',
+          message:
+            'La regla de fidelización cambió; vuelve a cotizar la venta.',
         });
       }
       if (error instanceof SuspendedSaleStateError) {
@@ -848,6 +881,24 @@ export class PosService {
           total: this.fromMoneyCents(lineTotal),
         };
       });
+      if (input.dto.loyaltyPointsToRedeem && !input.dto.customerId) {
+        throw new BadRequestException({
+          code: 'LOYALTY_CUSTOMER_REQUIRED',
+          message: 'Selecciona un cliente para canjear puntos.',
+        });
+      }
+      const loyalty = input.dto.customerId
+        ? await this.loyalty.preview({
+            tenantId: input.tenantId,
+            customerId: input.dto.customerId,
+            userId: input.userId,
+            saleTotal: this.fromMoneyCents(totalCents),
+            pointsToRedeem: input.dto.loyaltyPointsToRedeem ?? 0,
+          })
+        : null;
+      const loyaltyValueCents = this.toMoneyCents(
+        loyalty?.redemptionValue ?? '0.00',
+      );
       return {
         data: {
           context: {
@@ -859,6 +910,7 @@ export class PosService {
           currency,
           taxRate: this.normalizeTaxRate(taxRate),
           discount: this.appliedDiscount(input.dto.discount, saleDiscountCents),
+          loyalty,
           lines,
           totals: {
             gross: this.fromMoneyCents(grossCents),
@@ -869,6 +921,11 @@ export class PosService {
             subtotal: this.fromMoneyCents(subtotalCents),
             tax: this.fromMoneyCents(taxCents),
             total: this.fromMoneyCents(totalCents),
+            ...(loyalty
+              ? {
+                  payable: this.fromMoneyCents(totalCents - loyaltyValueCents),
+                }
+              : {}),
           },
         },
         meta: { apiVersion: '1', recalculatedAt: new Date().toISOString() },
@@ -1083,6 +1140,7 @@ export class PosService {
         ? { installmentCount: dto.credit.installmentCount }
         : null,
       customerId: dto.customerId ?? null,
+      loyaltyPointsToRedeem: dto.loyaltyPointsToRedeem ?? 0,
       reservationId: dto.reservationId ?? null,
       suspendedSaleId: dto.suspendedSaleId ?? null,
       discount: dto.discount

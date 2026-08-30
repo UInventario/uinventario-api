@@ -43,6 +43,11 @@ export interface SaleReceiptData {
   taxRate: string;
   lines: SaleReceiptLine[];
   payments: SaleReceiptPayment[];
+  loyalty?: {
+    pointsRedeemed: number;
+    redemptionValue: string;
+    pointsEarned: number;
+  } | null;
   totals: {
     gross: string;
     discount: string;

@@ -29,6 +29,7 @@ import { AuditService } from '../audit/audit.service';
 import { SaleReceiptRepository } from './sale-receipt.repository';
 import { SuspendedSaleStateError } from './suspended-sale.errors';
 import type { SuspendedSaleStatus } from './suspended-sale.types';
+import { LoyaltyRepository } from '../loyalty/loyalty.repository';
 
 interface SaleRow {
   id: string;
@@ -45,6 +46,10 @@ interface SaleRow {
   gross_total: string;
   line_discount_total: string;
   promotion_discount_total: string;
+  loyalty_points_redeemed: number | string;
+  loyalty_value: string;
+  loyalty_points_earned: number | string;
+  loyalty_rule_version: number | string | null;
   sale_discount_total: string;
   discount_total: string;
   discount_type: 'PERCENT' | 'AMOUNT' | null;
@@ -84,6 +89,7 @@ export class SalesRepository {
     private readonly dataSource: DataSource,
     private readonly audit: AuditService,
     private readonly receipts: SaleReceiptRepository,
+    private readonly loyalty: LoyaltyRepository,
   ) {}
 
   async listSales(
@@ -488,6 +494,12 @@ export class SalesRepository {
           if (Number(paymentUpdate.affectedRows ?? 0) < 1) {
             throw new Error('SALE_VOID_PAYMENT_NOT_REVERSED');
           }
+          await this.loyalty.compensateSale(manager, {
+            tenantId: input.tenantId,
+            saleId: sale.id,
+            userId: input.userId,
+            mode: 'VOID',
+          });
           const saleUpdate = await manager.query<{ affectedRows?: number }>(
             `UPDATE sales SET status = 'VOIDED', voided_by_user_id = ?, void_reason = ?,
                void_idempotency_key = ?, void_request_fingerprint = ?,
@@ -738,7 +750,9 @@ export class SalesRepository {
               );
               const currentBalance = this.toMoney(exposure?.balance ?? '0');
               const limit = this.toMoney(customer.credit_limit);
-              const requested = this.toMoney(input.quote.totals.total);
+              const requested = this.toMoney(
+                input.quote.totals.payable ?? input.quote.totals.total,
+              );
               if (currentBalance + requested > limit) {
                 throw new CustomerCreditLimitExceededError(
                   this.money(currentBalance),
@@ -998,10 +1012,12 @@ export class SalesRepository {
             (id, tenant_id, branch_id, warehouse_id, cash_register_id,
              cash_register_shift_id, created_by_user_id, customer_id, reservation_id, quotation_id,
              receipt_number, currency, tax_rate, gross_total, line_discount_total,
-             promotion_discount_total, sale_discount_total, discount_total, discount_type, discount_value,
+             promotion_discount_total, loyalty_points_redeemed, loyalty_value,
+             loyalty_points_earned, loyalty_rule_version, loyalty_rule_snapshot,
+             sale_discount_total, discount_total, discount_type, discount_value,
              discount_reason, subtotal, tax_total, total, status, idempotency_key,
              request_fingerprint)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
             [
               saleId,
               input.tenantId,
@@ -1019,6 +1035,13 @@ export class SalesRepository {
               input.quote.totals.gross,
               input.quote.totals.lineDiscount,
               input.quote.totals.promotionDiscount,
+              input.quote.loyalty?.pointsRedeemed ?? 0,
+              input.quote.loyalty?.redemptionValue ?? '0.00',
+              input.quote.loyalty?.pointsEarned ?? 0,
+              input.quote.loyalty?.rule.version ?? null,
+              input.quote.loyalty
+                ? JSON.stringify(input.quote.loyalty.rule)
+                : null,
               input.quote.totals.saleDiscount,
               input.quote.totals.discount,
               input.quote.discount?.type ?? null,
@@ -1031,6 +1054,17 @@ export class SalesRepository {
               input.fingerprint,
             ],
           );
+          if (effectiveCustomerId && input.quote.loyalty) {
+            await this.loyalty.applySale(manager, {
+              tenantId: input.tenantId,
+              customerId: effectiveCustomerId,
+              userId: input.userId,
+              saleId,
+              idempotencyKey: input.idempotencyKey,
+              saleTotal: input.quote.totals.total,
+              loyalty: input.quote.loyalty,
+            });
+          }
           for (const [index, line] of input.quote.lines.entries()) {
             const saleLineId = randomUUID();
             const promotionDiscountTotal = this.money(
@@ -1239,14 +1273,16 @@ export class SalesRepository {
                 effectiveCustomerId,
                 saleId,
                 creditProfile.currency,
-                input.quote.totals.total,
+                input.quote.totals.payable ?? input.quote.totals.total,
                 input.credit.installmentCount,
                 termDays,
                 termDays,
                 input.userId,
               ],
             );
-            const totalCents = this.toMoney(input.quote.totals.total);
+            const totalCents = this.toMoney(
+              input.quote.totals.payable ?? input.quote.totals.total,
+            );
             const count = BigInt(input.credit.installmentCount);
             const baseAmount = totalCents / count;
             const remainder = totalCents % count;
@@ -1284,7 +1320,7 @@ export class SalesRepository {
                 effectiveCustomerId,
                 creditAccountId,
                 saleId,
-                input.quote.totals.total,
+                input.quote.totals.payable ?? input.quote.totals.total,
                 `sale-credit:${input.idempotencyKey}`,
                 input.userId,
               ],
@@ -1302,7 +1338,7 @@ export class SalesRepository {
                 saleId,
                 creditAccountId,
                 input.quote.currency,
-                input.quote.totals.total,
+                input.quote.totals.payable ?? input.quote.totals.total,
               ],
             );
           }
@@ -1326,6 +1362,27 @@ export class SalesRepository {
                 payment.amountReceived,
                 payment.amountApplied,
                 payment.change,
+              ],
+            );
+          }
+          if (input.quote.loyalty && input.quote.loyalty.pointsRedeemed > 0) {
+            await manager.query(
+              `INSERT INTO sale_payments
+                (id, tenant_id, sale_id, method, provider, external_reference,
+                 provider_reference, authorization_code, authorization_status,
+                 currency, amount_received, amount_applied, change_amount)
+               VALUES (?, ?, ?, 'VOUCHER', 'LOYALTY', ?, ?, ?,
+                 'APPROVED', ?, ?, ?, 0)`,
+              [
+                randomUUID(),
+                input.tenantId,
+                saleId,
+                `points:${input.quote.loyalty.pointsRedeemed}`,
+                `loyalty:${saleId}`,
+                `RULE-V${input.quote.loyalty.rule.version}`,
+                input.quote.currency,
+                input.quote.loyalty.redemptionValue,
+                input.quote.loyalty.redemptionValue,
               ],
             );
           }
@@ -1393,7 +1450,9 @@ export class SalesRepository {
               c.identifier AS customer_identifier,
               q.id AS quotation_id, q.quotation_number,
               s.currency, s.tax_rate, s.gross_total, s.line_discount_total,
-              s.promotion_discount_total, s.sale_discount_total, s.discount_total, s.discount_type,
+               s.promotion_discount_total, s.loyalty_points_redeemed, s.loyalty_value,
+               s.loyalty_points_earned, s.loyalty_rule_version,
+               s.sale_discount_total, s.discount_total, s.discount_type,
               s.discount_value, s.discount_reason, s.subtotal, s.tax_total, s.total,
               s.request_fingerprint, s.created_at, s.voided_by_user_id,
               vu.email AS voided_by_email, s.void_reason, s.voided_at,
@@ -1619,6 +1678,16 @@ export class SalesRepository {
               amount: this.decimal(row.sale_discount_total, 2),
             }
           : null,
+        loyalty:
+          Number(row.loyalty_points_redeemed) > 0 ||
+          Number(row.loyalty_points_earned) > 0
+            ? {
+                ruleVersion: Number(row.loyalty_rule_version),
+                pointsRedeemed: Number(row.loyalty_points_redeemed),
+                redemptionValue: this.decimal(row.loyalty_value, 2),
+                pointsEarned: Number(row.loyalty_points_earned),
+              }
+            : null,
         lines: lines.map((line) => ({
           id: line.id,
           product: {

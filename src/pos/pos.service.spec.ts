@@ -49,6 +49,7 @@ describe('PosService', () => {
       { enabledMethods: jest.fn().mockReturnValue(['CASH']) } as never,
       { resolve: jest.fn().mockResolvedValue(new Map()) } as never,
       { resolve: jest.fn().mockResolvedValue(new Map()) } as never,
+      { preview: jest.fn().mockResolvedValue(null) } as never,
       {
         taxRates: { MX: '0.1600', DEFAULT: '0.0000' },
         nonCashProvider: 'DISABLED',
@@ -182,6 +183,7 @@ describe('PosService', () => {
       { enabledMethods: jest.fn().mockReturnValue(['CASH']) } as never,
       { resolve: jest.fn().mockResolvedValue(new Map()) } as never,
       { resolve: jest.fn().mockResolvedValue(new Map()) } as never,
+      { preview: jest.fn().mockResolvedValue(null) } as never,
       {
         taxRates: { MX: '0.1600', CL: '0.1900', DEFAULT: '0.0000' },
         nonCashProvider: 'DISABLED',
@@ -253,6 +255,7 @@ describe('PosService', () => {
       { enabledMethods: jest.fn().mockReturnValue(['CASH']) } as never,
       { resolve: jest.fn().mockResolvedValue(new Map()) } as never,
       { resolve: jest.fn().mockResolvedValue(new Map()) } as never,
+      { preview: jest.fn().mockResolvedValue(null) } as never,
       {
         taxRates: { US: '0.0000', DEFAULT: '0.0000' },
         nonCashProvider: 'DISABLED',

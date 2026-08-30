@@ -42,6 +42,7 @@ import { PosProfitabilityReportRepository } from './pos-profitability-report.rep
 import { PosProfitabilityReportService } from './pos-profitability-report.service';
 import { ExternalAdapterModule } from '../integrations/external-adapter.module';
 import { PromotionModule } from '../promotions/promotion.module';
+import { LoyaltyModule } from '../loyalty/loyalty.module';
 
 @Module({
   imports: [
@@ -50,6 +51,7 @@ import { PromotionModule } from '../promotions/promotion.module';
     CustomerModule,
     ExternalAdapterModule,
     PromotionModule,
+    LoyaltyModule,
   ],
   controllers: [
     PosController,

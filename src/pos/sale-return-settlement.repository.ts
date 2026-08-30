@@ -82,12 +82,14 @@ export class SaleReturnSettlementRepository {
             Array<{
               id: string;
               total: string;
+              loyalty_value_restored: string;
               settlement_status: string;
               currency: string;
               customer_id: string | null;
             }>
           >(
-            `SELECT sr.id, sr.total, sr.settlement_status, s.currency, s.customer_id
+            `SELECT sr.id, sr.total, sr.loyalty_value_restored,
+                    sr.settlement_status, s.currency, s.customer_id
              FROM sale_returns sr
              INNER JOIN sales s ON s.id = sr.sale_id AND s.tenant_id = sr.tenant_id
              WHERE sr.id = ? AND sr.tenant_id = ? AND sr.sale_id = ?
@@ -111,7 +113,9 @@ export class SaleReturnSettlementRepository {
             [input.tenantId, saleReturn.id],
           );
           const settledAmount = this.toMoney(settled.amount);
-          const returnTotal = this.toMoney(saleReturn.total);
+          const returnTotal =
+            this.toMoney(saleReturn.total) -
+            this.toMoney(saleReturn.loyalty_value_restored);
           if (amount <= 0n || settledAmount + amount > returnTotal) {
             throw new SaleReturnSettlementAmountError();
           }

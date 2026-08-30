@@ -25,6 +25,7 @@ import {
   SaleReturnSettlementPaymentError,
   SaleReturnSettlementShiftError,
 } from './sale-return.types';
+import { LoyaltyInsufficientBalanceError } from '../loyalty/loyalty.types';
 
 @Injectable()
 export class SaleReturnService {
@@ -122,6 +123,15 @@ export class SaleReturnService {
           code: 'SALE_RETURN_SERIALS_INVALID',
           message:
             'Los números de serie deben corresponder a las unidades vendidas que se devuelven.',
+        });
+      }
+      if (error instanceof LoyaltyInsufficientBalanceError) {
+        throw new ConflictException({
+          code: 'LOYALTY_COMPENSATION_BALANCE_REQUIRED',
+          available: error.available,
+          requested: error.requested,
+          message:
+            'El cliente ya utilizó los puntos a revertir; regulariza su saldo antes de devolver.',
         });
       }
       throw error;
