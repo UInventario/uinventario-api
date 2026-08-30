@@ -42,6 +42,7 @@ import {
   PaymentDeclinedError,
   PaymentMethodUnavailableError,
 } from './payment-authorization.service';
+import { PaymentTerminalOperationError } from './payment-terminal.errors';
 import {
   InsufficientInventoryLotStockError,
   InventoryFifoCurrencyMismatchError,
@@ -360,6 +361,17 @@ export class PosService {
         throw new ConflictException({
           code: 'PAYMENT_REFERENCE_REUSED',
           message: 'La referencia del pago ya fue utilizada.',
+        });
+      }
+      if (error instanceof PaymentTerminalOperationError) {
+        throw new ConflictException({
+          code: `PAYMENT_TERMINAL_${error.code}`,
+          message:
+            error.code === 'NOT_CAPTURED'
+              ? 'El pago del terminal todavía no está capturado.'
+              : error.code === 'ALREADY_USED'
+                ? 'El pago del terminal ya fue aplicado a otra venta.'
+                : 'El pago del terminal no coincide con esta venta o caja.',
         });
       }
       if (error instanceof PosInsufficientStockError) {
@@ -1100,9 +1112,12 @@ export class PosService {
       const amountCents = this.toMoneyCents(amount);
       appliedTotal += amountCents;
       const isCash = payment.method === 'CASH';
+      const usesTerminal = Boolean(payment.terminalOperationId);
       if (
         (isCash && payment.reference) ||
-        (!isCash && payment.amountReceived)
+        (!isCash && payment.amountReceived) ||
+        (usesTerminal &&
+          (payment.method !== 'CARD' || Boolean(payment.reference)))
       ) {
         throw new BadRequestException({
           code: 'PAYMENT_FIELDS_INVALID',
@@ -1115,7 +1130,7 @@ export class PosService {
           message: 'Indica el efectivo recibido.',
         });
       }
-      if (!isCash && !payment.reference) {
+      if (!isCash && !payment.reference && !usesTerminal) {
         throw new BadRequestException({
           code: 'PAYMENT_REFERENCE_REQUIRED',
           message: 'La referencia es obligatoria para pagos no efectivos.',
@@ -1130,19 +1145,26 @@ export class PosService {
           message: 'El efectivo recibido no cubre su parte de la venta.',
         });
       }
-      const authorization = this.paymentAuthorization.authorize({
-        method: payment.method,
-        reference: payment.reference,
-        amount: this.fromMoneyCents(amountCents),
-        currency,
-        idempotencyKey: `${idempotencyKey}:${index}`,
-      });
+      const authorization = usesTerminal
+        ? {
+            provider: 'PAYMENT_TERMINAL',
+            providerReference: null,
+            authorizationCode: null,
+          }
+        : this.paymentAuthorization.authorize({
+            method: payment.method,
+            reference: payment.reference,
+            amount: this.fromMoneyCents(amountCents),
+            currency,
+            idempotencyKey: `${idempotencyKey}:${index}`,
+          });
       return {
         method: payment.method,
         amountReceived: this.fromMoneyCents(receivedCents),
         amountApplied: this.fromMoneyCents(amountCents),
         change: this.fromMoneyCents(receivedCents - amountCents),
-        reference: isCash ? null : payment.reference!,
+        reference: isCash ? null : (payment.reference ?? null),
+        terminalOperationId: payment.terminalOperationId ?? null,
         ...authorization,
       };
     });
@@ -1236,6 +1258,7 @@ export class PosService {
             ? this.fromMoneyCents(this.toMoneyCents(payment.amountReceived))
             : null,
           reference: payment.reference ?? null,
+          terminalOperationId: payment.terminalOperationId ?? null,
         }),
       ),
       credit: dto.credit

@@ -9397,6 +9397,149 @@ describe('UInventario API (e2e)', () => {
       expect(balance.quantity).toBe('1.000');
     });
 
+    it('captures a terminal payment once and resolves a late response before completing the sale', async () => {
+      const { cookie, productId, locationId } = await preparePos();
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/payment-terminal/operations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-zero-amount')
+        .send({ amount: '0.00', currency: 'MXN', scenario: 'SUCCESS' })
+        .expect(400);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/payment-terminal/operations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-decline-001')
+        .send({ amount: '119.90', currency: 'MXN', scenario: 'REJECT' })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { status: 'DECLINED', errorCode: 'SIMULATED_DECLINE' },
+          });
+          expect(JSON.stringify(body)).not.toMatch(/cardNumber|cvv|pan/i);
+        });
+
+      const uncertain = await request(app.getHttpServer())
+        .post('/api/v1/pos/payment-terminal/operations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-late-001')
+        .send({ amount: '119.90', currency: 'MXN', scenario: 'INDETERMINATE' })
+        .expect(201);
+      const uncertainData = uncertain.body as {
+        data: { id: string; status: string };
+      };
+      expect(uncertainData.data.status).toBe('INDETERMINATE');
+
+      const terminalSale = {
+        lines: [{ productId, quantity: '1' }],
+        payment: {
+          method: 'CARD',
+          terminalOperationId: uncertainData.data.id,
+        },
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-sale-before-capture')
+        .send(terminalSale)
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PAYMENT_TERMINAL_NOT_CAPTURED');
+        });
+
+      await request(app.getHttpServer())
+        .get(`/api/v1/pos/payment-terminal/operations/${uncertainData.data.id}`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          const response = body as {
+            data: {
+              status: string;
+              queryCount: number;
+              authorizationCode: unknown;
+            };
+          };
+          expect(response.data).toMatchObject({
+            status: 'CAPTURED',
+            queryCount: 1,
+          });
+          expect(typeof response.data.authorizationCode).toBe('string');
+        });
+
+      const completed = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-sale-completed')
+        .send(terminalSale)
+        .expect(201);
+      const completedData = completed.body as { data: { id: string } };
+      const completedPayment = completed.body as {
+        data: {
+          payment: { method: string; provider: string; reference: string };
+        };
+      };
+      expect(completedPayment.data.payment).toMatchObject({
+        method: 'CARD',
+        provider: 'SIMULATOR',
+      });
+      expect(completedPayment.data.payment.reference).toMatch(/^TERM-/);
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-sale-completed')
+        .send(terminalSale)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: { id: completedData.data.id },
+            meta: { idempotentReplay: true },
+          });
+        });
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/sales')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-sale-reused-operation')
+        .send(terminalSale)
+        .expect(409)
+        .expect(({ body }: { body: { code?: string } }) => {
+          expect(body.code).toBe('PAYMENT_TERMINAL_ALREADY_USED');
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/payment-terminal/reconciliation')
+        .set('Cookie', cookie)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            meta: { totals: { captured: 1, matchedSales: 1, pending: 0 } },
+          });
+        });
+      const [balance] = await dataSource.query<Array<{ quantity: string }>>(
+        `SELECT available_quantity AS quantity FROM inventory_balances
+         WHERE product_id = ? AND location_id = ?`,
+        [productId, locationId],
+      );
+      expect(balance.quantity).toBe('4.000');
+
+      const cancellable = await request(app.getHttpServer())
+        .post('/api/v1/pos/payment-terminal/operations')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'terminal-cancel-001')
+        .send({ amount: '20.00', currency: 'MXN', scenario: 'SUCCESS' })
+        .expect(201);
+      const cancellableId = (cancellable.body as { data: { id: string } }).data
+        .id;
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/payment-terminal/operations/${cancellableId}/cancel`)
+        .set('Cookie', cookie)
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({ data: { status: 'CANCELLED' } });
+        });
+    });
+
     it('reconciles tenant-scoped sales, payments and cash shifts with local-date filters', async () => {
       const { cookie, productId } = await preparePos();
       const mixedSale = await request(app.getHttpServer())
