@@ -31,16 +31,20 @@ export class CommerceService {
     dto: CreateCommerceCredentialDto;
   }) {
     this.assertWebhook(input.dto);
-    const prefix = randomBytes(6).toString('hex').slice(0, 8);
-    const rawKey = `uic_${prefix}_${randomBytes(32).toString('base64url')}`;
+    if (
+      input.dto.scopes.includes('STOCK_READ') &&
+      !input.dto.scopes.includes('CATALOG_READ')
+    )
+      throw new BadRequestException('STOCK_SCOPE_REQUIRES_CATALOG_READ');
+    const { rawKey, keyPrefix, keyHash } = this.key();
     let credential;
     try {
       credential = await this.repository.createCredential({
         ...input.dto,
         tenantId: input.tenantId,
         userId: input.userId,
-        keyPrefix: `uic_${prefix}`,
-        keyHash: createHash('sha256').update(rawKey).digest('hex'),
+        keyPrefix,
+        keyHash,
         webhookUrl: input.dto.webhookUrl ?? null,
       });
     } catch (error) {
@@ -84,6 +88,98 @@ export class CommerceService {
     return {
       data: await this.repository.listCredentials(tenantId),
       meta: { apiVersion: '1' },
+    };
+  }
+
+  openapi() {
+    return {
+      openapi: '3.1.0',
+      info: {
+        title: 'UInventario External Commerce API',
+        version: '1.0.0',
+      },
+      servers: [{ url: '/external/v1' }],
+      components: {
+        securitySchemes: {
+          bearerApiKey: { type: 'http', scheme: 'bearer' },
+        },
+      },
+      security: [{ bearerApiKey: [] }],
+      paths: {
+        '/catalog': {
+          get: {
+            summary: 'Catálogo incremental',
+            'x-required-scope': 'CATALOG_READ',
+            'x-limits': { default: 100, maximum: 200 },
+            responses: {
+              '200': { description: 'Página incremental de catálogo' },
+            },
+          },
+        },
+        '/orders': {
+          post: {
+            summary: 'Crear pedido idempotente',
+            'x-required-scope': 'ORDERS_WRITE',
+            responses: {
+              '201': { description: 'Pedido creado o reproducido' },
+            },
+          },
+        },
+        '/orders/{externalOrderId}': {
+          get: {
+            summary: 'Consultar pedido externo',
+            'x-required-scope': 'ORDERS_READ',
+            responses: { '200': { description: 'Estado actual del pedido' } },
+          },
+        },
+      },
+      'x-webhook-contract': {
+        version: '1',
+        signatureHeader: 'X-UInventario-Signature',
+        signature: 'HMAC-SHA256(JSON, SHA256(apiKey))',
+        attempts: { automatic: 3, controlledMaximumTotal: 5 },
+        simulatorUrls: {
+          success: 'https://success.example.test/webhook',
+          retryThenSuccess: 'https://retry.example.test/webhook',
+          recoverWithReplay: 'https://recover.example.test/webhook',
+          reject: 'https://reject.example.test/webhook',
+        },
+        example: {
+          apiVersion: '1',
+          eventId: '00000000-0000-4000-8000-000000000000:ORDER_CONFIRMED:1',
+          type: 'ORDER_CONFIRMED',
+          occurredAt: '2026-01-01T00:00:00.000Z',
+        },
+      },
+    };
+  }
+
+  async rotateCredential(input: {
+    tenantId: string;
+    userId: string;
+    credentialId: string;
+    correlationId: string;
+  }) {
+    const { rawKey, keyPrefix, keyHash } = this.key();
+    const credential = await this.repository.rotateCredential({
+      tenantId: input.tenantId,
+      credentialId: input.credentialId,
+      keyPrefix,
+      keyHash,
+    });
+    if (!credential) throw new NotFoundException();
+    await this.audit.recordRequired({
+      tenantId: input.tenantId,
+      actorUserId: input.userId,
+      action: 'COMMERCE_CREDENTIAL_ROTATED',
+      entityType: 'COMMERCE_API_CREDENTIAL',
+      entityId: input.credentialId,
+      correlationId: input.correlationId,
+      after: { keyPrefix: credential.keyPrefix, scopes: credential.scopes },
+    });
+    return {
+      data: { ...credential, apiKey: rawKey },
+      meta: { apiVersion: '1', warning: 'La clave sólo se muestra una vez.' },
     };
   }
 
@@ -236,6 +332,39 @@ export class CommerceService {
     return {
       data: await this.repository.deliveries(tenantId),
       meta: { apiVersion: '1' },
+    };
+  }
+
+  async replayDelivery(input: {
+    tenantId: string;
+    userId: string;
+    deliveryId: string;
+    correlationId: string;
+  }) {
+    const delivery = await this.webhooks.replay(
+      input.tenantId,
+      input.deliveryId,
+    );
+    if (!delivery) throw new ConflictException('WEBHOOK_REPLAY_NOT_ALLOWED');
+    await this.audit.recordRequired({
+      tenantId: input.tenantId,
+      actorUserId: input.userId,
+      action: 'COMMERCE_WEBHOOK_REPLAYED',
+      entityType: 'COMMERCE_WEBHOOK_DELIVERY',
+      entityId: input.deliveryId,
+      correlationId: input.correlationId,
+      after: { status: delivery.status, attemptCount: delivery.attemptCount },
+    });
+    return { data: delivery, meta: { apiVersion: '1' } };
+  }
+
+  private key() {
+    const prefix = randomBytes(6).toString('hex').slice(0, 8);
+    const rawKey = `uic_${prefix}_${randomBytes(32).toString('base64url')}`;
+    return {
+      rawKey,
+      keyPrefix: `uic_${prefix}`,
+      keyHash: createHash('sha256').update(rawKey).digest('hex'),
     };
   }
 
