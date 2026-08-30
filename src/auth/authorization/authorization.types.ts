@@ -44,6 +44,7 @@ export const INVENTORY_PERMISSIONS = [
 ] as const satisfies readonly AppPermission[];
 
 export const OPERATIONAL_PERMISSIONS = [
+  'PRODUCTS_MANAGE',
   ...INVENTORY_PERMISSIONS,
   'SALES_MANAGE',
   'SALES_VOID',

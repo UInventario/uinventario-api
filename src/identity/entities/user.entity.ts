@@ -17,6 +17,14 @@ export class UserEntity {
   @Column({ name: 'password_hash', type: 'varchar', length: 255 })
   passwordHash!: string;
 
+  @Column({
+    name: 'access_revoked_at',
+    type: 'datetime',
+    precision: 6,
+    nullable: true,
+  })
+  accessRevokedAt!: Date | null;
+
   @CreateDateColumn({ name: 'created_at', type: 'datetime', precision: 6 })
   createdAt!: Date;
 }

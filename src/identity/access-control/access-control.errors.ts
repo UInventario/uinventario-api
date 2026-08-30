@@ -15,3 +15,9 @@ export class AccessUserNotFoundError extends Error {
     super('ACCESS_USER_NOT_FOUND');
   }
 }
+
+export class AccessRetirementConfirmationError extends Error {
+  constructor() {
+    super('ACCESS_RETIREMENT_CONFIRMATION');
+  }
+}

@@ -18,6 +18,7 @@ import { AccessControlService } from './access-control.service';
 import { CreateAccessRoleDto } from './dto/create-access-role.dto';
 import { CreateAccessUserDto } from './dto/create-access-user.dto';
 import { UpdateUserAccessDto } from './dto/update-user-access.dto';
+import { RetireUserAccessDto } from './dto/retire-user-access.dto';
 
 @Controller('access')
 @UseGuards(SessionGuard, PermissionGuard)
@@ -89,6 +90,28 @@ export class AccessControlController {
     await this.record(
       request,
       'ACCESS_USER_UPDATED',
+      'USER',
+      result.data.id,
+      this.assignmentSnapshot(result.data),
+    );
+    return result;
+  }
+
+  @Post('users/:userId/retirement')
+  async retireUser(
+    @Req() request: AuthenticatedRequest,
+    @Param('userId', new ParseUUIDPipe()) userId: string,
+    @Body() dto: RetireUserAccessDto,
+  ) {
+    const result = await this.access.retireUser(
+      request.principal.tenant.id,
+      request.principal.user.id,
+      userId,
+      dto.confirmationEmail,
+    );
+    await this.record(
+      request,
+      'ACCESS_USER_RETIRED',
       'USER',
       result.data.id,
       this.assignmentSnapshot(result.data),

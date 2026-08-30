@@ -9,6 +9,7 @@ export interface AccessRoleData {
 export interface AccessUserData {
   id: string;
   email: string;
+  active: boolean;
   roles: AccessRoleData[];
   branches: Array<{ id: string; name: string }>;
   cashRegisters: Array<{
