@@ -3,6 +3,9 @@ export interface ProductData {
   name: string;
   sku: string;
   barcode: string | null;
+  withoutCode: boolean;
+  stockBehavior: 'TRACKED' | 'UNTRACKED';
+  taxBehavior: 'STANDARD' | 'EXEMPT';
   baseUnit: import('../common/quantity-policy').ProductBaseUnit;
   quantityPrecision: number;
   quantityRounding: import('../common/quantity-policy').QuantityRoundingMode;

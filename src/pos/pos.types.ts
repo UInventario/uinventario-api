@@ -2,6 +2,9 @@ export interface PosProductSnapshot {
   id: string;
   name: string;
   sku: string;
+  withoutCode: boolean;
+  stockBehavior: 'TRACKED' | 'UNTRACKED';
+  taxBehavior: 'STANDARD' | 'EXEMPT';
   price: string;
   active: boolean;
   trackLots: boolean;
@@ -51,11 +54,15 @@ export interface PosCartQuoteResponse {
         id: string;
         name: string;
         sku: string;
+        withoutCode: boolean;
+        stockBehavior: 'TRACKED' | 'UNTRACKED';
+        taxBehavior: 'STANDARD' | 'EXEMPT';
         baseUnit?: import('../common/quantity-policy').ProductBaseUnit;
         quantityPrecision?: number;
         minimumQuantity?: string;
       };
       quantity: string;
+      note: string | null;
       lotId: string | null;
       expiredLotOverrideReason?: string | null;
       serialNumbers: string[];
@@ -71,7 +78,8 @@ export interface PosCartQuoteResponse {
         unitCost: string;
       };
       unitPrice: string;
-      priceSource: 'BASE' | 'PRICE_LIST';
+      priceSource: 'BASE' | 'PRICE_LIST' | 'MANUAL';
+      priceOverrideReason: string | null;
       priceList: { id: string; name: string } | null;
       grossTotal: string;
       discount: {
@@ -163,11 +171,20 @@ export interface CashSaleData {
   } | null;
   lines: Array<{
     id: string;
-    product: { id: string; name: string; sku: string };
+    product: {
+      id: string;
+      name: string;
+      sku: string;
+      withoutCode: boolean;
+      stockBehavior: 'TRACKED' | 'UNTRACKED';
+      taxBehavior: 'STANDARD' | 'EXEMPT';
+    };
     quantity: string;
+    note: string | null;
     expiredLotOverrideReason: string | null;
     unitPrice: string;
-    priceSource: 'BASE' | 'PRICE_LIST';
+    priceSource: 'BASE' | 'PRICE_LIST' | 'MANUAL';
+    priceOverrideReason: string | null;
     priceList: { id: string; name: string } | null;
     grossTotal: string;
     discount: {

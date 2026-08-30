@@ -72,6 +72,9 @@ export class PosRepository {
           id: string;
           name: string;
           sku: string;
+          code_mode: 'EXPLICIT' | 'GENERATED';
+          stock_behavior: 'TRACKED' | 'UNTRACKED';
+          tax_behavior: 'STANDARD' | 'EXEMPT';
           price: string;
           active: number | boolean;
           track_lots: number | boolean;
@@ -84,7 +87,8 @@ export class PosRepository {
           available_quantity: string;
         }>
       >(
-        `SELECT p.id, p.name, p.sku, p.price, p.active, p.track_lots,
+        `SELECT p.id, p.name, p.sku, p.code_mode, p.stock_behavior,
+                p.tax_behavior, p.price, p.active, p.track_lots,
                 p.allow_expired_stock_override, p.track_serials,
                 p.base_unit, p.quantity_precision, p.quantity_rounding, p.minimum_quantity,
                 rl.quantity AS available_quantity
@@ -105,6 +109,9 @@ export class PosRepository {
           id: row.id,
           name: row.name,
           sku: row.sku,
+          withoutCode: row.code_mode === 'GENERATED',
+          stockBehavior: row.stock_behavior,
+          taxBehavior: row.tax_behavior,
           price: row.price,
           active: Boolean(row.active),
           trackLots: Boolean(row.track_lots),
@@ -124,6 +131,9 @@ export class PosRepository {
         id: string;
         name: string;
         sku: string;
+        code_mode: 'EXPLICIT' | 'GENERATED';
+        stock_behavior: 'TRACKED' | 'UNTRACKED';
+        tax_behavior: 'STANDARD' | 'EXEMPT';
         price: string;
         active: number | boolean;
         track_lots: number | boolean;
@@ -136,7 +146,8 @@ export class PosRepository {
         available_quantity: string;
       }>
     >(
-      `SELECT p.id, p.name, p.sku, p.price, p.active, p.track_lots,
+      `SELECT p.id, p.name, p.sku, p.code_mode, p.stock_behavior,
+              p.tax_behavior, p.price, p.active, p.track_lots,
               p.allow_expired_stock_override, p.track_serials,
               p.base_unit, p.quantity_precision, p.quantity_rounding, p.minimum_quantity,
               COALESCE(SUM(CASE WHEN l.warehouse_id = ? THEN ib.available_quantity ELSE 0 END), 0) AS available_quantity
@@ -145,7 +156,8 @@ export class PosRepository {
        LEFT JOIN locations l ON l.id = ib.location_id AND l.tenant_id = ib.tenant_id
        WHERE p.tenant_id = ? AND p.variant_schema IS NULL
          AND p.id IN (${placeholders})
-       GROUP BY p.id, p.name, p.sku, p.price, p.active, p.track_lots,
+       GROUP BY p.id, p.name, p.sku, p.code_mode, p.stock_behavior,
+                p.tax_behavior, p.price, p.active, p.track_lots,
                 p.allow_expired_stock_override, p.track_serials, p.base_unit,
                 p.quantity_precision, p.quantity_rounding, p.minimum_quantity`,
       [warehouseId, tenantId, ...productIds],
@@ -158,6 +170,9 @@ export class PosRepository {
         id: row.id,
         name: row.name,
         sku: row.sku,
+        withoutCode: row.code_mode === 'GENERATED',
+        stockBehavior: row.stock_behavior,
+        taxBehavior: row.tax_behavior,
         price: row.price,
         active: Boolean(row.active),
         trackLots: Boolean(row.track_lots),

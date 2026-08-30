@@ -13,6 +13,7 @@ import {
   ProductVariantConfigurationError,
   ProductVariantsRequireZeroStockError,
   ProductKitConfigurationError,
+  ProductSaleBehaviorError,
 } from './catalog.errors';
 import {
   CatalogClassificationData,
@@ -41,6 +42,9 @@ interface ProductRow {
   name: string;
   sku: string;
   barcode: string | null;
+  code_mode: 'EXPLICIT' | 'GENERATED';
+  stock_behavior: 'TRACKED' | 'UNTRACKED';
+  tax_behavior: 'STANDARD' | 'EXEMPT';
   base_unit: ProductBaseUnit;
   quantity_precision: number;
   quantity_rounding: QuantityRoundingMode;
@@ -94,26 +98,36 @@ export class CatalogRepository {
             )
           : null;
         const id = randomUUID();
+        const withoutCode = dto.withoutCode ?? false;
+        const sku = withoutCode
+          ? `NC-${id.replaceAll('-', '').slice(0, 12).toUpperCase()}`
+          : dto.sku!;
         await manager.query(
           `INSERT INTO products
-            (id, tenant_id, name, sku, normalized_sku, barcode, base_unit,
+            (id, tenant_id, name, sku, normalized_sku, barcode, code_mode,
+             stock_behavior, tax_behavior, base_unit,
              quantity_precision, quantity_rounding, minimum_quantity, track_lots,
              lot_expiration_policy, lot_expiration_alert_days,
              allow_expired_stock_override, track_serials, category_id, brand_id,
              cost, price)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             id,
             tenantId,
             dto.name,
-            dto.sku,
-            this.normalize(dto.sku),
+            sku,
+            this.normalize(sku),
             dto.barcode ?? null,
+            withoutCode ? 'GENERATED' : 'EXPLICIT',
+            dto.stockBehavior ?? 'TRACKED',
+            dto.taxBehavior ?? 'STANDARD',
             dto.baseUnit ?? 'UNIT',
             dto.quantityPrecision ?? (dto.trackSerials ? 0 : 3),
             dto.quantityRounding ?? 'HALF_UP',
             dto.minimumQuantity ?? (dto.trackSerials ? '1.000' : '0.001'),
-            specificLotPolicy || (dto.trackLots ?? false),
+            dto.stockBehavior === 'UNTRACKED'
+              ? false
+              : specificLotPolicy || (dto.trackLots ?? false),
             dto.lotExpirationPolicy ?? 'NONE',
             dto.lotExpirationAlertDays ?? 30,
             dto.allowExpiredStockOverride ?? false,
@@ -163,6 +177,10 @@ export class CatalogRepository {
       return await this.dataSource.transaction(async (manager) => {
         const [currentTracking] = await manager.query<
           Array<{
+            sku: string;
+            code_mode: 'EXPLICIT' | 'GENERATED';
+            stock_behavior: 'TRACKED' | 'UNTRACKED';
+            tax_behavior: 'STANDARD' | 'EXEMPT';
             track_lots: number | boolean;
             lot_expiration_policy: 'NONE' | 'OPTIONAL' | 'REQUIRED';
             lot_expiration_alert_days: number;
@@ -177,7 +195,8 @@ export class CatalogRepository {
             is_kit: number | string;
           }>
         >(
-          `SELECT p.track_lots, p.track_serials, p.base_unit,
+          `SELECT p.sku, p.code_mode, p.stock_behavior, p.tax_behavior,
+                  p.track_lots, p.track_serials, p.base_unit,
                   p.quantity_precision, p.quantity_rounding, p.minimum_quantity,
                   EXISTS(SELECT 1 FROM inventory_movements im
                          WHERE im.tenant_id = p.tenant_id
@@ -196,6 +215,27 @@ export class CatalogRepository {
           [id, tenantId],
         );
         if (!currentTracking) return null;
+        const nextStockBehavior =
+          dto.stockBehavior ?? currentTracking.stock_behavior;
+        const nextTrackLots =
+          dto.trackLots ?? Boolean(currentTracking.track_lots);
+        const nextTrackSerials =
+          dto.trackSerials ?? Boolean(currentTracking.track_serials);
+        if (
+          nextStockBehavior === 'UNTRACKED' &&
+          (nextTrackLots || nextTrackSerials)
+        ) {
+          throw new ProductSaleBehaviorError(
+            'Un producto sin control de stock no puede usar lotes ni series.',
+          );
+        }
+        if (
+          dto.stockBehavior !== undefined &&
+          dto.stockBehavior !== currentTracking.stock_behavior &&
+          Number(currentTracking.has_movements) === 1
+        ) {
+          throw new ProductQuantityPolicyLockedError();
+        }
         if (
           dto.trackLots !== undefined &&
           dto.trackLots !== Boolean(currentTracking.track_lots) &&
@@ -272,9 +312,18 @@ export class CatalogRepository {
               dto.brandName,
             )
           : null;
+        const withoutCode =
+          dto.withoutCode ?? currentTracking.code_mode === 'GENERATED';
+        const sku = withoutCode
+          ? currentTracking.code_mode === 'GENERATED'
+            ? currentTracking.sku
+            : `NC-${randomUUID().replaceAll('-', '').slice(0, 12).toUpperCase()}`
+          : dto.sku!;
         const result = await manager.query<ResultSetHeader>(
           `UPDATE products
-           SET name = ?, sku = ?, normalized_sku = ?, barcode = ?,
+           SET name = ?, sku = ?, normalized_sku = ?, barcode = ?, code_mode = ?,
+               stock_behavior = COALESCE(?, stock_behavior),
+               tax_behavior = COALESCE(?, tax_behavior),
                track_lots = COALESCE(?, track_lots),
                lot_expiration_policy = COALESCE(?, lot_expiration_policy),
                lot_expiration_alert_days = COALESCE(?, lot_expiration_alert_days),
@@ -288,9 +337,12 @@ export class CatalogRepository {
            WHERE id = ? AND tenant_id = ? AND version = ?`,
           [
             dto.name,
-            dto.sku,
-            this.normalize(dto.sku),
+            sku,
+            this.normalize(sku),
             dto.barcode ?? null,
+            withoutCode ? 'GENERATED' : 'EXPLICIT',
+            dto.stockBehavior ?? null,
+            dto.taxBehavior ?? null,
             dto.trackLots ?? null,
             dto.lotExpirationPolicy ?? null,
             dto.lotExpirationAlertDays ?? null,
@@ -320,6 +372,8 @@ export class CatalogRepository {
              ON parent.id = child.parent_product_id
             AND parent.tenant_id = child.tenant_id
            SET child.track_lots = parent.track_lots,
+               child.stock_behavior = parent.stock_behavior,
+               child.tax_behavior = parent.tax_behavior,
                child.lot_expiration_policy = parent.lot_expiration_policy,
                child.lot_expiration_alert_days = parent.lot_expiration_alert_days,
                child.allow_expired_stock_override = parent.allow_expired_stock_override,
@@ -636,6 +690,8 @@ export class CatalogRepository {
             name: string;
             category_id: string | null;
             brand_id: string | null;
+            stock_behavior: 'TRACKED' | 'UNTRACKED';
+            tax_behavior: 'STANDARD' | 'EXEMPT';
             track_lots: number | boolean;
             lot_expiration_policy: 'NONE' | 'OPTIONAL' | 'REQUIRED';
             lot_expiration_alert_days: number;
@@ -652,7 +708,8 @@ export class CatalogRepository {
             is_kit: number | string;
           }>
         >(
-          `SELECT id, name, category_id, brand_id, track_lots, base_unit,
+          `SELECT id, name, category_id, brand_id, stock_behavior, tax_behavior,
+                  track_lots, base_unit,
                   quantity_precision, quantity_rounding, minimum_quantity,
                   lot_expiration_policy, lot_expiration_alert_days,
                   allow_expired_stock_override, track_serials, active,
@@ -758,12 +815,13 @@ export class CatalogRepository {
             await manager.query(
               `INSERT INTO products
                 (id, tenant_id, parent_product_id, name, sku, normalized_sku, barcode,
-                 variant_values, track_lots, track_serials, base_unit,
+                 variant_values, stock_behavior, tax_behavior,
+                 track_lots, track_serials, base_unit,
                  quantity_precision, quantity_rounding, minimum_quantity,
                  category_id, brand_id,
                  lot_expiration_policy, lot_expiration_alert_days,
                  allow_expired_stock_override, cost, price, active)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 id,
                 tenantId,
@@ -773,6 +831,8 @@ export class CatalogRepository {
                 this.normalize(input.sku),
                 input.barcode ?? null,
                 JSON.stringify(variantValues),
+                parent.stock_behavior,
+                parent.tax_behavior,
                 parent.track_lots,
                 parent.track_serials,
                 parent.base_unit,
@@ -1144,7 +1204,8 @@ export class CatalogRepository {
   }
 
   private productSelect(): string {
-    return `SELECT p.id, p.name, p.sku, p.barcode, p.base_unit,
+    return `SELECT p.id, p.name, p.sku, p.barcode, p.code_mode,
+                   p.stock_behavior, p.tax_behavior, p.base_unit,
                    p.quantity_precision, p.quantity_rounding, p.minimum_quantity,
                    p.track_lots,
                    p.lot_expiration_policy, p.lot_expiration_alert_days,
@@ -1215,6 +1276,9 @@ export class CatalogRepository {
       name: row.name,
       sku: row.sku,
       barcode: row.barcode,
+      withoutCode: row.code_mode === 'GENERATED',
+      stockBehavior: row.stock_behavior,
+      taxBehavior: row.tax_behavior,
       baseUnit: row.base_unit,
       quantityPrecision: Number(row.quantity_precision),
       quantityRounding: row.quantity_rounding,

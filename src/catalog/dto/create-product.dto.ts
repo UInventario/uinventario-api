@@ -1,10 +1,12 @@
 import { Transform, Type } from 'class-transformer';
 import {
   IsBoolean,
+  IsDefined,
   IsIn,
   IsInt,
   IsOptional,
   IsString,
+  ValidateIf,
   Matches,
   MaxLength,
   Max,
@@ -41,10 +43,24 @@ export class CreateProductDto {
   @MaxLength(160)
   name!: string;
 
-  @Transform(trim)
+  @Transform(optionalTrim)
+  @ValidateIf((dto: CreateProductDto) => !dto.withoutCode)
+  @IsDefined()
   @IsString()
   @Matches(/^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/)
-  sku!: string;
+  sku?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  withoutCode?: boolean;
+
+  @IsOptional()
+  @IsIn(['TRACKED', 'UNTRACKED'])
+  stockBehavior?: 'TRACKED' | 'UNTRACKED';
+
+  @IsOptional()
+  @IsIn(['STANDARD', 'EXEMPT'])
+  taxBehavior?: 'STANDARD' | 'EXEMPT';
 
   @Transform(optionalTrim)
   @IsOptional()

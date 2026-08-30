@@ -268,6 +268,9 @@ export class PosController {
       userId: principal.user.id,
       dto,
       canDiscount: principal.user.permissions.includes('SALES_DISCOUNT'),
+      canOverridePrice: principal.user.permissions.includes(
+        'SALES_PRICE_OVERRIDE',
+      ),
       canOverrideExpired: principal.user.permissions.includes(
         'INVENTORY_EXPIRED_STOCK_OVERRIDE',
       ),
@@ -290,6 +293,9 @@ export class PosController {
       idempotencyKey,
       dto,
       canDiscount: principal.user.permissions.includes('SALES_DISCOUNT'),
+      canOverridePrice: principal.user.permissions.includes(
+        'SALES_PRICE_OVERRIDE',
+      ),
       canOverrideExpired: principal.user.permissions.includes(
         'INVENTORY_EXPIRED_STOCK_OVERRIDE',
       ),
@@ -308,6 +314,7 @@ export class PosController {
       after: {
         discountTotal: result.data.totals.discount,
         discountReasons: this.discountReasons(result.data),
+        priceOverrides: this.priceOverrides(result.data),
         expiredLotOverrides: this.expiredLotOverrides(result.data),
       },
     });
@@ -342,6 +349,9 @@ export class PosController {
       idempotencyKey,
       dto,
       canDiscount: principal.user.permissions.includes('SALES_DISCOUNT'),
+      canOverridePrice: principal.user.permissions.includes(
+        'SALES_PRICE_OVERRIDE',
+      ),
       canOverrideExpired: principal.user.permissions.includes(
         'INVENTORY_EXPIRED_STOCK_OVERRIDE',
       ),
@@ -362,6 +372,7 @@ export class PosController {
         paymentMethods: result.data.payments.map((payment) => payment.method),
         discountTotal: result.data.totals.discount,
         discountReasons: this.discountReasons(result.data),
+        priceOverrides: this.priceOverrides(result.data),
         expiredLotOverrides: this.expiredLotOverrides(result.data),
       },
     });
@@ -407,6 +418,22 @@ export class PosController {
             {
               productId: line.product.id,
               reason: line.expiredLotOverrideReason,
+            },
+          ]
+        : [],
+    );
+  }
+
+  private priceOverrides(
+    sale: Awaited<ReturnType<PosService['createSale']>>['data'],
+  ): Array<{ productId: string; unitPrice: string; reason: string }> {
+    return sale.lines.flatMap((line) =>
+      line.priceSource === 'MANUAL' && line.priceOverrideReason
+        ? [
+            {
+              productId: line.product.id,
+              unitPrice: line.unitPrice,
+              reason: line.priceOverrideReason,
             },
           ]
         : [],

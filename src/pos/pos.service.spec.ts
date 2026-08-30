@@ -4,6 +4,52 @@ import { PosService } from './pos.service';
 import { CashRegisterShiftService } from './cash-register-shift.service';
 
 describe('PosService', () => {
+  const untrackedService = () => {
+    const productId = '7efc799b-2086-4cb6-808d-bfa682543757';
+    const repository = {
+      getContext: jest.fn().mockResolvedValue({
+        countryCode: 'MX',
+        timezone: 'America/Mexico_City',
+        branch: { id: 'branch', name: 'Sucursal' },
+        warehouse: { id: 'warehouse', name: 'Bodega' },
+        cashRegister: { id: 'register', name: 'Caja', code: 'MAIN' },
+      }),
+      getProducts: jest.fn().mockResolvedValue([
+        {
+          id: productId,
+          name: 'Servicio sin cÃ³digo',
+          sku: 'NC-123456789ABC',
+          withoutCode: true,
+          stockBehavior: 'UNTRACKED',
+          taxBehavior: 'EXEMPT',
+          price: '10.00',
+          active: true,
+          trackLots: false,
+          trackSerials: false,
+          availableQuantity: '0.000',
+        },
+      ]),
+      getSelectedLotAvailability: jest.fn().mockResolvedValue(new Map()),
+    };
+    const service = new PosService(
+      repository as unknown as PosRepository,
+      {} as SalesRepository,
+      {
+        requireCurrent: jest.fn().mockResolvedValue({ id: 'shift' }),
+      } as unknown as CashRegisterShiftService,
+      { enabledMethods: jest.fn().mockReturnValue(['CASH']) } as never,
+      { resolve: jest.fn().mockResolvedValue(new Map()) } as never,
+      { resolve: jest.fn().mockResolvedValue(new Map()) } as never,
+      { preview: jest.fn().mockResolvedValue(null) } as never,
+      {
+        taxRates: { MX: '0.1600', DEFAULT: '0.0000' },
+        nonCashProvider: 'DISABLED',
+        paymentMethods: ['CASH'],
+      },
+    );
+    return { service, productId };
+  };
+
   const expirationService = () => {
     const productId = '7efc799b-2086-4cb6-808d-bfa682543757';
     const lotId = '6a5ec4cd-a854-4fb1-85d7-9ed7c98279c1';
@@ -296,6 +342,97 @@ describe('PosService', () => {
       subtotal: '2.00',
       tax: '0.00',
       total: '2.00',
+    });
+  });
+
+  it('requires the price override permission', async () => {
+    const { service, productId } = untrackedService();
+
+    await expect(
+      service.quoteCart({
+        tenantId: 'tenant',
+        branchId: 'branch',
+        warehouseId: 'warehouse',
+        cashRegisterId: 'register',
+        userId: 'user',
+        dto: {
+          lines: [
+            {
+              productId,
+              quantity: '1',
+              manualUnitPrice: '15.00',
+              priceOverrideReason: 'Precio negociado',
+            },
+          ],
+        },
+      }),
+    ).rejects.toMatchObject({
+      response: { code: 'SALE_PRICE_OVERRIDE_PERMISSION_REQUIRED' },
+    });
+  });
+
+  it('quotes an authorized untracked exempt product with its safe note', async () => {
+    const { service, productId } = untrackedService();
+
+    const quote = await service.quoteCart({
+      tenantId: 'tenant',
+      branchId: 'branch',
+      warehouseId: 'warehouse',
+      cashRegisterId: 'register',
+      userId: 'user',
+      canOverridePrice: true,
+      dto: {
+        lines: [
+          {
+            productId,
+            quantity: '1',
+            note: 'Preparar para regalo',
+            manualUnitPrice: '15.00',
+            priceOverrideReason: 'Precio negociado',
+          },
+        ],
+      },
+    });
+
+    expect(quote.data.lines[0]).toMatchObject({
+      product: {
+        withoutCode: true,
+        stockBehavior: 'UNTRACKED',
+        taxBehavior: 'EXEMPT',
+      },
+      note: 'Preparar para regalo',
+      unitPrice: '15.00',
+      priceSource: 'MANUAL',
+      priceOverrideReason: 'Precio negociado',
+      tax: '0.00',
+      total: '15.00',
+    });
+  });
+
+  it('bounds a manual price against the current resolved price', async () => {
+    const { service, productId } = untrackedService();
+
+    await expect(
+      service.quoteCart({
+        tenantId: 'tenant',
+        branchId: 'branch',
+        warehouseId: 'warehouse',
+        cashRegisterId: 'register',
+        userId: 'user',
+        canOverridePrice: true,
+        dto: {
+          lines: [
+            {
+              productId,
+              quantity: '1',
+              manualUnitPrice: '4.99',
+              priceOverrideReason: 'Precio negociado',
+            },
+          ],
+        },
+      }),
+    ).rejects.toMatchObject({
+      response: { code: 'SALE_PRICE_OVERRIDE_LIMIT_EXCEEDED' },
     });
   });
 });

@@ -64,12 +64,17 @@ interface QuotationLineRow {
   product_id: string;
   product_name: string;
   product_sku: string;
+  without_code: number | boolean;
+  line_note: string | null;
   quantity: string;
   lot_id: string | null;
   serial_numbers: string | string[];
   available_quantity: string;
   unit_price: string;
-  price_source: 'BASE' | 'PRICE_LIST';
+  price_source: 'BASE' | 'PRICE_LIST' | 'MANUAL';
+  price_override_reason: string | null;
+  stock_behavior: 'TRACKED' | 'UNTRACKED';
+  tax_behavior: 'STANDARD' | 'EXEMPT';
   price_list_id: string | null;
   price_list_name: string | null;
   gross_total: string;
@@ -483,14 +488,19 @@ export class SalesQuotationRepository {
           id: line.product_id,
           name: line.product_name,
           sku: line.product_sku,
+          withoutCode: Boolean(line.without_code),
+          stockBehavior: line.stock_behavior,
+          taxBehavior: line.tax_behavior,
         },
         quantity: this.decimal(line.quantity, 3),
+        note: line.line_note,
         lotId: line.lot_id,
         expiredLotOverrideReason: null,
         serialNumbers: this.json(line.serial_numbers),
         availableQuantity: this.decimal(line.available_quantity, 3),
         unitPrice: this.decimal(line.unit_price, 2),
         priceSource: line.price_source,
+        priceOverrideReason: line.price_override_reason,
         priceList: line.price_list_id
           ? { id: line.price_list_id, name: line.price_list_name! }
           : null,
@@ -555,10 +565,11 @@ export class SalesQuotationRepository {
       await manager.query(
         `INSERT INTO sales_quotation_lines
          (id, tenant_id, quotation_id, line_number, product_id, lot_id, quantity, serial_numbers,
-          product_name, product_sku, available_quantity, unit_price, price_source, price_list_id,
+          product_name, product_sku, without_code, line_note, available_quantity, unit_price,
+          price_source, price_override_reason, stock_behavior, tax_behavior, price_list_id,
           price_list_name, gross_total, line_discount_total, promotion_discount_total, sale_discount_total, discount_total,
           discount_type, discount_value, discount_reason, promotions_snapshot, subtotal, tax, total)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           randomUUID(),
           tenantId,
@@ -570,9 +581,14 @@ export class SalesQuotationRepository {
           JSON.stringify(line.serialNumbers),
           line.product.name,
           line.product.sku,
+          line.product.withoutCode,
+          line.note,
           line.availableQuantity,
           line.unitPrice,
           line.priceSource,
+          line.priceOverrideReason,
+          line.product.stockBehavior,
+          line.product.taxBehavior,
           line.priceList?.id ?? null,
           line.priceList?.name ?? null,
           line.grossTotal,

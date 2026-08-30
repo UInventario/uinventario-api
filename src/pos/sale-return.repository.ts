@@ -27,6 +27,7 @@ interface SaleLineRow {
   subtotal: string;
   tax: string;
   total: string;
+  stock_behavior: 'TRACKED' | 'UNTRACKED';
   track_serials: number | boolean;
   base_unit: import('../common/quantity-policy').ProductBaseUnit;
   quantity_precision: number;
@@ -183,7 +184,8 @@ export class SaleReturnRepository {
           const placeholders = requestedIds.map(() => '?').join(',');
           const saleLines = await manager.query<SaleLineRow[]>(
             `SELECT sl.id, sl.product_id, sl.product_name, sl.product_sku,
-                    sl.quantity, sl.subtotal, sl.tax, sl.total, p.track_serials,
+                    sl.quantity, sl.subtotal, sl.tax, sl.total,
+                    sl.stock_behavior, p.track_serials,
                     p.base_unit, p.quantity_precision, p.quantity_rounding,
                     p.minimum_quantity
              FROM sale_lines sl
@@ -271,14 +273,18 @@ export class SaleReturnRepository {
                ORDER BY component_product_id`,
               [input.tenantId, sale.id, source.id],
             );
-            const returnTargets = kitComponents.length
-              ? kitComponents.map((component) => ({
-                  productId: component.component_product_id,
-                  quantity:
-                    (quantity * this.toQuantity(component.quantity_per_kit)) /
-                    1000n,
-                }))
-              : [{ productId: source.product_id, quantity }];
+            const returnTargets =
+              source.stock_behavior === 'UNTRACKED'
+                ? []
+                : kitComponents.length
+                  ? kitComponents.map((component) => ({
+                      productId: component.component_product_id,
+                      quantity:
+                        (quantity *
+                          this.toQuantity(component.quantity_per_kit)) /
+                        1000n,
+                    }))
+                  : [{ productId: source.product_id, quantity }];
             const sourceMovements: SourceMovementRow[] = [];
             for (const target of returnTargets) {
               sourceMovements.push(

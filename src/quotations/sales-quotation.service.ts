@@ -315,6 +315,10 @@ export class SalesQuotationService {
       lines: quotation.lines.map((line) => ({
         productId: line.product.id,
         quantity: line.quantity,
+        note: line.note ?? undefined,
+        manualUnitPrice:
+          line.priceSource === 'MANUAL' ? line.unitPrice : undefined,
+        priceOverrideReason: line.priceOverrideReason ?? undefined,
         lotId: line.lotId ?? undefined,
         serialNumbers: line.serialNumbers,
         discount: line.discount.line
