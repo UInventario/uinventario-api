@@ -2,11 +2,13 @@ import type { ExternalAdapterCommand } from './external-adapter.types';
 import {
   SimulatedEmailExternalAdapter,
   SimulatedPushExternalAdapter,
+  SimulatedWhatsAppExternalAdapter,
 } from './simulated-notification.adapter';
 
 describe.each([
   ['email', new SimulatedEmailExternalAdapter()],
   ['push', new SimulatedPushExternalAdapter()],
+  ['whatsapp', new SimulatedWhatsAppExternalAdapter()],
 ])('versioned %s simulator contract', (_name, adapter) => {
   const command = (scenario: ExternalAdapterCommand['scenario'], attempt = 1) =>
     ({
