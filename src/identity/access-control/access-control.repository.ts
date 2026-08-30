@@ -5,6 +5,7 @@ import type { AppPermission } from '../../auth/authorization/authorization.types
 import {
   AccessUserConflictError,
   AccessUserNotFoundError,
+  AccessRetirementConfirmationError,
   InvalidAccessAssignmentError,
 } from './access-control.errors';
 import type { AccessRoleData, AccessUserData } from './access-control.types';
@@ -59,14 +60,20 @@ export class AccessControlRepository {
     actorUserId: string,
   ): Promise<AccessUserData[]> {
     const users = await this.dataSource.query<
-      Array<{ id: string; email: string; administrator: number | string }>
+      Array<{
+        id: string;
+        email: string;
+        accessRevokedAt: Date | null;
+        administrator: number | string;
+      }>
     >(
       `SELECT u.id, u.email,
               EXISTS (
                 SELECT 1 FROM user_roles ur
                 INNER JOIN roles r ON r.id = ur.role_id AND r.tenant_id = ur.tenant_id
                 WHERE ur.user_id = u.id AND ur.tenant_id = u.tenant_id AND r.code = 'ADMIN'
-              ) AS administrator
+              ) AS administrator,
+              u.access_revoked_at AS accessRevokedAt
        FROM users u WHERE u.tenant_id = ? ORDER BY u.email, u.id`,
       [tenantId],
     );
@@ -74,6 +81,7 @@ export class AccessControlRepository {
       users.map(async (user) => ({
         id: user.id,
         email: user.email,
+        active: user.accessRevokedAt === null,
         roles: await this.userRoles(this.dataSource.manager, tenantId, user.id),
         branches: await this.userBranches(
           this.dataSource.manager,
@@ -178,6 +186,10 @@ export class AccessControlRepository {
         input.cashRegisterIds,
       );
       await manager.query(
+        'UPDATE users SET access_revoked_at = NULL WHERE id = ? AND tenant_id = ?',
+        [input.userId, input.tenantId],
+      );
+      await manager.query(
         `UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP(6)
          WHERE user_id = ? AND tenant_id = ? AND revoked_at IS NULL`,
         [input.userId, input.tenantId],
@@ -188,6 +200,60 @@ export class AccessControlRepository {
         input.actorUserId,
         input.userId,
       );
+    });
+  }
+
+  async retireUser(input: {
+    tenantId: string;
+    actorUserId: string;
+    userId: string;
+    confirmationEmail: string;
+  }): Promise<AccessUserData> {
+    if (input.userId === input.actorUserId)
+      throw new InvalidAccessAssignmentError();
+    return this.dataSource.transaction(async (manager) => {
+      const [target] = await manager.query<
+        Array<{
+          email: string;
+          normalizedEmail: string;
+          administrator: number | string;
+        }>
+      >(
+        `SELECT u.email, u.normalized_email AS normalizedEmail,
+                EXISTS (
+                  SELECT 1 FROM user_roles ur
+                  INNER JOIN roles r ON r.id = ur.role_id AND r.tenant_id = ur.tenant_id
+                  WHERE ur.user_id = u.id AND ur.tenant_id = u.tenant_id AND r.code = 'ADMIN'
+                ) AS administrator
+         FROM users u WHERE u.id = ? AND u.tenant_id = ? FOR UPDATE`,
+        [input.userId, input.tenantId],
+      );
+      if (!target) throw new AccessUserNotFoundError();
+      if (Number(target.administrator) !== 0)
+        throw new InvalidAccessAssignmentError();
+      if (target.normalizedEmail !== input.confirmationEmail)
+        throw new AccessRetirementConfirmationError();
+
+      await manager.query(
+        `UPDATE users SET access_revoked_at = COALESCE(access_revoked_at, CURRENT_TIMESTAMP(6))
+         WHERE id = ? AND tenant_id = ?`,
+        [input.userId, input.tenantId],
+      );
+      await this.clearAssignment(manager, input.tenantId, input.userId);
+      await manager.query(
+        `UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP(6)
+         WHERE user_id = ? AND tenant_id = ? AND revoked_at IS NULL`,
+        [input.userId, input.tenantId],
+      );
+      return {
+        id: input.userId,
+        email: target.email,
+        active: false,
+        roles: [],
+        branches: [],
+        cashRegisters: [],
+        manageable: true,
+      };
     });
   }
 
@@ -232,18 +298,7 @@ export class AccessControlRepository {
     branchIds: string[],
     cashRegisterIds: string[],
   ): Promise<void> {
-    await manager.query(
-      'DELETE FROM user_roles WHERE user_id = ? AND tenant_id = ?',
-      [userId, tenantId],
-    );
-    await manager.query(
-      'DELETE FROM user_branch_access WHERE user_id = ? AND tenant_id = ?',
-      [userId, tenantId],
-    );
-    await manager.query(
-      'DELETE FROM user_cash_register_access WHERE user_id = ? AND tenant_id = ?',
-      [userId, tenantId],
-    );
+    await this.clearAssignment(manager, tenantId, userId);
     for (const roleId of roleIds) {
       await manager.query(
         'INSERT INTO user_roles (user_id, role_id, tenant_id) VALUES (?, ?, ?)',
@@ -268,20 +323,43 @@ export class AccessControlRepository {
     }
   }
 
+  private async clearAssignment(
+    manager: EntityManager,
+    tenantId: string,
+    userId: string,
+  ): Promise<void> {
+    await manager.query(
+      'DELETE FROM user_roles WHERE user_id = ? AND tenant_id = ?',
+      [userId, tenantId],
+    );
+    await manager.query(
+      'DELETE FROM user_branch_access WHERE user_id = ? AND tenant_id = ?',
+      [userId, tenantId],
+    );
+    await manager.query(
+      'DELETE FROM user_cash_register_access WHERE user_id = ? AND tenant_id = ?',
+      [userId, tenantId],
+    );
+  }
+
   private async findUser(
     manager: EntityManager,
     tenantId: string,
     actorUserId: string,
     userId: string,
   ): Promise<AccessUserData> {
-    const [user] = await manager.query<Array<{ id: string; email: string }>>(
-      'SELECT id, email FROM users WHERE id = ? AND tenant_id = ?',
+    const [user] = await manager.query<
+      Array<{ id: string; email: string; accessRevokedAt: Date | null }>
+    >(
+      `SELECT id, email, access_revoked_at AS accessRevokedAt
+       FROM users WHERE id = ? AND tenant_id = ?`,
       [userId, tenantId],
     );
     if (!user) throw new AccessUserNotFoundError();
     return {
       id: user.id,
       email: user.email,
+      active: user.accessRevokedAt === null,
       roles: await this.userRoles(manager, tenantId, userId),
       branches: await this.userBranches(manager, tenantId, userId),
       cashRegisters: await this.userCashRegisters(manager, tenantId, userId),

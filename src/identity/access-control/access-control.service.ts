@@ -12,6 +12,7 @@ import { AccessControlRepository } from './access-control.repository';
 import {
   AccessUserConflictError,
   AccessUserNotFoundError,
+  AccessRetirementConfirmationError,
   InvalidAccessAssignmentError,
 } from './access-control.errors';
 
@@ -85,6 +86,23 @@ export class AccessControlService {
     }));
   }
 
+  async retireUser(
+    tenantId: string,
+    actorUserId: string,
+    userId: string,
+    confirmationEmail: string,
+  ) {
+    return this.mapErrors(async () => ({
+      data: await this.access.retireUser({
+        tenantId,
+        actorUserId,
+        userId,
+        confirmationEmail,
+      }),
+      meta: { apiVersion: '1' as const },
+    }));
+  }
+
   private async mapErrors<T>(operation: () => Promise<T>): Promise<T> {
     try {
       return await operation();
@@ -100,6 +118,12 @@ export class AccessControlService {
           code: 'ACCESS_USER_NOT_AVAILABLE',
           message:
             'No fue posible crear el usuario con los datos proporcionados.',
+        });
+      }
+      if (error instanceof AccessRetirementConfirmationError) {
+        throw new BadRequestException({
+          code: 'ACCESS_RETIREMENT_CONFIRMATION_INVALID',
+          message: 'El correo de confirmación no corresponde al usuario.',
         });
       }
       if (error instanceof AccessUserNotFoundError)
