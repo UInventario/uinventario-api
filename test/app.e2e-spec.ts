@@ -18497,13 +18497,16 @@ describe('UInventario API (e2e)', () => {
         .post(`/api/v1/shipping/v1/orders/${deliveryCreated.data.id}/quote`)
         .set('Cookie', cookie)
         .expect(201);
+      const carrierQuoteData = carrierQuote.body as {
+        data: { quoteReference: string; service: string; currency: string };
+      };
       expect(carrierQuote.body).toMatchObject({
         data: {
-          quoteReference: expect.stringMatching(/^QUOTE-O-/),
           service: 'SIMULATED_STANDARD',
           currency: 'MXN',
         },
       });
+      expect(carrierQuoteData.data.quoteReference).toMatch(/^QUOTE-O-/);
       expect(JSON.stringify(carrierQuote.body)).not.toContain(
         'Calle Privada 123',
       );
@@ -18551,7 +18554,10 @@ describe('UInventario API (e2e)', () => {
         data: {
           version: number;
           fulfillment: {
-            carrier: { trackingReference: string | null };
+            carrier: {
+              trackingReference: string | null;
+              label: { payload: string };
+            };
           };
         };
       };
@@ -18563,7 +18569,7 @@ describe('UInventario API (e2e)', () => {
               attempts: 2,
               providerVersion: '1',
               trackingStatus: 'LABEL_READY',
-              label: { format: 'ZPL', payload: expect.stringContaining('^XA') },
+              label: { format: 'ZPL' },
               lastErrorCode: null,
             },
           },
@@ -18571,6 +18577,9 @@ describe('UInventario API (e2e)', () => {
       });
       expect(dispatchedData.data.fulfillment.carrier.trackingReference).toMatch(
         /^SIM-O-/,
+      );
+      expect(dispatchedData.data.fulfillment.carrier.label.payload).toContain(
+        '^XA',
       );
       expect(JSON.stringify(dispatched.body)).not.toContain(
         'Calle Privada 123',
