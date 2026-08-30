@@ -26,6 +26,10 @@ import { SimulatedFiscalAdapter } from './simulated-fiscal.adapter';
 import { ErpIntegrationController } from './erp-integration.controller';
 import { ErpIntegrationRepository } from './erp-integration.repository';
 import { ErpIntegrationService } from './erp-integration.service';
+import { PspPaymentController } from './psp-payment.controller';
+import { PspPaymentRepository } from './psp-payment.repository';
+import { PspPaymentService } from './psp-payment.service';
+import { SimulatedPspAdapter } from './simulated-psp.adapter';
 
 @Module({
   imports: [SessionModule, AuditModule],
@@ -35,6 +39,7 @@ import { ErpIntegrationService } from './erp-integration.service';
     FiscalContractController,
     FiscalSimulatorController,
     ErpIntegrationController,
+    PspPaymentController,
   ],
   providers: [
     ExternalAdapterRepository,
@@ -54,6 +59,9 @@ import { ErpIntegrationService } from './erp-integration.service';
     FiscalSimulatorService,
     ErpIntegrationRepository,
     ErpIntegrationService,
+    PspPaymentRepository,
+    PspPaymentService,
+    SimulatedPspAdapter,
     PermissionGuard,
   ],
   exports: [
