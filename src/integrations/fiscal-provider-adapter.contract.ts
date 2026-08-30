@@ -30,6 +30,12 @@ export function fiscalProviderAdapterContract(
       expect(Buffer.from(pdf.contentBase64, 'base64').toString()).toContain(
         '%PDF-1.4',
       );
+      expect(Buffer.from(pdf.contentBase64, 'base64').toString()).toContain(
+        '/Type /Pages',
+      );
+      expect(Buffer.from(pdf.contentBase64, 'base64').toString()).toContain(
+        'startxref',
+      );
     });
 
     it('returns a sanitized rejection', async () => {
