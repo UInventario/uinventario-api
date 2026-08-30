@@ -10,6 +10,17 @@ import { SalesCashReportRepository } from './sales-cash-report.repository';
 export class SalesCashReportService {
   constructor(private readonly reports: SalesCashReportRepository) {}
 
+  async resolveSaleBranch(input: {
+    tenantId: string;
+    userId: string;
+    administrator: boolean;
+    saleId: string;
+  }): Promise<string> {
+    const branchId = await this.reports.saleBranch(input);
+    if (!branchId) throw new NotFoundException();
+    return branchId;
+  }
+
   async report(input: {
     tenantId: string;
     userId: string;

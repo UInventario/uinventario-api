@@ -15,6 +15,7 @@ import { PermissionGuard } from '../auth/authorization/permission.guard';
 import { PaymentAuthorizationService } from './payment-authorization.service';
 import { SalesCashReportRepository } from './sales-cash-report.repository';
 import { SalesCashReportService } from './sales-cash-report.service';
+import { SalesReportDetailController } from './sales-report-detail.controller';
 import { SaleReceiptController } from './sale-receipt.controller';
 import { SaleReceiptRepository } from './sale-receipt.repository';
 import { SaleReceiptService } from './sale-receipt.service';
@@ -65,6 +66,7 @@ import {
   ],
   controllers: [
     PosController,
+    SalesReportDetailController,
     SaleReceiptController,
     SaleFiscalDocumentController,
     SaleReturnController,

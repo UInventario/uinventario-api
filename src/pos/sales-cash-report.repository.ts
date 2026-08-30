@@ -13,6 +13,24 @@ export interface BranchScope {
 export class SalesCashReportRepository {
   constructor(private readonly dataSource: DataSource) {}
 
+  async saleBranch(input: {
+    tenantId: string;
+    userId: string;
+    administrator: boolean;
+    saleId: string;
+  }): Promise<string | null> {
+    const rows = await this.dataSource.query<Array<{ branch_id: string }>>(
+      `SELECT s.branch_id FROM sales s
+       INNER JOIN branches b ON b.id = s.branch_id AND b.tenant_id = s.tenant_id
+       WHERE s.id = ? AND s.tenant_id = ? AND b.active = TRUE
+         AND (? = TRUE OR EXISTS (SELECT 1 FROM user_branch_access uba
+           WHERE uba.tenant_id = s.tenant_id AND uba.branch_id = s.branch_id AND uba.user_id = ?))
+       LIMIT 1`,
+      [input.saleId, input.tenantId, input.administrator, input.userId],
+    );
+    return rows[0]?.branch_id ?? null;
+  }
+
   async report(input: {
     tenantId: string;
     userId: string;
