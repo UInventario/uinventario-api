@@ -41,6 +41,10 @@ describe('UInventario API (e2e)', () => {
   async function resetIdentityData(): Promise<void> {
     await dataSource.query('SET FOREIGN_KEY_CHECKS = 0');
     for (const table of [
+      'commerce_webhook_deliveries',
+      'commerce_external_orders',
+      'commerce_api_usage_windows',
+      'commerce_api_credentials',
       'loyalty_point_allocations',
       'loyalty_point_entries',
       'loyalty_rules',
@@ -537,6 +541,301 @@ describe('UInventario API (e2e)', () => {
         .expect(({ body }: { body: unknown }) =>
           expect(body).toMatchObject({ data: [] }),
         );
+    });
+  });
+
+  describe('commerce API v1', () => {
+    beforeEach(resetIdentityData);
+
+    it('publishes safe incremental stock and reserves an idempotent external order', async () => {
+      await registerAccount('commerce-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Commerce SA',
+          tradeName: 'Commerce',
+          countryCode: 'MX',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Central',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'General',
+          locationName: 'Piso',
+        })
+        .expect(200);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja' })
+        .expect(200);
+      await openCurrentCashRegister(cookie, 'commerce-shift-opening');
+      const productResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Producto marketplace',
+          sku: 'MKT-1',
+          cost: '10',
+          price: '25',
+        })
+        .expect(201);
+      const customerResponse = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Cliente e-commerce',
+          identifier: 'ECOMMERCE-1',
+          dataProcessingConsent: false,
+        })
+        .expect(201);
+      const [context] = await dataSource.query<
+        Array<{
+          tenant_id: string;
+          branch_id: string;
+          warehouse_id: string;
+          location_id: string;
+          cash_register_id: string;
+        }>
+      >(
+        `SELECT b.tenant_id, b.id AS branch_id, w.id AS warehouse_id,
+                l.id AS location_id, cr.id AS cash_register_id
+         FROM branches b JOIN warehouses w ON w.branch_id = b.id
+         JOIN locations l ON l.warehouse_id = w.id
+         JOIN cash_registers cr ON cr.branch_id = b.id LIMIT 1`,
+      );
+      const productId = (productResponse.body as { data: { id: string } }).data
+        .id;
+      const customerId = (customerResponse.body as { data: { id: string } })
+        .data.id;
+      await request(app.getHttpServer())
+        .post('/api/v1/inventory/movements')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'commerce-opening-stock')
+        .send({
+          productId,
+          locationId: context.location_id,
+          type: 'INITIAL',
+          quantity: '5',
+          reason: 'Apertura e-commerce',
+        })
+        .expect(201);
+      const secondProductResponse = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Segundo producto marketplace',
+          sku: 'MKT-2',
+          cost: '11',
+          price: '30',
+        })
+        .expect(201);
+      const secondProductId = (
+        secondProductResponse.body as { data: { id: string } }
+      ).data.id;
+      const credentialResponse = await request(app.getHttpServer())
+        .post('/api/v1/integrations/commerce/credentials')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Marketplace principal',
+          scopes: ['CATALOG_READ', 'STOCK_READ', 'ORDERS_WRITE', 'ORDERS_READ'],
+          branchId: context.branch_id,
+          warehouseId: context.warehouse_id,
+          cashRegisterId: context.cash_register_id,
+          locationId: context.location_id,
+          customerId,
+          rateLimitPerMinute: 60,
+          webhookUrl: 'https://retry.example.test/order-events',
+          webhookEvents: ['ORDER_CONFIRMED'],
+          webhookEnabled: true,
+        })
+        .expect(201);
+      const apiKey = (
+        credentialResponse.body as {
+          data: { apiKey: string; keyHash?: string };
+        }
+      ).data.apiKey;
+      expect(apiKey).toMatch(/^uic_[A-Za-z0-9]{8}_[A-Za-z0-9_-]{32,128}$/);
+      expect(JSON.stringify(credentialResponse.body)).not.toContain('keyHash');
+
+      const catalog = await request(app.getHttpServer())
+        .get('/api/v1/external/v1/catalog?limit=1')
+        .set('Authorization', `Bearer ${apiKey}`)
+        .expect(200);
+      const catalogPage = catalog.body as {
+        data: Array<{
+          id: string;
+          price: string;
+          currency: string;
+          stock: { onHand: string; available: string };
+        }>;
+        meta: { apiVersion: '1'; hasMore: boolean; nextCursor: string };
+      };
+      expect(catalogPage.data).toHaveLength(1);
+      expect(catalogPage.data[0].currency).toBe('MXN');
+      expect(typeof catalogPage.data[0].price).toBe('string');
+      expect(typeof catalogPage.data[0].stock.onHand).toBe('string');
+      expect(typeof catalogPage.data[0].stock.available).toBe('string');
+      expect(catalogPage.meta).toMatchObject({
+        apiVersion: '1',
+        hasMore: true,
+      });
+      expect(JSON.stringify(catalog.body)).not.toContain('cost');
+      expect(JSON.stringify(catalog.body)).not.toContain(
+        registrationPayload.email,
+      );
+      const secondCatalogPage = await request(app.getHttpServer())
+        .get('/api/v1/external/v1/catalog')
+        .query({ limit: 1, cursor: catalogPage.meta.nextCursor })
+        .set('Authorization', `Bearer ${apiKey}`)
+        .expect(200);
+      const secondCatalogData = secondCatalogPage.body as {
+        data: Array<{ id: string }>;
+        meta: { hasMore: boolean; nextCursor: null };
+      };
+      expect(
+        new Set([catalogPage.data[0].id, secondCatalogData.data[0].id]),
+      ).toEqual(new Set([productId, secondProductId]));
+      expect(secondCatalogData.meta).toEqual(
+        expect.objectContaining({ hasMore: false, nextCursor: null }),
+      );
+
+      const orderInput = {
+        externalOrderId: 'market-1001',
+        expiresInHours: 24,
+        fulfillment: {
+          method: 'PICKUP',
+          windowStart: new Date(Date.now() + 60_000).toISOString(),
+          windowEnd: new Date(Date.now() + 3_600_000).toISOString(),
+          deliveryCost: '0',
+        },
+        lines: [{ productId, quantity: '1' }],
+        payment: { method: 'TRANSFER', reference: 'market-payment-1001' },
+      };
+      const created = await request(app.getHttpServer())
+        .post('/api/v1/external/v1/orders')
+        .set('Authorization', `Bearer ${apiKey}`)
+        .send(orderInput)
+        .expect(201);
+      expect(created.body).toMatchObject({
+        data: {
+          externalOrderId: 'market-1001',
+          status: 'CONFIRMED',
+          reservationStatus: 'ACTIVE',
+          paymentStatus: 'PLANNED',
+        },
+        meta: { idempotentReplay: false },
+      });
+      await request(app.getHttpServer())
+        .post('/api/v1/external/v1/orders')
+        .set('Authorization', `Bearer ${apiKey}`)
+        .send(orderInput)
+        .expect(201)
+        .expect(
+          ({ body }: { body: { meta: { idempotentReplay: boolean } } }) => {
+            expect(body.meta.idempotentReplay).toBe(true);
+          },
+        );
+      const [balance] = await dataSource.query<
+        Array<{ available_quantity: string; reserved_quantity: string }>
+      >(
+        `SELECT available_quantity, reserved_quantity FROM inventory_balances
+         WHERE tenant_id = ? AND product_id = ? AND location_id = ?`,
+        [context.tenant_id, productId, context.location_id],
+      );
+      expect(balance).toEqual({
+        available_quantity: '4.000',
+        reserved_quantity: '1.000',
+      });
+      const deliveries = await request(app.getHttpServer())
+        .get('/api/v1/integrations/commerce/webhook-deliveries')
+        .set('Cookie', cookie)
+        .expect(200);
+      expect(deliveries.body).toMatchObject({
+        data: [
+          {
+            eventType: 'ORDER_CONFIRMED',
+            status: 'SUCCEEDED',
+            attemptCount: 2,
+          },
+        ],
+      });
+    });
+
+    it('enforces scopes and the credential-specific minute limit', async () => {
+      await registerAccount('commerce-limit-registration');
+      const cookie = await createPersistedSession(registrationPayload.email);
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/company')
+        .set('Cookie', cookie)
+        .send({
+          legalName: 'Limits SA',
+          tradeName: 'Limits',
+          countryCode: 'MX',
+        });
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-location')
+        .set('Cookie', cookie)
+        .send({
+          branchName: 'Central',
+          timezone: 'America/Mexico_City',
+          warehouseName: 'General',
+          locationName: 'Piso',
+        });
+      await request(app.getHttpServer())
+        .put('/api/v1/onboarding/initial-cash-register')
+        .set('Cookie', cookie)
+        .send({ name: 'Caja' });
+      const customer = await request(app.getHttpServer())
+        .post('/api/v1/customers')
+        .set('Cookie', cookie)
+        .send({ name: 'Cliente API', dataProcessingConsent: false });
+      const [context] = await dataSource.query<
+        Array<{
+          branch_id: string;
+          warehouse_id: string;
+          location_id: string;
+          cash_register_id: string;
+        }>
+      >(
+        `SELECT b.id AS branch_id, w.id AS warehouse_id, l.id AS location_id,
+                cr.id AS cash_register_id FROM branches b
+         JOIN warehouses w ON w.branch_id = b.id JOIN locations l ON l.warehouse_id = w.id
+         JOIN cash_registers cr ON cr.branch_id = b.id LIMIT 1`,
+      );
+      const credential = await request(app.getHttpServer())
+        .post('/api/v1/integrations/commerce/credentials')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Catálogo limitado',
+          scopes: ['CATALOG_READ'],
+          branchId: context.branch_id,
+          warehouseId: context.warehouse_id,
+          cashRegisterId: context.cash_register_id,
+          locationId: context.location_id,
+          customerId: (customer.body as { data: { id: string } }).data.id,
+          rateLimitPerMinute: 10,
+          webhookEvents: [],
+          webhookEnabled: false,
+        })
+        .expect(201);
+      const key = (credential.body as { data: { apiKey: string } }).data.apiKey;
+      await request(app.getHttpServer())
+        .post('/api/v1/external/v1/orders')
+        .set('Authorization', `Bearer ${key}`)
+        .send({})
+        .expect(403);
+      for (let index = 0; index < 11; index += 1) {
+        await request(app.getHttpServer())
+          .get('/api/v1/external/v1/catalog')
+          .set('Authorization', `Bearer ${key}`)
+          .expect(index < 10 ? 200 : 429);
+      }
     });
   });
 

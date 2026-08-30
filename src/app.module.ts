@@ -39,6 +39,7 @@ import { NotificationModule } from './notifications/notification.module';
 import { ExternalAdapterModule } from './integrations/external-adapter.module';
 import { emailProviderConfig } from './config/email-provider.config';
 import { LoyaltyModule } from './loyalty/loyalty.module';
+import { CommerceModule } from './commerce/commerce.module';
 
 @Module({
   imports: [
@@ -96,6 +97,7 @@ import { LoyaltyModule } from './loyalty/loyalty.module';
     NotificationModule,
     ExternalAdapterModule,
     LoyaltyModule,
+    CommerceModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: SecurityThrottlerGuard }],
 })
