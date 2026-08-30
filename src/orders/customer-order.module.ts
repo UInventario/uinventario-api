@@ -11,14 +11,19 @@ import {
 import { CustomerOrderRepository } from './customer-order.repository';
 import { CustomerOrderService } from './customer-order.service';
 import { CustomerOrderEventBus } from './customer-order-event.bus';
+import { CustomerOrderShippingController } from './customer-order-shipping.controller';
+import { CustomerOrderShippingRepository } from './customer-order-shipping.repository';
+import { CustomerOrderShippingService } from './customer-order-shipping.service';
 
 @Module({
   imports: [SessionModule, PosModule, ProductReservationModule],
-  controllers: [CustomerOrderController],
+  controllers: [CustomerOrderController, CustomerOrderShippingController],
   providers: [
     CustomerOrderRepository,
     CustomerOrderService,
     CustomerOrderEventBus,
+    CustomerOrderShippingRepository,
+    CustomerOrderShippingService,
     PermissionGuard,
     SimulatorCustomerOrderCarrierAdapter,
     {

@@ -18,6 +18,7 @@ import { SupplierProductData } from '../src/suppliers/supplier-product.types';
 import type { OfflineBootstrapResponseV1 } from '../src/offline-sync/offline-sync-v1.contract';
 import type { OfflineChangesResponseV1 } from '../src/offline-sync/offline-sync-v1.contract';
 import { StructuredTelemetryService } from '../src/observability/structured-telemetry.service';
+import type { CustomerOrderData } from '../src/orders/customer-order.types';
 
 jest.setTimeout(15_000);
 
@@ -90,6 +91,8 @@ describe('UInventario API (e2e)', () => {
       'sale_returns',
       'suspended_sale_lines',
       'suspended_sales',
+      'customer_order_shipping_actions',
+      'customer_order_carrier_events',
       'customer_order_dispatch_attempts',
       'customer_order_transitions',
       'customer_order_payments',
@@ -18490,6 +18493,23 @@ describe('UInventario API (e2e)', () => {
         .set('Idempotency-Key', 'order-delivery-no-session')
         .send({ version: deliveryReadyData.data.version })
         .expect(401);
+      const carrierQuote = await request(app.getHttpServer())
+        .post(`/api/v1/shipping/v1/orders/${deliveryCreated.data.id}/quote`)
+        .set('Cookie', cookie)
+        .expect(201);
+      expect(carrierQuote.body).toMatchObject({
+        data: {
+          quoteReference: expect.stringMatching(/^QUOTE-O-/),
+          service: 'SIMULATED_STANDARD',
+          currency: 'MXN',
+        },
+      });
+      expect(JSON.stringify(carrierQuote.body)).not.toContain(
+        'Calle Privada 123',
+      );
+      expect(JSON.stringify(carrierQuote.body)).not.toContain(
+        '+52 55 1234 9876',
+      );
       const failedDispatch = await request(app.getHttpServer())
         .post(`/api/v1/orders/${deliveryCreated.data.id}/dispatch`)
         .set('Cookie', cookie)
@@ -18506,7 +18526,7 @@ describe('UInventario API (e2e)', () => {
             status: 'RETRYABLE_FAILURE',
             carrier: {
               attempts: 1,
-              lastErrorCode: 'SIMULATED_CARRIER_UNAVAILABLE',
+              lastErrorCode: 'SIMULATED_CARRIER_TIMEOUT',
             },
           },
         },
@@ -18539,13 +18559,135 @@ describe('UInventario API (e2e)', () => {
         data: {
           fulfillment: {
             status: 'DISPATCHED',
-            carrier: { attempts: 2, lastErrorCode: null },
+            carrier: {
+              attempts: 2,
+              providerVersion: '1',
+              trackingStatus: 'LABEL_READY',
+              label: { format: 'ZPL', payload: expect.stringContaining('^XA') },
+              lastErrorCode: null,
+            },
           },
         },
       });
       expect(dispatchedData.data.fulfillment.carrier.trackingReference).toMatch(
         /^SIM-O-/,
       );
+      expect(JSON.stringify(dispatched.body)).not.toContain(
+        'Calle Privada 123',
+      );
+
+      const cancelTimeout = await request(app.getHttpServer())
+        .post(`/api/v1/shipping/v1/orders/${deliveryCreated.data.id}/cancel`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-carrier-cancel-timeout')
+        .send({ scenario: 'TIMEOUT' })
+        .expect(201);
+      expect(cancelTimeout.body).toMatchObject({
+        data: {
+          status: 'READY',
+          fulfillment: {
+            status: 'DISPATCHED',
+            carrier: {
+              trackingStatus: 'LABEL_READY',
+              manualActionRequired: true,
+              lastErrorCode: 'SIMULATED_CARRIER_CANCEL_TIMEOUT',
+            },
+          },
+        },
+      });
+      await request(app.getHttpServer())
+        .post(`/api/v1/shipping/v1/orders/${deliveryCreated.data.id}/cancel`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-carrier-cancel-timeout')
+        .send({ scenario: 'TIMEOUT' })
+        .expect(201)
+        .expect(({ body }: { body: { meta: { idempotentReplay: boolean } } }) =>
+          expect(body.meta.idempotentReplay).toBe(true),
+        );
+
+      const polled = await request(app.getHttpServer())
+        .post(`/api/v1/shipping/v1/orders/${deliveryCreated.data.id}/poll`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'order-carrier-poll-transit')
+        .send({ scenario: 'IN_TRANSIT' })
+        .expect(201);
+      expect(polled.body).toMatchObject({
+        data: {
+          fulfillment: {
+            carrier: {
+              trackingStatus: 'IN_TRANSIT',
+              latestEventSequence: 1,
+              manualActionRequired: false,
+            },
+          },
+        },
+        meta: { eventApplied: true, idempotentReplay: false },
+      });
+
+      const deliveredEvent = {
+        providerEventId: 'carrier-event-delivered-20',
+        trackingReference:
+          dispatchedData.data.fulfillment.carrier.trackingReference!,
+        status: 'DELIVERED',
+        sequence: 20,
+        occurredAt: new Date().toISOString(),
+      };
+      await request(app.getHttpServer())
+        .post(`/api/v1/shipping/v1/orders/${deliveryCreated.data.id}/events`)
+        .set('Cookie', cookie)
+        .send(deliveredEvent)
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: { fulfillment: CustomerOrderData['fulfillment'] };
+              meta: { eventApplied: boolean };
+            };
+          }) => {
+            expect(body.meta.eventApplied).toBe(true);
+            expect(body.data.fulfillment.carrier?.trackingStatus).toBe(
+              'DELIVERED',
+            );
+          },
+        );
+      await request(app.getHttpServer())
+        .post(`/api/v1/shipping/v1/orders/${deliveryCreated.data.id}/events`)
+        .set('Cookie', cookie)
+        .send(deliveredEvent)
+        .expect(201)
+        .expect(({ body }: { body: { meta: { idempotentReplay: boolean } } }) =>
+          expect(body.meta.idempotentReplay).toBe(true),
+        );
+      await request(app.getHttpServer())
+        .post(`/api/v1/shipping/v1/orders/${deliveryCreated.data.id}/events`)
+        .set('Cookie', cookie)
+        .send({
+          providerEventId: 'carrier-event-old-transit-10',
+          trackingReference:
+            dispatchedData.data.fulfillment.carrier.trackingReference!,
+          status: 'IN_TRANSIT',
+          sequence: 10,
+          occurredAt: new Date(Date.now() - 60_000).toISOString(),
+        })
+        .expect(201)
+        .expect(
+          ({
+            body,
+          }: {
+            body: {
+              data: { fulfillment: CustomerOrderData['fulfillment'] };
+              meta: { eventApplied: boolean };
+            };
+          }) => {
+            expect(body.meta.eventApplied).toBe(false);
+            expect(body.data.fulfillment.carrier?.trackingStatus).toBe(
+              'DELIVERED',
+            );
+            expect(body.data.fulfillment.carrier?.latestEventSequence).toBe(20);
+          },
+        );
       const deliveredDispatch = await request(app.getHttpServer())
         .post(`/api/v1/orders/${deliveryCreated.data.id}/deliver`)
         .set('Cookie', cookie)

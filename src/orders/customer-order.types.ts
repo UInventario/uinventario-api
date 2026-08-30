@@ -44,7 +44,20 @@ export interface CustomerOrderData {
     carrier: {
       code: 'SIMULATED' | 'SIMULATED_RETRY';
       name: string;
+      providerVersion: '1';
       trackingReference: string | null;
+      label: { format: 'ZPL'; payload: string } | null;
+      trackingStatus:
+        | 'LABEL_READY'
+        | 'IN_TRANSIT'
+        | 'OUT_FOR_DELIVERY'
+        | 'DELIVERED'
+        | 'EXCEPTION'
+        | 'CANCELLED'
+        | null;
+      latestEventSequence: number;
+      latestEventAt: string | null;
+      manualActionRequired: boolean;
       attempts: number;
       lastErrorCode: string | null;
       lastAttemptAt: string | null;

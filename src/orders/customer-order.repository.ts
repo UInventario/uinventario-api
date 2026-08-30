@@ -17,7 +17,10 @@ import type {
   CustomerOrderStatus,
 } from './customer-order.types';
 import type { ListCustomerOrdersDto } from './dto/list-customer-orders.dto';
-import type { CustomerOrderDispatchResult } from './customer-order-carrier.adapter';
+import type {
+  CustomerOrderCarrierPayload,
+  CustomerOrderDispatchResult,
+} from './customer-order-carrier.adapter';
 
 interface OrderRow {
   id: string;
@@ -60,10 +63,24 @@ interface OrderRow {
   fulfillment_country_code: string | null;
   carrier_code: 'SIMULATED' | 'SIMULATED_RETRY' | null;
   carrier_name: string | null;
+  carrier_version: '1' | null;
   delivery_cost: string;
   window_start: Date | string;
   window_end: Date | string;
   tracking_reference: string | null;
+  label_format: 'ZPL' | null;
+  label_payload: string | null;
+  tracking_status:
+    | 'LABEL_READY'
+    | 'IN_TRANSIT'
+    | 'OUT_FOR_DELIVERY'
+    | 'DELIVERED'
+    | 'EXCEPTION'
+    | 'CANCELLED'
+    | null;
+  latest_event_sequence: number | string;
+  latest_event_at: Date | string | null;
+  manual_action_required: number | boolean;
   attempt_count: number;
   last_error_code: string | null;
   last_attempt_at: Date | string | null;
@@ -575,7 +592,12 @@ export class CustomerOrderRepository {
     actorUserId: string;
     version: number;
     idempotencyKey: string;
-    result: CustomerOrderDispatchResult;
+    execute: (
+      payload: CustomerOrderCarrierPayload & {
+        attempt: number;
+        idempotencyKey: string;
+      },
+    ) => Promise<CustomerOrderDispatchResult>;
   }): Promise<{ order: CustomerOrderData; replay: boolean }> {
     const fingerprint = this.dispatchFingerprint(input.orderId, input.version);
     try {
@@ -610,10 +632,25 @@ export class CustomerOrderRepository {
               fulfillment_status: CustomerOrderData['fulfillment']['status'];
               carrier_code: 'SIMULATED' | 'SIMULATED_RETRY' | null;
               attempt_count: number;
+              order_number: string;
+              currency: string;
+              recipient_name: string;
+              recipient_phone: string;
+              address_line1: string;
+              address_line2: string | null;
+              city: string;
+              region: string;
+              postal_code: string;
+              country_code: string;
+              window_start: Date | string;
+              window_end: Date | string;
             }>
           >(
-            `SELECT o.status, o.version, f.method,
-                    f.status AS fulfillment_status, f.carrier_code, f.attempt_count
+            `SELECT o.status, o.version, o.order_number, o.currency, f.method,
+                    f.status AS fulfillment_status, f.carrier_code, f.attempt_count,
+                    f.recipient_name, f.recipient_phone, f.address_line1, f.address_line2,
+                    f.city, f.region, f.postal_code, f.country_code,
+                    f.window_start, f.window_end
              FROM customer_orders o
              INNER JOIN customer_order_fulfillments f
                ON f.order_id = o.id AND f.tenant_id = o.tenant_id
@@ -630,6 +667,38 @@ export class CustomerOrderRepository {
           if (Number(current.version) !== input.version)
             throw new CustomerOrderVersionConflictError();
           const attempt = Number(current.attempt_count) + 1;
+          const parcels = await manager.query<
+            Array<{ sku: string; quantity: string }>
+          >(
+            `SELECT product.sku, line.quantity
+             FROM customer_order_lines line
+             INNER JOIN products product
+               ON product.id = line.product_id AND product.tenant_id = line.tenant_id
+             WHERE line.tenant_id = ? AND line.order_id = ? ORDER BY line.line_number`,
+            [input.tenantId, input.orderId],
+          );
+          const result = await input.execute({
+            carrierCode: current.carrier_code!,
+            orderNumber: current.order_number,
+            currency: current.currency,
+            windowStart: this.iso(current.window_start),
+            windowEnd: this.iso(current.window_end),
+            recipient: {
+              name: current.recipient_name,
+              phone: current.recipient_phone,
+            },
+            address: {
+              line1: current.address_line1,
+              line2: current.address_line2,
+              city: current.city,
+              region: current.region,
+              postalCode: current.postal_code,
+              countryCode: current.country_code,
+            },
+            parcels,
+            attempt,
+            idempotencyKey: input.idempotencyKey,
+          });
           await manager.query(
             `INSERT INTO customer_order_dispatch_attempts
             (id, tenant_id, order_id, attempt_number, status, carrier_code,
@@ -641,14 +710,10 @@ export class CustomerOrderRepository {
               input.tenantId,
               input.orderId,
               attempt,
-              input.result.status,
+              result.status,
               current.carrier_code,
-              input.result.status === 'SUCCEEDED'
-                ? input.result.trackingReference
-                : null,
-              input.result.status === 'FAILED_RETRYABLE'
-                ? input.result.errorCode
-                : null,
+              result.status === 'SUCCEEDED' ? result.trackingReference : null,
+              result.status === 'FAILED_RETRYABLE' ? result.errorCode : null,
               input.actorUserId,
               input.idempotencyKey,
               fingerprint,
@@ -657,19 +722,22 @@ export class CustomerOrderRepository {
           await manager.query(
             `UPDATE customer_order_fulfillments
              SET status = ?, attempt_count = ?, tracking_reference = ?,
+                 carrier_version = '1', label_format = ?, label_payload = ?,
+                 tracking_status = ?, latest_event_sequence = 0,
+                 latest_event_at = CURRENT_TIMESTAMP(6), manual_action_required = ?,
                  last_error_code = ?, last_attempt_at = CURRENT_TIMESTAMP(6)
              WHERE order_id = ? AND tenant_id = ?`,
             [
-              input.result.status === 'SUCCEEDED'
+              result.status === 'SUCCEEDED'
                 ? 'DISPATCHED'
                 : 'RETRYABLE_FAILURE',
               attempt,
-              input.result.status === 'SUCCEEDED'
-                ? input.result.trackingReference
-                : null,
-              input.result.status === 'FAILED_RETRYABLE'
-                ? input.result.errorCode
-                : null,
+              result.status === 'SUCCEEDED' ? result.trackingReference : null,
+              result.status === 'SUCCEEDED' ? result.label.format : null,
+              result.status === 'SUCCEEDED' ? result.label.payload : null,
+              result.status === 'SUCCEEDED' ? result.trackingStatus : null,
+              result.status === 'FAILED_RETRYABLE',
+              result.status === 'FAILED_RETRYABLE' ? result.errorCode : null,
               input.orderId,
               input.tenantId,
             ],
@@ -788,8 +856,10 @@ export class CustomerOrderRepository {
               f.recipient_name, f.recipient_phone,
               f.city AS fulfillment_city, f.region AS fulfillment_region,
               f.country_code AS fulfillment_country_code,
-              f.carrier_code, f.carrier_name, f.delivery_cost,
+              f.carrier_code, f.carrier_name, f.carrier_version, f.delivery_cost,
               f.window_start, f.window_end, f.tracking_reference,
+              f.label_format, f.label_payload, f.tracking_status,
+              f.latest_event_sequence, f.latest_event_at, f.manual_action_required,
               f.attempt_count, f.last_error_code, f.last_attempt_at,
               au.id AS assigned_user_id, au.email AS assigned_user_email,
               du.id AS delivered_user_id, du.email AS delivered_user_email
@@ -928,7 +998,18 @@ export class CustomerOrderRepository {
             ? {
                 code: row.carrier_code,
                 name: row.carrier_name,
+                providerVersion: row.carrier_version ?? '1',
                 trackingReference: row.tracking_reference,
+                label:
+                  row.label_format && row.label_payload
+                    ? { format: row.label_format, payload: row.label_payload }
+                    : null,
+                trackingStatus: row.tracking_status,
+                latestEventSequence: Number(row.latest_event_sequence),
+                latestEventAt: row.latest_event_at
+                  ? this.iso(row.latest_event_at)
+                  : null,
+                manualActionRequired: Boolean(row.manual_action_required),
                 attempts: Number(row.attempt_count),
                 lastErrorCode: row.last_error_code,
                 lastAttemptAt: row.last_attempt_at
