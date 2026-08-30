@@ -10,6 +10,7 @@ import {
 } from './customer-order-carrier.adapter';
 import { CustomerOrderRepository } from './customer-order.repository';
 import { CustomerOrderService } from './customer-order.service';
+import { CustomerOrderEventBus } from './customer-order-event.bus';
 
 @Module({
   imports: [SessionModule, PosModule, ProductReservationModule],
@@ -17,6 +18,7 @@ import { CustomerOrderService } from './customer-order.service';
   providers: [
     CustomerOrderRepository,
     CustomerOrderService,
+    CustomerOrderEventBus,
     PermissionGuard,
     SimulatorCustomerOrderCarrierAdapter,
     {
@@ -24,5 +26,6 @@ import { CustomerOrderService } from './customer-order.service';
       useExisting: SimulatorCustomerOrderCarrierAdapter,
     },
   ],
+  exports: [CustomerOrderService, CustomerOrderEventBus],
 })
 export class CustomerOrderModule {}

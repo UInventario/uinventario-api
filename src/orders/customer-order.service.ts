@@ -31,6 +31,7 @@ import {
   type CustomerOrderCarrierAdapter,
 } from './customer-order-carrier.adapter';
 import type { CustomerOrderFulfillmentDto } from './dto/customer-order-fulfillment.dto';
+import { CustomerOrderEventBus } from './customer-order-event.bus';
 
 interface CustomerOrderTransitionInput {
   tenantId: string;
@@ -51,6 +52,7 @@ export class CustomerOrderService {
     private readonly pos: PosService,
     @Inject(CUSTOMER_ORDER_CARRIER_ADAPTER)
     private readonly carrier: CustomerOrderCarrierAdapter,
+    private readonly events: CustomerOrderEventBus,
   ) {}
 
   async create(input: {
@@ -266,6 +268,7 @@ export class CustomerOrderService {
         idempotencyKey: input.idempotencyKey!,
         result,
       });
+      await this.events.publish(input.tenantId, dispatched.order);
       return {
         data: dispatched.order,
         meta: { apiVersion: '1', idempotentReplay: dispatched.replay },
@@ -403,6 +406,7 @@ export class CustomerOrderService {
         reservationId: input.reservationId,
         saleId: input.saleId,
       });
+      await this.events.publish(input.tenantId, result.order);
       return {
         data: result.order,
         meta: { apiVersion: '1', idempotentReplay: result.replay },
