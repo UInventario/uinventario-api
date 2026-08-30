@@ -34,6 +34,12 @@ export class ProductQuantityPolicyLockedError extends Error {
   }
 }
 
+export class ProductSaleBehaviorError extends Error {
+  constructor(readonly reason: string) {
+    super('PRODUCT_SALE_BEHAVIOR_INVALID');
+  }
+}
+
 export class ProductVariantConfigurationError extends Error {
   constructor(readonly reason: string) {
     super('PRODUCT_VARIANT_CONFIGURATION_INVALID');

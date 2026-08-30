@@ -198,6 +198,7 @@ export class PosService {
     dto: CreateCashSaleDto;
     expectedSnapshot?: OfflineCashSaleSnapshot;
     canDiscount?: boolean;
+    canOverridePrice?: boolean;
     canOverrideExpired?: boolean;
     canViewMargin?: boolean;
   }): Promise<CashSaleResponse> {
@@ -225,6 +226,7 @@ export class PosService {
     dto: CreateSaleDto;
     expectedSnapshot?: OfflineCashSaleSnapshot;
     canDiscount?: boolean;
+    canOverridePrice?: boolean;
     canOverrideExpired?: boolean;
     canCredit?: boolean;
     canViewMargin?: boolean;
@@ -272,6 +274,7 @@ export class PosService {
           discount: input.dto.discount,
         },
         canDiscount: input.canDiscount,
+        canOverridePrice: input.canOverridePrice,
         canOverrideExpired: input.canOverrideExpired,
       });
       if (input.expectedSnapshot) {
@@ -483,6 +486,7 @@ export class PosService {
     userId: string;
     dto: QuoteCartDto;
     canDiscount?: boolean;
+    canOverridePrice?: boolean;
     canOverrideExpired?: boolean;
   }): Promise<PosCartQuoteResponse> {
     try {
@@ -498,6 +502,9 @@ export class PosService {
       const requestedExpiredReasons = new Map<string, string | null>();
       const requestedSerials = new Map<string, string[]>();
       const requestedDiscounts = new Map<string, SaleDiscountDto | null>();
+      const requestedNotes = new Map<string, string | null>();
+      const requestedManualPrices = new Map<string, string | null>();
+      const requestedOverrideReasons = new Map<string, string | null>();
       const hasDiscount =
         Boolean(input.dto.discount) ||
         input.dto.lines.some((line) => Boolean(line.discount));
@@ -552,6 +559,31 @@ export class PosService {
           });
         }
         requestedDiscounts.set(line.productId, discount);
+        const controls = [
+          [requestedNotes, line.note ?? null],
+          [requestedManualPrices, line.manualUnitPrice ?? null],
+          [requestedOverrideReasons, line.priceOverrideReason ?? null],
+        ] as const;
+        for (const [values, value] of controls) {
+          const previous = values.get(line.productId);
+          if (previous !== undefined && previous !== value) {
+            throw new BadRequestException({
+              code: 'MIXED_PRODUCT_LINE_CONTROLS',
+              message:
+                'Un producto repetido debe usar la misma nota y precio manual.',
+            });
+          }
+          values.set(line.productId, value);
+        }
+      }
+      if (
+        [...requestedManualPrices.values()].some((price) => price !== null) &&
+        !input.canOverridePrice
+      ) {
+        throw new ForbiddenException({
+          code: 'SALE_PRICE_OVERRIDE_PERMISSION_REQUIRED',
+          message: 'No tienes permiso para modificar el precio de venta.',
+        });
       }
       const products = await this.pos.getProducts(
         input.tenantId,
@@ -616,6 +648,20 @@ export class PosService {
       >();
       for (const [productId, quantity] of normalizedRequested) {
         const product = productMap.get(productId)!;
+        if (product.stockBehavior === 'UNTRACKED') {
+          if (
+            input.dto.reservationId ||
+            requestedLots.get(productId) ||
+            (requestedSerials.get(productId)?.length ?? 0) > 0
+          ) {
+            throw new BadRequestException({
+              code: 'UNTRACKED_PRODUCT_INVENTORY_CONTROLS_NOT_SUPPORTED',
+              message:
+                'Los productos sin control de stock no admiten reserva, lote ni serie.',
+            });
+          }
+          continue;
+        }
         if (product.kit?.stockMode === 'DERIVED') {
           if (
             input.dto.reservationId ||
@@ -704,11 +750,38 @@ export class PosService {
               message: 'Captura el motivo de la excepción de caducidad.',
             });
           }
-          if (quantityUnits > this.toQuantityUnits(availableQuantity!)) {
+          if (
+            product.stockBehavior !== 'UNTRACKED' &&
+            quantityUnits > this.toQuantityUnits(availableQuantity!)
+          ) {
             throw new PosInsufficientStockError(productId);
           }
           const resolvedPrice = resolvedPrices.get(productId);
-          const effectivePrice = resolvedPrice?.price ?? product.price;
+          const referencePrice = resolvedPrice?.price ?? product.price;
+          const manualPrice = requestedManualPrices.get(productId) ?? null;
+          const priceOverrideReason =
+            requestedOverrideReasons.get(productId) ?? null;
+          if (manualPrice && !priceOverrideReason) {
+            throw new BadRequestException({
+              code: 'SALE_PRICE_OVERRIDE_REASON_REQUIRED',
+              message: 'Captura el motivo del precio manual.',
+            });
+          }
+          if (manualPrice) {
+            const referenceCents = this.toMoneyCents(referencePrice);
+            const manualCents = this.toMoneyCents(manualPrice);
+            if (
+              manualCents * 2n < referenceCents ||
+              manualCents > referenceCents * 2n
+            ) {
+              throw new BadRequestException({
+                code: 'SALE_PRICE_OVERRIDE_LIMIT_EXCEEDED',
+                message:
+                  'El precio manual debe estar entre 50% y 200% del precio vigente.',
+              });
+            }
+          }
+          const effectivePrice = manualPrice ?? referencePrice;
           const grossCents = this.roundDivide(
             this.toMoneyCents(effectivePrice) * quantityUnits,
             1000n,
@@ -751,19 +824,26 @@ export class PosService {
               id: product.id,
               name: product.name,
               sku: product.sku,
+              withoutCode: product.withoutCode,
+              stockBehavior: product.stockBehavior,
+              taxBehavior: product.taxBehavior,
               baseUnit: product.baseUnit ?? 'UNIT',
               quantityPrecision: product.quantityPrecision ?? 3,
               minimumQuantity: product.minimumQuantity ?? '0.001',
             },
             quantity: this.fromQuantityUnits(quantityUnits),
+            note: requestedNotes.get(productId) ?? null,
             lotId: requestedLots.get(productId) ?? null,
             expiredLotOverrideReason: expired ? expiredReason : null,
             serialNumbers,
             availableQuantity: availableQuantity!,
             kit,
             unitPrice: this.fromMoneyCents(this.toMoneyCents(effectivePrice)),
-            priceSource: resolvedPrice?.source ?? ('BASE' as const),
-            priceList: resolvedPrice?.priceList ?? null,
+            priceSource: manualPrice
+              ? ('MANUAL' as const)
+              : (resolvedPrice?.source ?? ('BASE' as const)),
+            priceOverrideReason: manualPrice ? priceOverrideReason : null,
+            priceList: manualPrice ? null : (resolvedPrice?.priceList ?? null),
             grossCents,
             lineDiscountCents,
             requestedDiscount,
@@ -845,7 +925,7 @@ export class PosService {
           line.lineDiscountCents + line.promotionDiscountCents + saleAllocation;
         const lineTotal = line.grossCents - totalDiscount;
         const lineTax =
-          taxBasisPoints === 0n
+          taxBasisPoints === 0n || line.product.taxBehavior === 'EXEMPT'
             ? 0n
             : this.roundDivide(
                 lineTotal * taxBasisPoints,
@@ -858,6 +938,7 @@ export class PosService {
         return {
           product: line.product,
           quantity: line.quantity,
+          note: line.note,
           lotId: line.lotId,
           expiredLotOverrideReason: line.expiredLotOverrideReason,
           serialNumbers: line.serialNumbers,
@@ -865,6 +946,7 @@ export class PosService {
           kit: line.kit,
           unitPrice: line.unitPrice,
           priceSource: line.priceSource,
+          priceOverrideReason: line.priceOverrideReason,
           priceList: line.priceList,
           grossTotal: this.fromMoneyCents(line.grossCents),
           discount: {
@@ -1078,6 +1160,9 @@ export class PosService {
     const lots = new Map<string, string | null>();
     const serials = new Map<string, string[]>();
     const discounts = new Map<string, SaleDiscountDto | null>();
+    const notes = new Map<string, string | null>();
+    const manualPrices = new Map<string, string | null>();
+    const overrideReasons = new Map<string, string | null>();
     for (const line of dto.lines) {
       quantities.set(
         line.productId,
@@ -1106,6 +1191,20 @@ export class PosService {
         });
       }
       discounts.set(line.productId, discount);
+      const controls = [
+        [notes, line.note ?? null],
+        [manualPrices, line.manualUnitPrice ?? null],
+        [overrideReasons, line.priceOverrideReason ?? null],
+      ] as const;
+      for (const [values, value] of controls) {
+        const previous = values.get(line.productId);
+        if (previous !== undefined && previous !== value) {
+          throw new BadRequestException({
+            code: 'MIXED_PRODUCT_LINE_CONTROLS',
+          });
+        }
+        values.set(line.productId, value);
+      }
     }
     const canonical = {
       lines: [...quantities.entries()]
@@ -1123,6 +1222,9 @@ export class PosService {
                 reason: discounts.get(productId)!.reason.trim(),
               }
             : null,
+          note: notes.get(productId) ?? null,
+          manualUnitPrice: manualPrices.get(productId) ?? null,
+          priceOverrideReason: overrideReasons.get(productId) ?? null,
         })),
       payments: (dto.payments ?? (dto.payment ? [dto.payment] : [])).map(
         (payment) => ({

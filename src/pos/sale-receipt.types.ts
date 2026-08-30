@@ -4,8 +4,12 @@ export interface SaleReceiptLine {
   lineNumber: number;
   productName: string;
   productSku: string;
+  withoutCode: boolean;
+  note: string | null;
   quantity: string;
   unitPrice: string;
+  priceSource: 'BASE' | 'PRICE_LIST' | 'MANUAL';
+  priceOverrideReason: string | null;
   grossTotal: string;
   discountTotal: string;
   lineDiscountReason: string | null;

@@ -12789,6 +12789,174 @@ describe('UInventario API (e2e)', () => {
       });
     });
 
+    it('sells, reports and returns an uncoded untracked product with controlled notes and price', async () => {
+      const { cookie } = await preparePos();
+      const created = await request(app.getHttpServer())
+        .post('/api/v1/products')
+        .set('Cookie', cookie)
+        .send({
+          name: 'Servicio de envoltura',
+          withoutCode: true,
+          stockBehavior: 'UNTRACKED',
+          taxBehavior: 'EXEMPT',
+          cost: '2.00',
+          price: '10.00',
+          quantityPrecision: 0,
+          minimumQuantity: '1.000',
+        })
+        .expect(201);
+      const product = (
+        created.body as {
+          data: {
+            id: string;
+            sku: string;
+            withoutCode: boolean;
+            stockBehavior: string;
+            taxBehavior: string;
+          };
+        }
+      ).data;
+      expect(product).toMatchObject({
+        withoutCode: true,
+        stockBehavior: 'UNTRACKED',
+        taxBehavior: 'EXEMPT',
+      });
+      expect(product.sku).toMatch(/^NC-[A-F0-9]{12}$/);
+
+      await request(app.getHttpServer())
+        .get('/api/v1/products')
+        .query({ q: 'envoltura' })
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: [{ id: product.id, withoutCode: true }],
+            meta: { pagination: { total: 1 } },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({
+          lines: [
+            {
+              productId: product.id,
+              quantity: '1',
+              note: 'Visible\u0000oculto',
+            },
+          ],
+        })
+        .expect(400);
+
+      const line = {
+        productId: product.id,
+        quantity: '1',
+        note: 'Entregar en mostrador',
+        manualUnitPrice: '15.00',
+        priceOverrideReason: 'Servicio personalizado',
+      };
+      await request(app.getHttpServer())
+        .post('/api/v1/pos/cart/quote')
+        .set('Cookie', cookie)
+        .send({ lines: [line] })
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  product: {
+                    id: product.id,
+                    withoutCode: true,
+                    stockBehavior: 'UNTRACKED',
+                    taxBehavior: 'EXEMPT',
+                  },
+                  note: line.note,
+                  unitPrice: line.manualUnitPrice,
+                  priceSource: 'MANUAL',
+                  priceOverrideReason: line.priceOverrideReason,
+                  tax: '0.00',
+                  total: '15.00',
+                },
+              ],
+              totals: { subtotal: '15.00', tax: '0.00', total: '15.00' },
+            },
+          });
+        });
+
+      const saleResponse = await request(app.getHttpServer())
+        .post('/api/v1/pos/sales/cash')
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'uncoded-untracked-sale')
+        .send({ lines: [line], cashReceived: '20.00' })
+        .expect(201);
+      const sale = saleResponse.body as {
+        data: { id: string; lines: Array<{ id: string }> };
+      };
+      expect(saleResponse.body).toMatchObject({
+        data: {
+          lines: [
+            {
+              note: line.note,
+              priceSource: 'MANUAL',
+              priceOverrideReason: line.priceOverrideReason,
+              product: { withoutCode: true, stockBehavior: 'UNTRACKED' },
+            },
+          ],
+        },
+      });
+      const [movementCount] = await dataSource.query<
+        Array<{ total: number | string }>
+      >(
+        'SELECT COUNT(*) AS total FROM inventory_movements WHERE sale_id = ? AND product_id = ?',
+        [sale.data.id, product.id],
+      );
+      expect(Number(movementCount.total)).toBe(0);
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${sale.data.id}/receipt/reprints`)
+        .set('Cookie', cookie)
+        .expect(200)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              lines: [
+                {
+                  withoutCode: true,
+                  note: line.note,
+                  priceSource: 'MANUAL',
+                  priceOverrideReason: line.priceOverrideReason,
+                },
+              ],
+            },
+          });
+        });
+
+      await request(app.getHttpServer())
+        .post(`/api/v1/pos/sales/${sale.data.id}/returns`)
+        .set('Cookie', cookie)
+        .set('Idempotency-Key', 'uncoded-untracked-return')
+        .send({
+          reason: 'Servicio cancelado',
+          lines: [
+            {
+              saleLineId: sale.data.lines[0].id,
+              quantity: '1',
+              condition: 'SELLABLE',
+            },
+          ],
+        })
+        .expect(201)
+        .expect(({ body }: { body: unknown }) => {
+          expect(body).toMatchObject({
+            data: {
+              totals: { subtotal: '15.00', tax: '0.00', total: '15.00' },
+            },
+          });
+        });
+    });
+
     it('returns sale quantities once, restores the right stock state and links an exchange', async () => {
       const { cookie, productId, locationId } = await preparePos();
       const original = await request(app.getHttpServer())

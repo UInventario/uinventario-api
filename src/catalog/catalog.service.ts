@@ -15,6 +15,7 @@ import {
   ProductKitConfigurationError,
   ProductVariantConfigurationError,
   ProductVariantsRequireZeroStockError,
+  ProductSaleBehaviorError,
 } from './catalog.errors';
 import {
   CatalogOptionsResponse,
@@ -41,6 +42,7 @@ export class CatalogService {
     tenantId: string,
     dto: CreateProductDto,
   ): Promise<ProductResponse> {
+    this.assertSaleBehavior(dto);
     this.assertLotExpirationPolicy(dto, true);
     assertProductQuantityPolicy(
       {
@@ -87,6 +89,7 @@ export class CatalogService {
     id: string,
     dto: UpdateProductDto,
   ): Promise<ProductResponse> {
+    this.assertSaleBehavior(dto);
     this.assertLotExpirationPolicy(dto);
     try {
       const product = await this.catalog.updateProduct(tenantId, id, dto);
@@ -116,6 +119,12 @@ export class CatalogService {
           code: 'PRODUCT_QUANTITY_POLICY_LOCKED',
           message:
             'La unidad, precisi\u00f3n, redondeo y cantidad m\u00ednima no pueden cambiar despu\u00e9s del primer movimiento.',
+        });
+      }
+      if (error instanceof ProductSaleBehaviorError) {
+        throw new BadRequestException({
+          code: 'PRODUCT_SALE_BEHAVIOR_INVALID',
+          message: error.reason,
         });
       }
       throw error;
@@ -249,6 +258,19 @@ export class CatalogService {
         });
       }
       throw error;
+    }
+  }
+
+  private assertSaleBehavior(dto: CreateProductDto): void {
+    if (
+      dto.stockBehavior === 'UNTRACKED' &&
+      (dto.trackLots === true || dto.trackSerials === true)
+    ) {
+      throw new BadRequestException({
+        code: 'UNTRACKED_PRODUCT_CANNOT_TRACK_INVENTORY',
+        message:
+          'Un producto sin control de stock no puede usar lotes ni series.',
+      });
     }
   }
 

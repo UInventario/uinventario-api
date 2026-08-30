@@ -854,6 +854,10 @@ export class SalesRepository {
           for (const line of [...input.quote.lines].sort((left, right) =>
             left.product.id.localeCompare(right.product.id),
           )) {
+            if (line.product.stockBehavior === 'UNTRACKED') {
+              allocations.set(line.product.id, []);
+              continue;
+            }
             if (line.kit?.stockMode === 'DERIVED') continue;
             const serialsByLocation = new Map<string, string[]>();
             if (line.serialNumbers.length > 0) {
@@ -1087,11 +1091,13 @@ export class SalesRepository {
             await manager.query(
               `INSERT INTO sale_lines
               (id, tenant_id, sale_id, line_number, product_id, product_name,
-               product_sku, quantity, unit_price, price_source, price_list_id,
+               product_sku, without_code, line_note, quantity, unit_price, price_source,
+               price_override_reason, price_list_id,
                price_list_name, unit_cost, gross_total, line_discount_total,
                promotion_discount_total, sale_discount_total, discount_total, discount_type, discount_value,
-               discount_reason, expired_lot_override_reason, subtotal, tax, total)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               discount_reason, expired_lot_override_reason, stock_behavior,
+               tax_behavior, subtotal, tax, total)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
               [
                 saleLineId,
                 input.tenantId,
@@ -1100,9 +1106,12 @@ export class SalesRepository {
                 line.product.id,
                 line.product.name,
                 line.product.sku,
+                line.product.withoutCode,
+                line.note,
                 line.quantity,
                 line.unitPrice,
                 line.priceSource,
+                line.priceOverrideReason,
                 line.priceList?.id ?? null,
                 line.priceList?.name ?? null,
                 unitCost,
@@ -1115,6 +1124,8 @@ export class SalesRepository {
                 line.discount.line?.value ?? null,
                 line.discount.line?.reason ?? null,
                 line.expiredLotOverrideReason,
+                line.product.stockBehavior,
+                line.product.taxBehavior,
                 line.subtotal,
                 line.tax,
                 line.total,
@@ -1167,22 +1178,24 @@ export class SalesRepository {
               }
             }
             const inventoryTargets =
-              line.kit?.stockMode === 'DERIVED'
-                ? line.kit.components.map((component) => ({
-                    productId: component.product.id,
-                    allocations:
-                      derivedAllocations.get(
-                        `${line.product.id}:${component.product.id}`,
-                      ) ?? [],
-                    derived: true,
-                  }))
-                : [
-                    {
-                      productId: line.product.id,
-                      allocations: allocations.get(line.product.id) ?? [],
-                      derived: false,
-                    },
-                  ];
+              line.product.stockBehavior === 'UNTRACKED'
+                ? []
+                : line.kit?.stockMode === 'DERIVED'
+                  ? line.kit.components.map((component) => ({
+                      productId: component.product.id,
+                      allocations:
+                        derivedAllocations.get(
+                          `${line.product.id}:${component.product.id}`,
+                        ) ?? [],
+                      derived: true,
+                    }))
+                  : [
+                      {
+                        productId: line.product.id,
+                        allocations: allocations.get(line.product.id) ?? [],
+                        derived: false,
+                      },
+                    ];
             for (const [targetIndex, target] of inventoryTargets.entries()) {
               for (const [
                 allocationIndex,
@@ -1478,9 +1491,12 @@ export class SalesRepository {
         product_id: string;
         product_name: string;
         product_sku: string;
+        without_code: number | boolean;
+        line_note: string | null;
         quantity: string;
         unit_price: string;
-        price_source: 'BASE' | 'PRICE_LIST';
+        price_source: 'BASE' | 'PRICE_LIST' | 'MANUAL';
+        price_override_reason: string | null;
         price_list_id: string | null;
         price_list_name: string | null;
         unit_cost: string;
@@ -1493,16 +1509,18 @@ export class SalesRepository {
         discount_value: string | null;
         discount_reason: string | null;
         expired_lot_override_reason: string | null;
+        stock_behavior: 'TRACKED' | 'UNTRACKED';
+        tax_behavior: 'STANDARD' | 'EXEMPT';
         subtotal: string;
         tax: string;
         total: string;
       }>
     >(
-      `SELECT id, product_id, product_name, product_sku, quantity, unit_price,
-              price_source, price_list_id, price_list_name, unit_cost,
+      `SELECT id, product_id, product_name, product_sku, without_code, line_note, quantity, unit_price,
+              price_source, price_override_reason, price_list_id, price_list_name, unit_cost,
               gross_total, line_discount_total, promotion_discount_total, sale_discount_total,
               discount_total, discount_type, discount_value, discount_reason,
-              expired_lot_override_reason,
+              expired_lot_override_reason, stock_behavior, tax_behavior,
               subtotal, tax, total
        FROM sale_lines WHERE tenant_id = ? AND sale_id = ? ORDER BY line_number`,
       [tenantId, row.id],
@@ -1694,11 +1712,16 @@ export class SalesRepository {
             id: line.product_id,
             name: line.product_name,
             sku: line.product_sku,
+            withoutCode: Boolean(line.without_code),
+            stockBehavior: line.stock_behavior,
+            taxBehavior: line.tax_behavior,
           },
           quantity: this.decimal(line.quantity, 3),
+          note: line.line_note,
           expiredLotOverrideReason: line.expired_lot_override_reason,
           unitPrice: this.decimal(line.unit_price, 2),
           priceSource: line.price_source,
+          priceOverrideReason: line.price_override_reason,
           priceList: line.price_list_id
             ? { id: line.price_list_id, name: line.price_list_name! }
             : null,

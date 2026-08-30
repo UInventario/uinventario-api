@@ -37,6 +37,17 @@ export class SuspendedSaleService {
     idempotencyKey?: string,
   ) {
     this.assertIdempotencyKey(idempotencyKey);
+    if (
+      dto.lines.some(
+        (line) => line.note || line.manualUnitPrice || line.priceOverrideReason,
+      )
+    ) {
+      throw new BadRequestException({
+        code: 'SUSPENDED_SALE_LINE_CONTROLS_NOT_SUPPORTED',
+        message:
+          'Completa la venta en lÃ­nea para conservar notas y precios manuales.',
+      });
+    }
     const notes = dto.notes?.trim() || null;
     const fingerprint = createHash('sha256')
       .update(

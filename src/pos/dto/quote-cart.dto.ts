@@ -44,6 +44,31 @@ export class QuoteCartLineDto {
   @Matches(/^(0|[1-9]\d{0,8})(\.\d{1,3})?$/)
   quantity!: string;
 
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : value,
+  )
+  @IsOptional()
+  @IsString()
+  @MinLength(1)
+  @MaxLength(240)
+  @Matches(/^[^\p{Cc}]*$/u)
+  note?: string;
+
+  @IsOptional()
+  @IsString()
+  @Matches(/^(?:[1-9]\d{0,11}(?:\.\d{1,2})?|0\.(?:0[1-9]|[1-9]\d?))$/)
+  manualUnitPrice?: string;
+
+  @Transform(({ value }: { value: unknown }) =>
+    typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : value,
+  )
+  @IsOptional()
+  @IsString()
+  @MinLength(3)
+  @MaxLength(240)
+  @Matches(/^[^\p{Cc}]*$/u)
+  priceOverrideReason?: string;
+
   @IsUUID()
   @IsOptional()
   lotId?: string;
