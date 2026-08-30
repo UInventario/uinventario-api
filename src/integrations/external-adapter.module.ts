@@ -30,6 +30,10 @@ import { PspPaymentController } from './psp-payment.controller';
 import { PspPaymentRepository } from './psp-payment.repository';
 import { PspPaymentService } from './psp-payment.service';
 import { SimulatedPspAdapter } from './simulated-psp.adapter';
+import { AccountingController } from './accounting.controller';
+import { AccountingRepository } from './accounting.repository';
+import { AccountingService } from './accounting.service';
+import { SimulatedAccountingAdapter } from './simulated-accounting.adapter';
 
 @Module({
   imports: [SessionModule, AuditModule],
@@ -40,6 +44,7 @@ import { SimulatedPspAdapter } from './simulated-psp.adapter';
     FiscalSimulatorController,
     ErpIntegrationController,
     PspPaymentController,
+    AccountingController,
   ],
   providers: [
     ExternalAdapterRepository,
@@ -62,6 +67,9 @@ import { SimulatedPspAdapter } from './simulated-psp.adapter';
     PspPaymentRepository,
     PspPaymentService,
     SimulatedPspAdapter,
+    AccountingRepository,
+    AccountingService,
+    SimulatedAccountingAdapter,
     PermissionGuard,
   ],
   exports: [
