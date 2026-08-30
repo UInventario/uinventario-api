@@ -23,6 +23,9 @@ import { FiscalSimulatorController } from './fiscal-simulator.controller';
 import { FiscalSimulatorRepository } from './fiscal-simulator.repository';
 import { FiscalSimulatorService } from './fiscal-simulator.service';
 import { SimulatedFiscalAdapter } from './simulated-fiscal.adapter';
+import { ErpIntegrationController } from './erp-integration.controller';
+import { ErpIntegrationRepository } from './erp-integration.repository';
+import { ErpIntegrationService } from './erp-integration.service';
 
 @Module({
   imports: [SessionModule, AuditModule],
@@ -31,6 +34,7 @@ import { SimulatedFiscalAdapter } from './simulated-fiscal.adapter';
     ResendWebhookController,
     FiscalContractController,
     FiscalSimulatorController,
+    ErpIntegrationController,
   ],
   providers: [
     ExternalAdapterRepository,
@@ -48,6 +52,8 @@ import { SimulatedFiscalAdapter } from './simulated-fiscal.adapter';
     SimulatedFiscalAdapter,
     FiscalSimulatorRepository,
     FiscalSimulatorService,
+    ErpIntegrationRepository,
+    ErpIntegrationService,
     PermissionGuard,
   ],
   exports: [
