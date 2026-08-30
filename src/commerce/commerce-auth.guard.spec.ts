@@ -2,6 +2,7 @@ import { ForbiddenException, HttpException } from '@nestjs/common';
 import type { ExecutionContext } from '@nestjs/common';
 import type { Reflector } from '@nestjs/core';
 import { createHash } from 'node:crypto';
+import type { AuditService, RecordAuditEvent } from '../audit/audit.service';
 import { CommerceAuthGuard } from './commerce-auth.guard';
 import type { CommerceRepository } from './commerce.repository';
 import type { CommercePrincipal } from './commerce.types';
@@ -28,9 +29,15 @@ describe('CommerceAuthGuard', () => {
     consumeRateLimit: jest.fn(),
   };
   const reflector = { getAllAndOverride: jest.fn() };
+  const audit = {
+    record: jest
+      .fn<Promise<void>, [RecordAuditEvent]>()
+      .mockResolvedValue(undefined),
+  };
   const guard = new CommerceAuthGuard(
     repository as unknown as CommerceRepository,
     reflector as unknown as Reflector,
+    audit as unknown as AuditService,
   );
 
   beforeEach(() => {
@@ -50,6 +57,13 @@ describe('CommerceAuthGuard', () => {
       principal.keyHash,
     );
     expect(request.commercePrincipal).toBe(principal);
+    expect(audit.record).toHaveBeenCalled();
+    const recorded = audit.record.mock.calls[0][0];
+    expect(recorded).toMatchObject({
+      tenantId: principal.tenantId,
+      entityId: principal.credentialId,
+    });
+    expect(recorded.after).toMatchObject({ scopes: ['CATALOG_READ'] });
   });
 
   it('rejects credentials without the required scope', async () => {
@@ -70,9 +84,13 @@ describe('CommerceAuthGuard', () => {
 function execution(authorization: string) {
   const request: {
     headers: { authorization: string };
+    method: string;
+    path: string;
     commercePrincipal?: CommercePrincipal;
   } = {
     headers: { authorization },
+    method: 'GET',
+    path: '/external/v1/catalog',
   };
   const context = {
     switchToHttp: () => ({ getRequest: () => request }),

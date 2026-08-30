@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { AuditService } from '../audit/audit.service';
 import { CommerceRepository } from './commerce.repository';
 import type { CommerceRequest } from './commerce-request.types';
 import { COMMERCE_SCOPES_KEY } from './commerce-scopes.decorator';
@@ -19,6 +20,7 @@ export class CommerceAuthGuard implements CanActivate {
   constructor(
     private readonly repository: CommerceRepository,
     private readonly reflector: Reflector,
+    private readonly audit: AuditService,
   ) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -47,6 +49,20 @@ export class CommerceAuthGuard implements CanActivate {
         HttpStatus.TOO_MANY_REQUESTS,
       );
     request.commercePrincipal = principal;
+    await this.audit.record({
+      tenantId: principal.tenantId,
+      actorUserId: principal.actorUserId,
+      action: 'EXTERNAL_API_ACCESSED',
+      entityType: 'COMMERCE_API_CREDENTIAL',
+      entityId: principal.credentialId,
+      correlationId: request.requestId ?? `external:${principal.credentialId}`,
+      origin: 'INTEGRATION',
+      after: {
+        method: request.method,
+        path: request.path,
+        scopes: required ?? [],
+      },
+    });
     return true;
   }
 

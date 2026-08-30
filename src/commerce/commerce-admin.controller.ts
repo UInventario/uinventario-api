@@ -27,6 +27,11 @@ export class CommerceAdminController {
     return this.commerce.credentials(request.principal.tenant.id);
   }
 
+  @Get('openapi')
+  openapi() {
+    return this.commerce.openapi();
+  }
+
   @Post('credentials')
   createCredential(
     @Req() request: AuthenticatedRequest,
@@ -53,8 +58,34 @@ export class CommerceAdminController {
     });
   }
 
+  @Post('credentials/:credentialId/rotate')
+  rotateCredential(
+    @Req() request: AuthenticatedRequest,
+    @Param('credentialId', ParseUUIDPipe) credentialId: string,
+  ) {
+    return this.commerce.rotateCredential({
+      tenantId: request.principal.tenant.id,
+      userId: request.principal.user.id,
+      credentialId,
+      correlationId: request.requestId!,
+    });
+  }
+
   @Get('webhook-deliveries')
   deliveries(@Req() request: AuthenticatedRequest) {
     return this.commerce.deliveries(request.principal.tenant.id);
+  }
+
+  @Post('webhook-deliveries/:deliveryId/replay')
+  replayDelivery(
+    @Req() request: AuthenticatedRequest,
+    @Param('deliveryId', ParseUUIDPipe) deliveryId: string,
+  ) {
+    return this.commerce.replayDelivery({
+      tenantId: request.principal.tenant.id,
+      userId: request.principal.user.id,
+      deliveryId,
+      correlationId: request.requestId!,
+    });
   }
 }

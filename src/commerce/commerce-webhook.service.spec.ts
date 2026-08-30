@@ -20,6 +20,14 @@ describe('CommerceWebhookService', () => {
       ReturnType<CommerceRepository['updateDelivery']>,
       Parameters<CommerceRepository['updateDelivery']>
     >(),
+    prepareDeliveryReplay: jest.fn<
+      ReturnType<CommerceRepository['prepareDeliveryReplay']>,
+      Parameters<CommerceRepository['prepareDeliveryReplay']>
+    >(),
+    updateDeliverySignature: jest.fn<
+      ReturnType<CommerceRepository['updateDeliverySignature']>,
+      Parameters<CommerceRepository['updateDeliverySignature']>
+    >(),
   };
   const eventBus = { subscribe: jest.fn() };
   const service = new CommerceWebhookService(
@@ -109,6 +117,39 @@ describe('CommerceWebhookService', () => {
     await service.publishOrder(tenantId, confirmedOrder());
 
     expect(repository.updateDelivery).not.toHaveBeenCalled();
+  });
+
+  it('re-signs a controlled replay with the current rotated credential', async () => {
+    const payload = { apiVersion: '1', eventId: 'event-1' };
+    repository.prepareDeliveryReplay.mockResolvedValue({
+      delivery: {
+        id: 'delivery',
+        eventId: 'event-1',
+        eventType: 'ORDER_CONFIRMED',
+        targetUrl: 'https://recover.example.test/webhook',
+        signature: `sha256=${'a'.repeat(64)}`,
+        status: 'RETRYABLE_FAILURE',
+        attemptCount: 3,
+        errorCode: 'SIMULATED_TIMEOUT',
+        createdAt: '2026-08-30T00:00:00.000Z',
+        updatedAt: '2026-08-30T00:00:01.000Z',
+        deliveredAt: null,
+      },
+      payload,
+      keyHash: 'b'.repeat(64),
+    });
+
+    const result = await service.replay(tenantId, 'delivery');
+
+    const expected = `sha256=${createHmac('sha256', 'b'.repeat(64))
+      .update(JSON.stringify(payload))
+      .digest('hex')}`;
+    expect(repository.updateDeliverySignature).toHaveBeenCalledWith(
+      tenantId,
+      'delivery',
+      expected,
+    );
+    expect(result).toMatchObject({ status: 'SUCCEEDED', attemptCount: 4 });
   });
 });
 

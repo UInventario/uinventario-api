@@ -48,10 +48,7 @@ export class CommerceWebhookService implements OnModuleInit, OnModuleDestroy {
         version: order.version,
       },
     };
-    const body = JSON.stringify(payload);
-    const signature = `sha256=${createHmac('sha256', configuration.keyHash)
-      .update(body)
-      .digest('hex')}`;
+    const signature = this.signature(configuration.keyHash, payload);
     const delivery = await this.repository.createDelivery({
       tenantId,
       credentialId: configuration.credentialId,
@@ -67,6 +64,41 @@ export class CommerceWebhookService implements OnModuleInit, OnModuleDestroy {
       await this.repository.updateDelivery(delivery.id, result);
       if (result.status === 'SUCCEEDED' || result.status === 'FAILED') return;
     }
+  }
+
+  async replay(tenantId: string, deliveryId: string) {
+    const prepared = await this.repository.prepareDeliveryReplay(
+      tenantId,
+      deliveryId,
+    );
+    if (!prepared) return null;
+    const signature = this.signature(prepared.keyHash, prepared.payload);
+    await this.repository.updateDeliverySignature(
+      tenantId,
+      deliveryId,
+      signature,
+    );
+    let delivery = { ...prepared.delivery, signature };
+    for (let attempt = delivery.attemptCount + 1; attempt <= 5; attempt += 1) {
+      const result = this.simulate(delivery.targetUrl, attempt);
+      await this.repository.updateDelivery(delivery.id, result);
+      delivery = {
+        ...delivery,
+        status: result.status,
+        attemptCount: attempt,
+        errorCode: result.errorCode,
+        deliveredAt:
+          result.status === 'SUCCEEDED' ? new Date().toISOString() : null,
+      };
+      if (result.status === 'SUCCEEDED' || result.status === 'FAILED') break;
+    }
+    return delivery;
+  }
+
+  private signature(secret: string, payload: object): string {
+    return `sha256=${createHmac('sha256', secret)
+      .update(JSON.stringify(payload))
+      .digest('hex')}`;
   }
 
   private eventType(order: CustomerOrderData): CommerceWebhookEvent {
@@ -86,6 +118,11 @@ export class CommerceWebhookService implements OnModuleInit, OnModuleDestroy {
   private simulate(url: string, attempt: number) {
     if (url.includes('reject'))
       return { status: 'FAILED' as const, errorCode: 'SIMULATED_REJECTED' };
+    if (url.includes('recover') && attempt <= 3)
+      return {
+        status: 'RETRYABLE_FAILURE' as const,
+        errorCode: 'SIMULATED_TIMEOUT',
+      };
     if (url.includes('retry') && attempt === 1)
       return {
         status: 'RETRYABLE_FAILURE' as const,

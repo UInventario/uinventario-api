@@ -25,6 +25,10 @@ describe('CommerceService', () => {
       ReturnType<CommerceRepository['catalog']>,
       Parameters<CommerceRepository['catalog']>
     >(),
+    rotateCredential: jest.fn<
+      ReturnType<CommerceRepository['rotateCredential']>,
+      Parameters<CommerceRepository['rotateCredential']>
+    >(),
   };
   const orders = {
     create: jest.fn<
@@ -40,11 +44,12 @@ describe('CommerceService', () => {
       Parameters<CustomerOrderService['get']>
     >(),
   };
-  const webhooks = { publishOrder: jest.fn() };
+  const audit = { recordRequired: jest.fn().mockResolvedValue(undefined) };
+  const webhooks = { publishOrder: jest.fn(), replay: jest.fn() };
   const service = new CommerceService(
     repository as unknown as CommerceRepository,
     orders as unknown as CustomerOrderService,
-    {} as AuditService,
+    audit as unknown as AuditService,
     webhooks as unknown as CommerceWebhookService,
   );
   const principal: CommercePrincipal = {
@@ -199,6 +204,81 @@ describe('CommerceService', () => {
     expect(repository.catalog).toHaveBeenCalledWith(
       expect.objectContaining({ principal }),
     );
+  });
+
+  it('rotates an active credential and exposes the replacement key only once', async () => {
+    repository.rotateCredential.mockResolvedValue({
+      id: principal.credentialId,
+      name: 'Marketplace',
+      keyPrefix: 'uic_87654321',
+      scopes: ['CATALOG_READ'],
+      context: {
+        branch: { id: 'b', name: 'Sucursal' },
+        warehouse: { id: 'w', name: 'Bodega' },
+        cashRegister: { id: 'r', name: 'Caja', code: 'C1' },
+        location: { id: 'l', name: 'Ubicación', code: 'L1' },
+        customer: { id: 'c', name: 'Cliente' },
+      },
+      active: true,
+      rateLimitPerMinute: 60,
+      webhook: { url: null, events: [], enabled: false, mode: 'SIMULATOR' },
+      lastUsedAt: null,
+      createdAt: '2026-08-30T00:00:00.000Z',
+      updatedAt: '2026-08-30T00:00:00.000Z',
+    });
+
+    const result = await service.rotateCredential({
+      tenantId: principal.tenantId,
+      userId: principal.actorUserId,
+      credentialId: principal.credentialId,
+      correlationId: 'request-rotate',
+    });
+
+    expect(result.data.apiKey).toMatch(/^uic_[a-f0-9]{8}_[A-Za-z0-9_-]{43}$/);
+    expect(repository.rotateCredential).toHaveBeenCalled();
+    const rotated = repository.rotateCredential.mock.calls[0][0];
+    expect(rotated).toMatchObject({
+      tenantId: principal.tenantId,
+      credentialId: principal.credentialId,
+    });
+    expect(rotated.keyHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(JSON.stringify(result.data)).not.toContain('keyHash');
+    expect(audit.recordRequired).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'COMMERCE_CREDENTIAL_ROTATED' }),
+    );
+  });
+
+  it('audits a controlled webhook replay', async () => {
+    webhooks.replay.mockResolvedValue({
+      id: 'delivery-1',
+      status: 'SUCCEEDED',
+      attemptCount: 4,
+    });
+
+    await expect(
+      service.replayDelivery({
+        tenantId: principal.tenantId,
+        userId: principal.actorUserId,
+        deliveryId: 'delivery-1',
+        correlationId: 'request-replay',
+      }),
+    ).resolves.toMatchObject({ data: { status: 'SUCCEEDED' } });
+    expect(audit.recordRequired).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'COMMERCE_WEBHOOK_REPLAYED' }),
+    );
+  });
+
+  it('publishes a secret-free OpenAPI 3.1 contract with scoped operations', () => {
+    const contract = service.openapi();
+
+    expect(contract.openapi).toBe('3.1.0');
+    expect(contract.paths['/catalog'].get['x-required-scope']).toBe(
+      'CATALOG_READ',
+    );
+    expect(
+      contract.paths['/catalog'].get.responses['200'].description.length,
+    ).toBeGreaterThan(0);
+    expect(JSON.stringify(contract)).not.toMatch(/uic_[a-f0-9]{8}_/);
   });
 });
 

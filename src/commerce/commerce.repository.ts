@@ -54,6 +54,13 @@ interface DeliveryRow {
   delivered_at: Date | string | null;
 }
 
+interface ReplayDeliveryRow extends DeliveryRow {
+  tenant_id: string;
+  credential_id: string;
+  payload: string | Record<string, unknown>;
+  key_hash: string;
+}
+
 export interface CommerceCatalogRow {
   id: string;
   name: string;
@@ -156,6 +163,23 @@ export class CommerceRepository {
       [tenantId, credentialId],
     );
     return result.affectedRows > 0;
+  }
+
+  async rotateCredential(input: {
+    tenantId: string;
+    credentialId: string;
+    keyPrefix: string;
+    keyHash: string;
+  }): Promise<CommerceCredentialData | null> {
+    const result = await this.dataSource.query<ResultSetHeader>(
+      `UPDATE commerce_api_credentials
+       SET key_prefix = ?, key_hash = ?, last_used_at = NULL
+       WHERE tenant_id = ? AND id = ? AND active = TRUE`,
+      [input.keyPrefix, input.keyHash, input.tenantId, input.credentialId],
+    );
+    return result.affectedRows > 0
+      ? this.findCredential(input.tenantId, input.credentialId)
+      : null;
   }
 
   async authenticate(keyPrefix: string, keyHash: string) {
@@ -350,6 +374,55 @@ export class CommerceRepository {
       [tenantId],
     );
     return rows.map((row) => this.mapDelivery(row));
+  }
+
+  async prepareDeliveryReplay(tenantId: string, deliveryId: string) {
+    return this.dataSource.transaction(async (manager) => {
+      await manager.query('SELECT id FROM tenants WHERE id = ? FOR UPDATE', [
+        tenantId,
+      ]);
+      const result = await manager.query<ResultSetHeader>(
+        `UPDATE commerce_webhook_deliveries delivery
+         INNER JOIN commerce_api_credentials credential
+           ON credential.id = delivery.credential_id
+          AND credential.tenant_id = delivery.tenant_id
+         SET delivery.status = 'PENDING', delivery.error_code = NULL,
+             delivery.delivered_at = NULL
+         WHERE delivery.tenant_id = ? AND delivery.id = ?
+           AND delivery.status IN ('FAILED', 'RETRYABLE_FAILURE')
+           AND delivery.attempt_count < 5 AND credential.active = TRUE`,
+        [tenantId, deliveryId],
+      );
+      if (result.affectedRows !== 1) return null;
+      const [row] = await manager.query<ReplayDeliveryRow[]>(
+        `SELECT delivery.*, credential.key_hash
+         FROM commerce_webhook_deliveries delivery
+         INNER JOIN commerce_api_credentials credential
+           ON credential.id = delivery.credential_id
+          AND credential.tenant_id = delivery.tenant_id
+         WHERE delivery.tenant_id = ? AND delivery.id = ? LIMIT 1`,
+        [tenantId, deliveryId],
+      );
+      return row
+        ? {
+            delivery: this.mapDelivery(row),
+            payload: this.json<Record<string, unknown>>(row.payload),
+            keyHash: row.key_hash,
+          }
+        : null;
+    });
+  }
+
+  async updateDeliverySignature(
+    tenantId: string,
+    deliveryId: string,
+    signature: string,
+  ): Promise<void> {
+    await this.dataSource.query(
+      `UPDATE commerce_webhook_deliveries SET signature = ?
+       WHERE tenant_id = ? AND id = ? AND status = 'PENDING'`,
+      [signature, tenantId, deliveryId],
+    );
   }
 
   private credentialRows(where: string, params: unknown[]) {
