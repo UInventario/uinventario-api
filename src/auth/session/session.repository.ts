@@ -4,7 +4,6 @@ import { DataSource } from 'typeorm';
 import { SessionEntity } from './entities/session.entity';
 import { SessionIdentity } from './session.types';
 import type { AppPermission } from '../authorization/authorization.types';
-
 interface IdentityRow {
   session_id?: string;
   user_id: string;
@@ -24,14 +23,12 @@ interface IdentityRow {
   cash_register_name: string | null;
   cash_register_code: string | null;
 }
-
 export interface LoginIdentity extends Omit<
   SessionIdentity,
   'sessionId' | 'expiresAt'
 > {
   passwordHash: string;
 }
-
 @Injectable()
 export class SessionRepository {
   constructor(private readonly dataSource: DataSource) {}
@@ -114,7 +111,7 @@ export class SessionRepository {
         LEFT JOIN user_roles ur ON ur.user_id = u.id AND ur.tenant_id = t.id
         LEFT JOIN roles r ON r.id = ur.role_id AND r.tenant_id = ur.tenant_id
         LEFT JOIN role_permissions rp ON rp.role_id = r.id AND rp.tenant_id = r.tenant_id
-        WHERE u.normalized_email = ?
+        WHERE u.normalized_email = ? AND u.access_revoked_at IS NULL
         GROUP BY u.id, u.email, u.password_hash, t.id, t.name, t.onboarding_completed_at, b.id, b.name, w.id, w.name, cr.id, cr.name, cr.code
         LIMIT 1
       `,
@@ -283,6 +280,7 @@ export class SessionRepository {
         LEFT JOIN roles r ON r.id = ur.role_id AND r.tenant_id = s.tenant_id
         LEFT JOIN role_permissions rp ON rp.role_id = r.id AND rp.tenant_id = r.tenant_id
         WHERE s.token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?
+          AND u.access_revoked_at IS NULL
         GROUP BY s.id, u.id, u.email, t.id, t.name, t.onboarding_completed_at, b.id, b.name, w.id, w.name, cr.id, cr.name, cr.code
         LIMIT 1
       `,
